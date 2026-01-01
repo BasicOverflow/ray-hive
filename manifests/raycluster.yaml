@@ -1,0 +1,344 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster
+  namespace: ray-system
+spec:
+  rayVersion: "2.53.0"
+  enableInTreeAutoscaling: false
+  headGroupSpec:
+    serviceType: LoadBalancer
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "2"  # Head node - minimal CPUs
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 6379
+            name: gcs-server
+          - containerPort: 8265
+            name: dashboard
+          - containerPort: 10001
+            name: client
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            # No limits - allow head to use more if needed
+          env:
+          - name: RAY_DISABLE_IMPORT_WARNING
+            value: "1"
+          - name: RAY_SCHEDULER_EVENTS
+            value: "0"  # Disable autoscaler event messages
+  workerGroupSpecs:
+  # CPU Worker Groups - one per CPU node to set exact CPU counts
+  # ergos-01: 12 CPUs
+  - groupName: cpu-workers-ergos-01
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-cpus: "12"  # Explicitly set to match node CPU count
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - ergos-01
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"  # Minimal request for scheduling
+              memory: "8Gi"
+            # No limits - allow workers to use all available resources
+          env:
+          - name: RAY_DISABLE_IMPORT_WARNING
+            value: "1"
+  
+  # ergos-03: 13 CPUs
+  - groupName: cpu-workers-ergos-03
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-cpus: "13"  # Explicitly set to match node CPU count
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - ergos-03
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"  # Minimal request for scheduling
+              memory: "8Gi"
+            # No limits - allow workers to use all available resources
+          env:
+          - name: RAY_DISABLE_IMPORT_WARNING
+            value: "1"
+  
+  # ergos-05: 5 CPUs
+  - groupName: cpu-workers-ergos-05
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-cpus: "5"  # Explicitly set to match node CPU count
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - ergos-05
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"  # Minimal request for scheduling
+              memory: "8Gi"
+            # No limits - allow workers to use all available resources
+          env:
+          - name: RAY_DISABLE_IMPORT_WARNING
+            value: "1"
+  
+  # GPU Worker Groups - one per GPU node to get all GPUs on each node
+  # ergos-02-nv: 12 CPUs, 3 GPUs
+  - groupName: gpu-workers-ergos-02-nv
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-cpus: "12"  # Explicitly set to match ergos-02-nv CPU count
+      num-gpus: "3"  # All 3 GPUs on ergos-02-nv
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - ergos-02-nv
+        tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        volumes:
+        - name: nvidia-bin
+          hostPath:
+            path: /usr/bin
+            type: Directory
+        - name: nvidia-lib
+          hostPath:
+            path: /usr/lib/x86_64-linux-gnu
+            type: Directory
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 12 CPUs (no limits)
+              memory: "8Gi"
+              nvidia.com/gpu: "3"  # All 3 GPUs on ergos-02-nv
+            limits:
+              memory: "40Gi"  # ergos-02-nv has 42 GB RAM - leave 2 GB for system
+              nvidia.com/gpu: "3"  # Must match request
+            # No CPU limit - Ray will auto-detect all available CPUs
+          volumeMounts:
+          - name: nvidia-bin
+            mountPath: /host/usr/bin
+            readOnly: true
+          - name: nvidia-lib
+            mountPath: /host/usr/lib/x86_64-linux-gnu
+            readOnly: true
+          env:
+          - name: LD_LIBRARY_PATH
+            value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+          env:
+          - name: RAY_DISABLE_IMPORT_WARNING
+            value: "1"
+          - name: RAY_HEAD_ADDRESS
+            value: "raycluster-head-svc:8265"
+  
+  # ergos-04-nv: 13 CPUs, 2 GPUs
+  - groupName: gpu-workers-ergos-04-nv
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-cpus: "13"  # Explicitly set to match ergos-04-nv CPU count
+      num-gpus: "2"  # All 2 GPUs on ergos-04-nv
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - ergos-04-nv
+        tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 13 CPUs (no limits)
+              memory: "8Gi"
+              nvidia.com/gpu: "2"  # All 2 GPUs on ergos-04-nv
+            limits:
+              memory: "18Gi"  # ergos-04-nv has 20 GB RAM - leave 2 GB for system
+              nvidia.com/gpu: "2"  # Must match request
+            # No CPU limit - Ray will auto-detect all available CPUs
+          env:
+          - name: RAY_DISABLE_IMPORT_WARNING
+            value: "1"
+          - name: RAY_HEAD_ADDRESS
+            value: "raycluster-head-svc:8265"
+  
+  # ergos-06-nv: 5 CPUs, 1 GPU
+  - groupName: gpu-workers-ergos-06-nv
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    rayStartParams:
+      num-cpus: "5"  # Explicitly set to match ergos-06-nv CPU count
+      num-gpus: "1"  # All 1 GPU on ergos-06-nv
+    template:
+      spec:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - ergos-06-nv
+        tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        containers:
+        - name: ray-worker
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 5 CPUs (no limits)
+              memory: "8Gi"
+              nvidia.com/gpu: "1"  # All 1 GPU on ergos-06-nv
+            limits:
+              memory: "32Gi"  # ergos-06-nv has 34 GB RAM - leave 2 GB for system
+              nvidia.com/gpu: "1"  # Must match request
+            # No CPU limit - Ray will auto-detect all available CPUs
+          env:
+          - name: RAY_DISABLE_IMPORT_WARNING
+            value: "1"
+          - name: RAY_HEAD_ADDRESS
+            value: "raycluster-head-svc:8265"
+        # VRAM monitor sidecar - reports free VRAM as custom resource
+        - name: vram-monitor
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          # Share GPU devices from worker container (same pod = shared device namespace)
+          # No GPU resource request needed - devices are accessible via shared namespace
+          env:
+          - name: RAY_HEAD_ADDRESS
+            value: "raycluster-head-svc:8265"
+          command: ["python3", "-c"]
+          args:
+          - |
+            import ray
+            import subprocess
+            import time
+            import sys
+            
+            def get_free_vram_gb():
+                """Get actual free VRAM across all GPUs using nvidia-smi, returns GB."""
+                # Try common nvidia-smi paths
+                nvidia_smi_paths = ['/usr/bin/nvidia-smi', '/usr/local/bin/nvidia-smi', 'nvidia-smi']
+                for nvidia_smi in nvidia_smi_paths:
+                    try:
+                        result = subprocess.run(
+                            [nvidia_smi, '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                            timeout=2
+                        )
+                        free_values_mb = [int(x.strip()) for x in result.stdout.strip().split('\n') if x.strip()]
+                        free_vram_mb = sum(free_values_mb)
+                        return free_vram_mb / 1024.0  # Convert MB to GB
+                    except (FileNotFoundError, subprocess.CalledProcessError):
+                        continue  # Try next path
+                # If all paths failed
+                print("Error: nvidia-smi not found in any common location", file=sys.stderr)
+                return None
+            
+            # Wait for Ray worker to be ready
+            time.sleep(5)
+            
+            # Connect to Ray cluster via head service
+            ray.init(address="ray://raycluster-head-svc:10001", ignore_reinit_error=True)
+            print("VRAM Monitor started - polling GPU memory every 0.1 seconds (reports in GB)")
+            
+            # Simple polling loop - update every 0.1 seconds
+            while True:
+                try:
+                    free_vram_gb = get_free_vram_gb()
+                    if free_vram_gb is not None:
+                        ray.util.set_resource("VRAM", free_vram_gb)
+                    
+                    time.sleep(0.1)
+                    
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    print("Error in monitor: " + str(e), file=sys.stderr)
+                    time.sleep(1)
+

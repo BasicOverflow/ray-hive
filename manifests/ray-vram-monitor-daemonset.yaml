@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ray-vram-monitor
+  namespace: ray-system
+spec:
+  selector:
+    matchLabels:
+      app: ray-vram-monitor
+  template:
+    metadata:
+      labels:
+        app: ray-vram-monitor
+    spec:
+      # Use host network to access GPU devices without allocating GPU resources
+      hostNetwork: true
+      hostPID: true
+      # Only run on GPU nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu
+                operator: Exists
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: vram-monitor
+        image: rayproject/ray:2.53.0-py312-cu125
+        # Override entrypoint to skip Ray's default startup
+        command: ["python3"]
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        # Mount GPU device files to access them
+        volumeMounts:
+        - name: dev
+          mountPath: /dev
+        - name: nvidia-bin
+          mountPath: /host/usr/bin
+          readOnly: true
+        - name: nvidia-lib
+          mountPath: /host/usr/lib/x86_64-linux-gnu
+          readOnly: true
+        - name: vram-scripts
+          mountPath: /scripts/vram-scheduler
+          readOnly: true
+        env:
+        - name: LD_LIBRARY_PATH
+          value: "/host/usr/lib/x86_64-linux-gnu"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: RAY_ADDRESS
+          value: "ray://10.0.1.53:10001"
+        args:
+        - /scripts/vram-scheduler/vram_monitor.py
+      volumes:
+      - name: dev
+        hostPath:
+          path: /dev
+          type: Directory
+      - name: nvidia-bin
+        hostPath:
+          path: /usr/bin
+          type: Directory
+      - name: nvidia-lib
+        hostPath:
+          path: /usr/lib/x86_64-linux-gnu
+          type: Directory
+      - name: vram-scripts
+        configMap:
+          name: vram-scheduler-scripts
+      serviceAccountName: ray-vram-monitor
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ray-vram-monitor
+  namespace: ray-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ray-vram-monitor
+  namespace: ray-system
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ray-vram-monitor
+  namespace: ray-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ray-vram-monitor
+subjects:
+- kind: ServiceAccount
+  name: ray-vram-monitor
+  namespace: ray-system
+

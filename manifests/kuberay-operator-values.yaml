@@ -1,0 +1,19 @@
+# KubeRay Operator Helm Values
+# Minimal configuration - uses chart defaults for most settings
+
+# Optional: Override operator image version if needed
+operator:
+  image:
+    repository: kuberay/operator
+    tag: v1.1.0
+
+# Optional: Adjust resource limits if needed
+operator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+

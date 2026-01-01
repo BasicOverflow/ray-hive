@@ -1,0 +1,181 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vram-scheduler-scripts
+  namespace: ray-system
+data:
+  vram_allocator.py: |
+    """
+    Global VRAM Allocator Actor - singleton, HA-safe, persistent.
+
+    This actor maintains VRAM state across all GPU nodes and handles
+    reservation/release of VRAM for models.
+    """
+    import ray
+    from typing import Dict, Optional
+
+    @ray.remote(num_cpus=0)
+    class VRAMAllocator:
+        """Global VRAM allocator - singleton, HA-safe, persistent."""
+        
+        def __init__(self):
+            # node_id -> {total_gb, free_gb, allocations: {model_id: gb}}
+            self.nodes: Dict[str, Dict] = {}
+        
+        def update_node(self, node_id: str, free_gb: float, total_gb: float):
+            """Update VRAM state for a node (called by DaemonSet)."""
+            if node_id not in self.nodes:
+                self.nodes[node_id] = {"total": total_gb, "free": free_gb, "allocs": {}}
+            else:
+                # Update free/total, but preserve allocations
+                self.nodes[node_id]["total"] = total_gb
+                # Free = actual_free - reserved
+                reserved = sum(self.nodes[node_id]["allocs"].values())
+                self.nodes[node_id]["free"] = free_gb - reserved
+        
+        def reserve(self, model_id: str, node_id: str, required_gb: float) -> bool:
+            """Reserve VRAM for a model. Returns True if successful."""
+            if node_id not in self.nodes:
+                return False
+            
+            node = self.nodes[node_id]
+            available = node["free"]
+            
+            if available < required_gb:
+                return False
+            
+            # Reserve it
+            node["free"] -= required_gb
+            node["allocs"][model_id] = required_gb
+            return True
+        
+        def release(self, model_id: str, node_id: str):
+            """Release VRAM reservation for a model."""
+            if node_id not in self.nodes:
+                return
+            
+            node = self.nodes[node_id]
+            if model_id in node["allocs"]:
+                gb = node["allocs"].pop(model_id)
+                node["free"] += gb
+        
+        def get_node_vram(self, node_id: str) -> Optional[Dict]:
+            """Get VRAM info for a specific node."""
+            return self.nodes.get(node_id)
+        
+        def find_node_with_vram(self, required_gb: float) -> Optional[str]:
+            """Find a node with enough free VRAM (only K8s node names, not old Ray node IDs)."""
+            for node_id, node in self.nodes.items():
+                # Skip old Ray node IDs (long hex strings starting with 'c')
+                if len(node_id) > 50 or node_id.startswith('c'):
+                    continue
+                if node["free"] >= required_gb:
+                    return node_id
+            return None
+        
+        def cleanup_old_ray_node_ids(self) -> int:
+            """Remove old Ray node ID entries (long hex strings). Returns count removed."""
+            old_ids = [node_id for node_id in self.nodes.keys() 
+                       if len(node_id) > 50 or node_id.startswith('c')]
+            for node_id in old_ids:
+                del self.nodes[node_id]
+            return len(old_ids)
+        
+        def get_all_nodes(self) -> Dict:
+            """Get VRAM state for all nodes."""
+            return self.nodes.copy()
+
+
+    def get_vram_allocator():
+        """Get or create the global VRAM allocator actor."""
+        try:
+            return ray.get_actor("vram_allocator", namespace="system")
+        except ValueError:
+            # Create it if it doesn't exist
+            return VRAMAllocator.options(
+                name="vram_allocator",
+                namespace="system",
+                lifetime="detached"
+            ).remote()
+
+  vram_monitor.py: |
+    """
+    VRAM Monitor Script - runs in DaemonSet to update allocator.
+
+    This script runs on each GPU node and continuously updates
+    the global VRAM allocator with current VRAM state.
+    """
+    import ray
+    import subprocess
+    import time
+    import sys
+    import os
+
+    # Add scripts directory to path for imports
+    sys.path.insert(0, "/scripts/vram-scheduler")
+
+    from vram_allocator import get_vram_allocator
+
+    def get_vram_gb():
+        """Get VRAM using nvidia-smi (mounted from host)."""
+        try:
+            env = os.environ.copy()
+            env['LD_LIBRARY_PATH'] = '/host/usr/lib/x86_64-linux-gnu:' + env.get('LD_LIBRARY_PATH', '')
+            # Get free VRAM
+            result_free = subprocess.run(
+                ['/host/usr/bin/nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, check=True, timeout=2, env=env
+            )
+            # Get total VRAM
+            result_total = subprocess.run(
+                ['/host/usr/bin/nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, check=True, timeout=2, env=env
+            )
+            free_values_mb = [int(x.strip()) for x in result_free.stdout.strip().split('\n') if x.strip()]
+            total_values_mb = [int(x.strip()) for x in result_total.stdout.strip().split('\n') if x.strip()]
+            free_gb = sum(free_values_mb) / 1024.0
+            total_gb = sum(total_values_mb) / 1024.0
+            return free_gb, total_gb
+        except Exception as e:
+            print(f"Error getting VRAM: {e}", file=sys.stderr, flush=True)
+            return None, None
+
+    def main():
+        # Connect to Ray cluster
+        ray_address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
+        ray.init(address=ray_address, ignore_reinit_error=True)
+        
+        # Get the global allocator
+        allocator = get_vram_allocator()
+        
+        print("VRAM Monitor started - updating allocator every 0.5 seconds", 
+              file=sys.stderr, flush=True)
+        
+        while True:
+            try:
+                # Get actual VRAM
+                free_gb, total_gb = get_vram_gb()
+                
+                if free_gb is not None and total_gb is not None:
+                    # Use Kubernetes node name as identifier (each DaemonSet pod runs on a unique K8s node)
+                    k8s_node_name = os.getenv("NODE_NAME", "unknown")
+                    
+                    # Update allocator with K8s node name as the key
+                    ray.get(allocator.update_node.remote(k8s_node_name, free_gb, total_gb))
+                    
+                    print(f"K8s Node {k8s_node_name}: {free_gb:.2f}GB free / {total_gb:.2f}GB total", 
+                          file=sys.stderr, flush=True)
+                else:
+                    print("Warning: Could not get VRAM", file=sys.stderr, flush=True)
+                
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                time.sleep(1)
+
+    if __name__ == "__main__":
+        main()
+

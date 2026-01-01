@@ -34,143 +34,193 @@ Ray Worker Pods
 
 ## Key Features
 
-### Dynamic GPU Pool
-- Request high GPU count (`nvidia.com/gpu: "10"`) - Kubernetes allocates all available GPUs per node
-- No need to specify exact GPU counts per node
-- Each GPU node automatically gets all its GPUs
+### VRAM-Aware Scheduling
+- **Dynamic VRAM tracking**: DaemonSet monitors VRAM on each GPU node every 0.5s
+- **Global allocator actor**: Singleton actor maintains VRAM state across all nodes
+- **Exact VRAM requirements**: Models declare exact VRAM needs, no overcommit
+- **Automatic placement**: Ray Serve places replicas based on available VRAM
 
-### VRAM-Based Scheduling
-- Workers report total VRAM across all GPUs as Ray custom resource
-- Tasks request VRAM amount (e.g., `VRAM: 8192` for 8GB model)
-- Ray scheduler places tasks based on VRAM availability, not GPU count
-- Works seamlessly with heterogeneous GPU configurations
+### vLLM Model Deployment
+- Deploy models via Ray Serve with VRAM reservation
+- Declarative model configuration
+- Automatic scaling and placement
+- Zero OOM guarantees through hard reservations
 
-### vLLM Inference
-- Deploy models via Ray Serve
-- Automatic replica placement based on VRAM
-- Treats all GPUs on a node as a single VRAM pool
-- Supports tensor parallelism for large models
+### Cluster Testing
+- Basic connectivity and resource tests
+- VRAM allocator verification
+- CPU/GPU stress testing
 
 ## Repository Structure
 
 ```
 ray-k3s-deployment/
-├── helm/
-│   ├── kuberay-operator-values.yaml    # KubeRay operator Helm values
-│   └── install-operator.sh              # Operator installation script
-├── manifests/
-│   ├── nvidia-device-plugin.yaml       # NVIDIA device plugin (if needed)
-│   ├── raycluster.yaml                 # RayCluster CRD with GPU workers
-│   └── ray-loadbalancer.yaml           # LoadBalancer service
+├── manifests/                          # Kubernetes manifests
+│   ├── raycluster.yaml                 # Main RayCluster deployment
+│   ├── ray-vram-monitor-daemonset.yaml # VRAM monitoring DaemonSet
+│   ├── vram-scheduler-configmap.yaml   # VRAM scheduler scripts
+│   └── helm/                           # KubeRay operator Helm config
 ├── scripts/
-│   ├── verify-gpu-resources.sh         # Verify GPU resources are exposed
-│   └── ray-vram-setup.sh               # Ray worker VRAM detection script
-├── examples/
-│   ├── submit-job-rest.py              # REST API job submission example
-│   ├── submit-job-curl.sh              # curl-based job submission
-│   ├── deploy-vllm-model.py            # vLLM deployment example
-│   └── vllm-inference-client.py         # vLLM inference client
-├── monitoring/
-│   ├── prometheus-scrape-config.yaml   # Prometheus scrape config
-│   └── grafana-dashboard.json          # Grafana dashboard (optional)
-├── docs/
-│   ├── deployment-steps.md             # Step-by-step deployment guide
-│   ├── rest-api-submission.md          # REST API documentation
-│   └── vllm-deployment.md              # vLLM deployment guide
-├── resource-limits.md                  # Hardware specs and recommendations
-└── vram-inventory.md                   # Per-node VRAM breakdown
+│   ├── vram-scheduler/                 # VRAM-aware scheduling system
+│   │   ├── 1_deploy_models.py         # Main: Deploy models from config
+│   │   ├── 2_deploy_max_llms.py       # Alternative: Deploy max replicas
+│   │   ├── vram_allocator.py          # Global VRAM allocator actor
+│   │   ├── vllm_model_actor.py        # vLLM model with VRAM reservation
+│   │   └── model_orchestrator.py      # Declarative model deployment
+│   │   # Note: vram_monitor.py is in ConfigMap (see below)
+│   └── stress_tests/                   # Cluster testing scripts
+│       ├── test_basic_connection.py   # Basic connectivity test
+│       └── test_vram_resource.py      # VRAM allocator test
 ```
 
-## Usage
+## Quick Start
 
-### Submit Job via REST API
+### Deploy Ray Cluster
 
-```python
-import requests
+```bash
+# Deploy KubeRay operator (if not already installed)
+kubectl apply -f manifests/helm/kuberay-operator-values.yaml
 
-response = requests.post(
-    "http://<LoadBalancer-IP>:8265/api/jobs",
-    json={
-        "entrypoint": "python my_script.py",
-        "runtime_env": {"pip": ["numpy"]}
-    }
-)
-job_id = response.json()["job_id"]
+# Deploy Ray cluster
+kubectl apply -f manifests/raycluster.yaml
+
+# Deploy VRAM monitor
+kubectl apply -f manifests/vram-scheduler-configmap.yaml
+kubectl apply -f manifests/ray-vram-monitor-daemonset.yaml
 ```
 
-### Deploy vLLM Model
+### Deploy Models
 
-```python
-from ray import serve
-from vllm import LLM
+**Option 1: Deploy from config (recommended)**
+```bash
+python scripts/vram-scheduler/1_deploy_models.py
+```
 
-@serve.deployment(
-    ray_actor_options={
-        "resources": {"VRAM": 8192}  # Request 8GB VRAM
-    }
-)
-class vLLMModel:
-    def __init__(self, model_name: str):
-        self.llm = LLM(model=model_name)
-    
-    def generate(self, prompt: str):
-        return self.llm.generate(prompt)
+**Option 2: Deploy maximum replicas**
+```bash
+python scripts/vram-scheduler/2_deploy_max_llms.py
+# Or with custom model:
+MODEL_NAME="microsoft/phi-2" MODEL_VRAM_GB=3.0 python scripts/vram-scheduler/2_deploy_max_llms.py
+```
 
-serve.run(vLLMModel.bind("microsoft/phi-2"), name="phi2")
+### Test Cluster
+
+```bash
+# Basic connectivity
+python scripts/stress_tests/test_basic_connection.py
+
+# VRAM allocator
+python scripts/stress_tests/test_vram_resource.py
 ```
 
 ## How It Works
 
-### Dynamic GPU Allocation
+### VRAM Scheduler Architecture
 
-- RayCluster manifest requests high GPU count (`nvidia.com/gpu: "10"`)
-- Kubernetes allocates all available GPUs on each node (up to requested amount)
-- Each GPU node automatically gets all its GPUs:
-  - Node with 3 GPUs → pod gets 3 GPUs
-  - Node with 2 GPUs → pod gets 2 GPUs
-  - Node with 1 GPU → pod gets 1 GPU
+1. **DaemonSet** runs on each GPU node, queries VRAM via `nvidia-smi` every 0.5s
+2. **Global allocator actor** maintains VRAM state across all nodes (named + detached)
+3. **Model actors** reserve VRAM before loading, preventing OOM
+4. **Ray Serve** places replicas based on VRAM availability
 
-### VRAM Custom Resource
+### Components
 
-- Worker startup script queries `nvidia-smi` to sum VRAM across all allocated GPUs
-- Reports total VRAM as Ray custom resource: `VRAM: <total_mb>`
-- Ray scheduler uses VRAM resource for task placement
-- Tasks request VRAM amount, Ray handles GPU assignment automatically
+- **`vram_allocator.py`**: Global VRAM state actor (singleton, HA-safe)
+- **`vram_monitor.py`**: DaemonSet script (stored in ConfigMap, see below)
+- **`vllm_model_actor.py`**: vLLM deployment with VRAM reservation
+- **`model_orchestrator.py`**: Declarative model deployment manager
 
-### Benefits
+### VRAM Monitor Script (ConfigMap)
 
-- **No per-node configuration**: Same manifest works for all GPU nodes
-- **Automatic GPU allocation**: Kubernetes gives all available GPUs per node
-- **VRAM-based scheduling**: Tasks request VRAM, not GPU counts
-- **Flexible placement**: Ray can use any GPU(s) in the worker's pool
-- **Heterogeneous GPU support**: Works with mixed GPU types per node
+The `vram_monitor.py` script runs in the DaemonSet and is stored in the ConfigMap. Here's the script:
+
+```python
+"""
+VRAM Monitor Script - runs in DaemonSet to update allocator.
+
+This script runs on each GPU node and continuously updates
+the global VRAM allocator with current VRAM state.
+"""
+import ray
+import subprocess
+import time
+import sys
+import os
+
+# Add scripts directory to path for imports
+sys.path.insert(0, "/scripts/vram-scheduler")
+
+from vram_allocator import get_vram_allocator
+
+def get_vram_gb():
+    """Get VRAM using nvidia-smi (mounted from host)."""
+    try:
+        env = os.environ.copy()
+        env['LD_LIBRARY_PATH'] = '/host/usr/lib/x86_64-linux-gnu:' + env.get('LD_LIBRARY_PATH', '')
+        # Get free VRAM
+        result_free = subprocess.run(
+            ['/host/usr/bin/nvidia-smi', '--query-gpu=memory.free', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, check=True, timeout=2, env=env
+        )
+        # Get total VRAM
+        result_total = subprocess.run(
+            ['/host/usr/bin/nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, check=True, timeout=2, env=env
+        )
+        free_values_mb = [int(x.strip()) for x in result_free.stdout.strip().split('\n') if x.strip()]
+        total_values_mb = [int(x.strip()) for x in result_total.stdout.strip().split('\n') if x.strip()]
+        free_gb = sum(free_values_mb) / 1024.0
+        total_gb = sum(total_values_mb) / 1024.0
+        return free_gb, total_gb
+    except Exception as e:
+        print(f"Error getting VRAM: {e}", file=sys.stderr, flush=True)
+        return None, None
+
+def main():
+    # Connect to Ray cluster
+    ray_address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
+    ray.init(address=ray_address, ignore_reinit_error=True)
+    
+    # Get the global allocator
+    allocator = get_vram_allocator()
+    
+    print("VRAM Monitor started - updating allocator every 0.5 seconds", 
+          file=sys.stderr, flush=True)
+    
+    while True:
+        try:
+            # Get actual VRAM
+            free_gb, total_gb = get_vram_gb()
+            
+            if free_gb is not None and total_gb is not None:
+                # Use Kubernetes node name as identifier
+                k8s_node_name = os.getenv("NODE_NAME", "unknown")
+                
+                # Update allocator with K8s node name as the key
+                ray.get(allocator.update_node.remote(k8s_node_name, free_gb, total_gb))
+                
+                print(f"K8s Node {k8s_node_name}: {free_gb:.2f}GB free / {total_gb:.2f}GB total", 
+                      file=sys.stderr, flush=True)
+            else:
+                print("Warning: Could not get VRAM", file=sys.stderr, flush=True)
+            
+            time.sleep(0.5)
+            
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()
+```
 
 ## Configuration
 
-### GPU Nodes
-
-The deployment automatically handles heterogeneous GPU configurations:
-- Each GPU node can have different GPUs (e.g., RTX 3060 Ti, RTX 3090, etc.)
-- Workers sum VRAM across all GPUs on the node
-- Ray treats all GPUs as a VRAM pool
-
-### Resource Limits
-
-For maximum compute, use resource requests only (no limits):
-```yaml
-resources:
-  requests:
-    cpu: "4"
-    memory: "8Gi"
-    nvidia.com/gpu: "10"  # High number, K8s gives all available
-  # No limits - jobs can use all available resources
-```
-
-## Monitoring
-
-- **Ray Dashboard**: `http://<LoadBalancer-IP>:8265`
-- **Prometheus Metrics**: `/metrics` endpoint
-- **Grafana Dashboard**: See `monitoring/grafana-dashboard.json`
+- **Ray Address**: `ray://10.0.1.53:10001` (LoadBalancer IP)
+- **Dashboard**: `http://10.0.1.53:8265`
+- **Cluster**: 6 worker nodes (3 CPU + 3 GPU), 6 GPUs total
+- **VRAM Tracking**: Per-node tracking via K8s node names
 
 ## Related Repositories
 

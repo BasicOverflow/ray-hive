@@ -1,0 +1,50 @@
+# Reference: Working test pod that successfully queried nvidia-smi
+# This pod was used to verify that privileged + hostNetwork + hostPID allows
+# access to nvidia-smi without allocating GPU resources
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-nvidia-reference
+  namespace: ray-system
+spec:
+  hostNetwork: true
+  hostPID: true
+  nodeSelector:
+    nvidia.com/gpu: "true"
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  containers:
+  - name: test-nvidia
+    image: rayproject/ray:2.53.0-py312-cu125
+    securityContext:
+      privileged: true
+    command: ["/host/usr/bin/nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"]
+    env:
+    - name: LD_LIBRARY_PATH
+      value: "/host/usr/lib/x86_64-linux-gnu"
+    volumeMounts:
+    - name: dev
+      mountPath: /dev
+    - name: nvidia-bin
+      mountPath: /host/usr/bin
+      readOnly: true
+    - name: nvidia-lib
+      mountPath: /host/usr/lib/x86_64-linux-gnu
+      readOnly: true
+  volumes:
+  - name: dev
+    hostPath:
+      path: /dev
+      type: Directory
+  - name: nvidia-bin
+    hostPath:
+      path: /usr/bin
+      type: Directory
+  - name: nvidia-lib
+    hostPath:
+      path: /usr/lib/x86_64-linux-gnu
+      type: Directory
+  restartPolicy: Never
+
