@@ -53,8 +53,13 @@ class VLLMModel:
         print(f"Model {model_id} loaded on {k8s_node_name}, reserved {required_vram_gb}GB", flush=True)
     
     def generate(self, prompt: str, **kwargs):
-        """Generate text using the model."""
-        return self.llm.generate(prompt, **kwargs)
+        """Generate text using the model. Returns extracted text strings."""
+        outputs = self.llm.generate(prompt, **kwargs)
+        # Extract text from vLLM RequestOutput objects to avoid serialization issues
+        # vLLM returns list of RequestOutput, each with outputs[0].text
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        return [output.outputs[0].text for output in outputs]
     
     def __del__(self):
         """Release VRAM reservation on cleanup."""

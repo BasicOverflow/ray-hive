@@ -42,6 +42,7 @@ Ray Worker Pods
 
 ### vLLM Model Deployment
 - Deploy models via Ray Serve with VRAM reservation
+- **Multiple models per GPU**: Fractional GPU allocation enables multiple replicas to share a single GPU
 - Declarative model configuration
 - Automatic scaling and placement
 - Zero OOM guarantees through hard reservations
@@ -123,6 +124,10 @@ python scripts/stress_tests/test_vram_resource.py
 2. **Global allocator actor** maintains VRAM state across all nodes (named + detached)
 3. **Model actors** reserve VRAM before loading, preventing OOM
 4. **Ray Serve** places replicas based on VRAM availability
+
+### Multiple Models Per GPU
+
+The system enables multiple vLLM replicas to share a single GPU through fractional GPU allocation (`num_gpus: 0.01`) and CUDA memory slicing. Each replica uses `torch.cuda.set_per_process_memory_fraction()` to hard-limit its VRAM usage before loading, with vLLM configured via `gpu_memory_utilization`. The Ray cluster manifest includes an initContainer to install vllm into a shared volume, CUDA environment variables (`PYTORCH_ALLOC_CONF`, `CUDA_DEVICE_MAX_CONNECTIONS`, `NCCL_P2P_DISABLE`, `NCCL_IB_DISABLE`) to prevent greedy memory allocation, privileged security context for GPU access, and host device mounts for NVIDIA drivers.
 
 ### Components
 
@@ -223,6 +228,10 @@ if __name__ == "__main__":
 - **Dashboard**: `http://10.0.1.53:8265`
 - **Cluster**: 6 worker nodes (3 CPU + 3 GPU), 6 GPUs total
 - **VRAM Tracking**: Per-node tracking via K8s node names
+
+## Troubleshooting
+
+When deploying multiple replicas that share a GPU, transient memory errors during initialization are expected. Ray Serve automatically retries failed deployments until models successfully load. If models consistently fail, verify VRAM requirements include a 70% buffer for overhead and that total VRAM doesn't exceed available GPU memory.
 
 ## Related Repositories
 
