@@ -216,6 +216,15 @@ spec:
             value: "1"
           - name: RAY_HEAD_ADDRESS
             value: "raycluster-head-svc:8265"
+          # CUDA memory slicing for multiple replicas per GPU
+          - name: PYTORCH_ALLOC_CONF
+            value: "max_split_size_mb:128,expandable_segments:True"
+          - name: CUDA_DEVICE_MAX_CONNECTIONS
+            value: "1"
+          - name: NCCL_P2P_DISABLE
+            value: "1"
+          - name: NCCL_IB_DISABLE
+            value: "1"
   
   # ergos-04-nv: 13 CPUs, 2 GPUs
   - groupName: gpu-workers-ergos-04-nv
@@ -302,6 +311,15 @@ spec:
             value: "1"
           - name: RAY_HEAD_ADDRESS
             value: "raycluster-head-svc:8265"
+          # CUDA memory slicing for multiple replicas per GPU
+          - name: PYTORCH_ALLOC_CONF
+            value: "max_split_size_mb:128,expandable_segments:True"
+          - name: CUDA_DEVICE_MAX_CONNECTIONS
+            value: "1"
+          - name: NCCL_P2P_DISABLE
+            value: "1"
+          - name: NCCL_IB_DISABLE
+            value: "1"
   
   # ergos-06-nv: 5 CPUs, 1 GPU
   - groupName: gpu-workers-ergos-06-nv
@@ -388,6 +406,15 @@ spec:
             value: "1"
           - name: RAY_HEAD_ADDRESS
             value: "raycluster-head-svc:8265"
+          # CUDA memory slicing for multiple replicas per GPU
+          - name: PYTORCH_ALLOC_CONF
+            value: "max_split_size_mb:128,expandable_segments:True"
+          - name: CUDA_DEVICE_MAX_CONNECTIONS
+            value: "1"
+          - name: NCCL_P2P_DISABLE
+            value: "1"
+          - name: NCCL_IB_DISABLE
+            value: "1"
         # VRAM monitor sidecar - reports free VRAM as custom resource
         - name: vram-monitor
           image: rayproject/ray:2.53.0-py312-cu125

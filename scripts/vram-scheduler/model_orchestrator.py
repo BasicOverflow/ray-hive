@@ -1,39 +1,32 @@
-"""
-Model Orchestrator - declarative model deployment.
-
-Defines desired model state and deploys them via Ray Serve.
-"""
+"""Model Orchestrator - declarative model deployment."""
 import ray
 from ray import serve
 from typing import Dict
 import sys
 import os
+import time
 
-# Set up path for imports (folder has hyphen, can't be imported as package)
 vram_scheduler_dir = os.path.dirname(os.path.abspath(__file__))
 if vram_scheduler_dir not in sys.path:
     sys.path.insert(0, vram_scheduler_dir)
 
-# Import at module level so it's available when serialized to remote workers
 import vllm_model_actor
 VLLMModel = vllm_model_actor.VLLMModel
 
 @ray.remote(num_cpus=0)
 class ModelOrchestrator:
-    """Orchestrates model deployment based on declarative state."""
+    """Deploys models via Ray Serve based on configuration."""
     
     def apply(self, model_configs: Dict):
-        """Deploy models according to configuration."""
-        
+        """Deploy all models from configuration."""
         for model_id, config in model_configs.items():
-            print(f"Deploying {model_id}: {config['name']}, "
-                  f"{config['vram_gb']}GB, {config['replicas']} replicas")
+            print(f"Deploying {model_id}: {config['name']}, {config['vram_gb']}GB, {config['replicas']} replicas")
             
             serve.run(
                 VLLMModel.options(
                     name=model_id,
                     autoscaling_config={
-                        "min_replicas": config["replicas"],  # Target replicas - VRAM allocator gates actual placement
+                        "min_replicas": config["replicas"],
                         "max_replicas": config["replicas"]
                     }
                 ).bind(
@@ -44,6 +37,7 @@ class ModelOrchestrator:
                 name=model_id,
                 route_prefix=f"/{model_id}"
             )
+            time.sleep(0.5)  # Stagger deployments to reduce race conditions
         
         print("All models deployed!")
 
