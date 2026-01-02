@@ -154,6 +154,10 @@ spec:
           operator: Exists
           effect: NoSchedule
         volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
         - name: nvidia-bin
           hostPath:
             path: /usr/bin
@@ -162,10 +166,27 @@ spec:
           hostPath:
             path: /usr/lib/x86_64-linux-gnu
             type: Directory
+        - name: vllm-install
+          emptyDir: {}
+        initContainers:
+        - name: install-vllm
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            pip install --no-cache-dir -t /vllm-install vllm
+            echo "vllm installed to /vllm-install"
+            ls -la /vllm-install/ | head -10
+          volumeMounts:
+          - name: vllm-install
+            mountPath: /vllm-install
         containers:
         - name: ray-worker
           image: rayproject/ray:2.53.0-py312-cu125
           imagePullPolicy: Always
+          securityContext:
+            privileged: true
           resources:
             requests:
               cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 12 CPUs (no limits)
@@ -176,16 +197,21 @@ spec:
               nvidia.com/gpu: "3"  # Must match request
             # No CPU limit - Ray will auto-detect all available CPUs
           volumeMounts:
+          - name: dev
+            mountPath: /dev
           - name: nvidia-bin
             mountPath: /host/usr/bin
             readOnly: true
           - name: nvidia-lib
             mountPath: /host/usr/lib/x86_64-linux-gnu
             readOnly: true
+          - name: vllm-install
+            mountPath: /vllm-install
           env:
           - name: LD_LIBRARY_PATH
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
-          env:
+          - name: PYTHONPATH
+            value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS
@@ -214,10 +240,39 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+        volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: nvidia-bin
+          hostPath:
+            path: /usr/bin
+            type: Directory
+        - name: nvidia-lib
+          hostPath:
+            path: /usr/lib/x86_64-linux-gnu
+            type: Directory
+        - name: vllm-install
+          emptyDir: {}
+        initContainers:
+        - name: install-vllm
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            pip install --no-cache-dir -t /vllm-install vllm
+            echo "vllm installed to /vllm-install"
+          volumeMounts:
+          - name: vllm-install
+            mountPath: /vllm-install
         containers:
         - name: ray-worker
           image: rayproject/ray:2.53.0-py312-cu125
           imagePullPolicy: Always
+          securityContext:
+            privileged: true
           resources:
             requests:
               cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 13 CPUs (no limits)
@@ -227,7 +282,22 @@ spec:
               memory: "18Gi"  # ergos-04-nv has 20 GB RAM - leave 2 GB for system
               nvidia.com/gpu: "2"  # Must match request
             # No CPU limit - Ray will auto-detect all available CPUs
+          volumeMounts:
+          - name: dev
+            mountPath: /dev
+          - name: nvidia-bin
+            mountPath: /host/usr/bin
+            readOnly: true
+          - name: nvidia-lib
+            mountPath: /host/usr/lib/x86_64-linux-gnu
+            readOnly: true
+          - name: vllm-install
+            mountPath: /vllm-install
           env:
+          - name: LD_LIBRARY_PATH
+            value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+          - name: PYTHONPATH
+            value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS
@@ -256,10 +326,39 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+        volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: nvidia-bin
+          hostPath:
+            path: /usr/bin
+            type: Directory
+        - name: nvidia-lib
+          hostPath:
+            path: /usr/lib/x86_64-linux-gnu
+            type: Directory
+        - name: vllm-install
+          emptyDir: {}
+        initContainers:
+        - name: install-vllm
+          image: rayproject/ray:2.53.0-py312-cu125
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            pip install --no-cache-dir -t /vllm-install vllm
+            echo "vllm installed to /vllm-install"
+          volumeMounts:
+          - name: vllm-install
+            mountPath: /vllm-install
         containers:
         - name: ray-worker
           image: rayproject/ray:2.53.0-py312-cu125
           imagePullPolicy: Always
+          securityContext:
+            privileged: true
           resources:
             requests:
               cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 5 CPUs (no limits)
@@ -269,7 +368,22 @@ spec:
               memory: "32Gi"  # ergos-06-nv has 34 GB RAM - leave 2 GB for system
               nvidia.com/gpu: "1"  # Must match request
             # No CPU limit - Ray will auto-detect all available CPUs
+          volumeMounts:
+          - name: dev
+            mountPath: /dev
+          - name: nvidia-bin
+            mountPath: /host/usr/bin
+            readOnly: true
+          - name: nvidia-lib
+            mountPath: /host/usr/lib/x86_64-linux-gnu
+            readOnly: true
+          - name: vllm-install
+            mountPath: /vllm-install
           env:
+          - name: LD_LIBRARY_PATH
+            value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+          - name: PYTHONPATH
+            value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS

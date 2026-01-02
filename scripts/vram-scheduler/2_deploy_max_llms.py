@@ -8,23 +8,41 @@ and deploys that many.
 Usage:
     python scripts/vram-scheduler/2_deploy_max_llms.py
     # Or with env vars:
-    MODEL_NAME="microsoft/phi-2" MODEL_VRAM_GB=3.0 python 2_deploy_max_llms.py
+    MODEL_NAME="microsoft/phi-2" MODEL_VRAM_GB=3.0 python scripts/vram-scheduler/2_deploy_max_llms.py
 """
 import ray
 import os
 import sys
 
-# Add repo root to path so vram_scheduler can be imported
-repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, repo_root)
+# Add vram-scheduler directory to path (folder has hyphen, can't be imported as package)
+vram_scheduler_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, vram_scheduler_dir)
 
-from scripts.vram_scheduler.vram_allocator import get_vram_allocator
-from scripts.vram_scheduler.vllm_model_actor import VLLMModel
+# Import modules directly (since folder name has hyphen)
+import vram_allocator
+import vllm_model_actor
+
+get_vram_allocator = vram_allocator.get_vram_allocator
+VLLMModel = vllm_model_actor.VLLMModel
 from ray import serve
 
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
 MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/phi-2")
 MODEL_VRAM_GB = float(os.getenv("MODEL_VRAM_GB", "3.0"))  # GB per model
+
+# Model configuration
+MODELS = {
+    "tinyllama": {
+        "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "vram_gb": 2.0,
+        "replicas": 1 
+    },
+    "qwen": {
+        "name": "Qwen/Qwen2-0.5B-Instruct",
+        "vram_gb": 1.0,
+        "replicas": 10
+    },
+}
 
 def main():
     ray.init(address=RAY_ADDRESS, ignore_reinit_error=True)

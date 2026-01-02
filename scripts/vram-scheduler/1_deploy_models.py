@@ -13,12 +13,30 @@ import ray
 import sys
 import os
 
-# Add repo root to path so vram_scheduler can be imported
-repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, repo_root)
+# Add vram-scheduler directory to path (folder has hyphen, can't be imported as package)
+vram_scheduler_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, vram_scheduler_dir)
 
-from scripts.vram_scheduler.model_orchestrator import ModelOrchestrator, MODELS
-from scripts.vram_scheduler.vram_allocator import get_vram_allocator
+# Import modules directly (since folder name has hyphen)
+import model_orchestrator
+import vram_allocator
+
+ModelOrchestrator = model_orchestrator.ModelOrchestrator
+get_vram_allocator = vram_allocator.get_vram_allocator
+
+# Model configuration
+MODELS = {
+    "tinyllama": {
+        "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "vram_gb": 2.0,
+        "replicas": 1 
+    },
+    "qwen": {
+        "name": "Qwen/Qwen2-0.5B-Instruct",
+        "vram_gb": 1.0,
+        "replicas": 10  # Multiple replicas can share GPUs (fractional GPU allocation)
+    },
+}
 
 def main():
     ray_address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")

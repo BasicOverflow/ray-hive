@@ -6,25 +6,17 @@ Defines desired model state and deploys them via Ray Serve.
 import ray
 from ray import serve
 from typing import Dict
+import sys
+import os
 
-# Declarative model state
-MODELS = {
-    "tinyllama": {
-        "name": "TinyLlama/TinyLlama-1.1B",
-        "vram_gb": 2.0,
-        "replicas": 10
-    },
-    "phi2": {
-        "name": "microsoft/phi-2",
-        "vram_gb": 3.0,
-        "replicas": 8
-    },
-    "qwen": {
-        "name": "Qwen/Qwen2-0.5B",
-        "vram_gb": 1.0,
-        "replicas": 12
-    },
-}
+# Set up path for imports (folder has hyphen, can't be imported as package)
+vram_scheduler_dir = os.path.dirname(os.path.abspath(__file__))
+if vram_scheduler_dir not in sys.path:
+    sys.path.insert(0, vram_scheduler_dir)
+
+# Import at module level so it's available when serialized to remote workers
+import vllm_model_actor
+VLLMModel = vllm_model_actor.VLLMModel
 
 @ray.remote(num_cpus=0)
 class ModelOrchestrator:
@@ -32,11 +24,6 @@ class ModelOrchestrator:
     
     def apply(self, model_configs: Dict):
         """Deploy models according to configuration."""
-        import sys
-        import os
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        sys.path.insert(0, repo_root)
-        from scripts.vram_scheduler.vllm_model_actor import VLLMModel
         
         for model_id, config in model_configs.items():
             print(f"Deploying {model_id}: {config['name']}, "
@@ -46,7 +33,7 @@ class ModelOrchestrator:
                 VLLMModel.options(
                     name=model_id,
                     autoscaling_config={
-                        "min_replicas": 0,
+                        "min_replicas": config["replicas"],  # Target replicas - VRAM allocator gates actual placement
                         "max_replicas": config["replicas"]
                     }
                 ).bind(
@@ -59,21 +46,4 @@ class ModelOrchestrator:
             )
         
         print("All models deployed!")
-
-
-if __name__ == "__main__":
-    import sys
-    import os
-    scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, scripts_dir)
-    
-    ray.init(address="ray://10.0.1.53:10001", ignore_reinit_error=True)
-    
-    # Initialize allocator
-    from vram_scheduler.vram_allocator import get_vram_allocator
-    get_vram_allocator()
-    
-    # Deploy models
-    orchestrator = ModelOrchestrator.remote()
-    ray.get(orchestrator.apply.remote(MODELS))
 

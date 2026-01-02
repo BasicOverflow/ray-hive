@@ -9,7 +9,7 @@ from ray import serve
 from typing import Optional
 
 @serve.deployment(
-    ray_actor_options={"num_gpus": 1},
+    ray_actor_options={"num_gpus": 0.01},  # Minimal GPU requirement - VRAM allocator handles actual placement
     autoscaling_config={
         "min_replicas": 0,
         "max_replicas": 20,
@@ -47,7 +47,11 @@ class VLLMModel:
         
         self.node_id = k8s_node_name
         
-        # Load model - no gpu_memory_utilization, exact allocation
+        # Load model - ensure CUDA is available
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available. Cannot load model.")
+        
         from vllm import LLM
         self.llm = LLM(model=model_name)
         

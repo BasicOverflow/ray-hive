@@ -64,6 +64,8 @@ ray-k3s-deployment/
 │   ├── vram-scheduler/                 # VRAM-aware scheduling system
 │   │   ├── 1_deploy_models.py         # Main: Deploy models from config
 │   │   ├── 2_deploy_max_llms.py       # Alternative: Deploy max replicas
+│   │   ├── 3_shutdown_models.py       # Shutdown deployments
+│   │   ├── 4_test_inference.py        # Test inference on models
 │   │   ├── vram_allocator.py          # Global VRAM allocator actor
 │   │   ├── vllm_model_actor.py        # vLLM model with VRAM reservation
 │   │   └── model_orchestrator.py      # Declarative model deployment

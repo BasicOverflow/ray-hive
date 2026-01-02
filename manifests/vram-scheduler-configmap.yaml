@@ -143,16 +143,35 @@ data:
     def main():
         # Connect to Ray cluster
         ray_address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
-        ray.init(address=ray_address, ignore_reinit_error=True)
+        allocator = None
         
-        # Get the global allocator
-        allocator = get_vram_allocator()
+        print("VRAM Monitor starting...", file=sys.stderr, flush=True)
         
-        print("VRAM Monitor started - updating allocator every 0.5 seconds", 
-              file=sys.stderr, flush=True)
+        # Retry connection until successful
+        while True:
+            try:
+                if not ray.is_initialized():
+                    print(f"Connecting to Ray at {ray_address}...", file=sys.stderr, flush=True)
+                    ray.init(address=ray_address, ignore_reinit_error=True)
+                
+                # Get the global allocator
+                allocator = get_vram_allocator()
+                print("VRAM Monitor connected - updating allocator every 0.5 seconds", 
+                      file=sys.stderr, flush=True)
+                break
+                
+            except Exception as e:
+                print(f"Failed to connect to Ray: {e}", file=sys.stderr, flush=True)
+                time.sleep(5)
         
         while True:
             try:
+                # Check if Ray is still connected, reconnect if needed
+                if not ray.is_initialized():
+                    print("Ray connection lost, reconnecting...", file=sys.stderr, flush=True)
+                    ray.init(address=ray_address, ignore_reinit_error=True)
+                    allocator = get_vram_allocator()
+                
                 # Get actual VRAM
                 free_gb, total_gb = get_vram_gb()
                 
@@ -174,7 +193,12 @@ data:
                 print(f"Error: {e}", file=sys.stderr, flush=True)
                 import traceback
                 traceback.print_exc(file=sys.stderr)
-                time.sleep(1)
+                # Try to reconnect on error
+                try:
+                    ray.shutdown()
+                except:
+                    pass
+                time.sleep(5)
 
     if __name__ == "__main__":
         main()
