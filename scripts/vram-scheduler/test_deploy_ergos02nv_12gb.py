@@ -27,10 +27,6 @@ def main():
     ray_utils.init_ray(suppress_logging=SUPPRESS_LOGGING)
     
     allocator = get_vram_allocator()
-    
-    import time
-    time.sleep(1)
-    
     state = ray.get(allocator.get_all_gpus.remote())
     
     print(f"\nTargeting SPECIFIC GPU: {TARGET_GPU_KEY}")

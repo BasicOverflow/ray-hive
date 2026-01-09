@@ -26,11 +26,6 @@ def main():
     
     # Calculate max replicas based on available VRAM per node
     allocator = get_vram_allocator()
-    
-    # Wait a moment for daemonset to update if needed
-    import time
-    time.sleep(1)
-    
     state = ray.get(allocator.get_all_gpus.remote())
     
     # Calculate replicas per GPU, then sum
