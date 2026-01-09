@@ -70,93 +70,6 @@ class ModelOrchestrator:
             route_prefix=f"/{model_id}"  # Unified route prefix
         )
     
-    def _wait_for_deployment_ready(self, deployment_name: str, expected_replicas: int, gpu_key: str = None, timeout: int = 300) -> bool:
-        """Wait for deployment to have expected number of replicas fully initialized (RUNNING).
-        
-        Also waits for pending VRAM reservations to clear on the GPU to ensure replicas are fully loaded.
-        Returns True if deployment is ready, False if timeout.
-        """
-        start_time = time.time()
-        check_interval = 5
-        max_checks = timeout // check_interval
-        
-        allocator = ray.get_actor("vram_allocator", namespace="system")
-        
-        for check_num in range(max_checks):
-            try:
-                status = serve.status()
-                
-                # Check all applications for this deployment
-                for app_name, app_info in status.applications.items():
-                    if hasattr(app_info, 'deployments') and deployment_name in app_info.deployments:
-                        dep = app_info.deployments[deployment_name]
-                        
-                        # Check if deployment exists and has replicas
-                        if hasattr(dep, 'status'):
-                            dep_status_str = str(dep.status).upper()
-                            if 'ERROR' in dep_status_str or 'FAILED' in dep_status_str:
-                                print(f"    Deployment {deployment_name} is in error state")
-                                return False
-                        
-                        # Count RUNNING replicas (fully initialized) and check for errors
-                        running = 0
-                        error_count = 0
-                        if hasattr(dep, 'replicas') and dep.replicas:
-                            for replica in dep.replicas:
-                                if hasattr(replica, 'state'):
-                                    state = str(replica.state).upper()
-                                    if state == 'RUNNING':
-                                        running += 1
-                                    elif 'ERROR' in state or 'FAILED' in state:
-                                        error_count += 1
-                        
-                        if error_count > 0:
-                            print(f"    ⚠️  Deployment {deployment_name} has {error_count} replicas in error state")
-                            return False
-                        
-                        # Check pending reservations for status reporting only
-                        pending_gb = 0
-                        if gpu_key:
-                            try:
-                                gpu_info = ray.get(allocator.get_gpu_vram.remote(gpu_key))
-                                if gpu_info:
-                                    pending_gb = gpu_info.get("pending", 0)
-                            except:
-                                pass
-                        
-                        if check_num % 3 == 0:  # Print every 3 checks (every 15s)
-                            print(f"    Deployment {deployment_name}: {running}/{expected_replicas} RUNNING, {pending_gb:.2f}GB pending on {gpu_key}")
-                        
-                        # Wait for all replicas to be RUNNING
-                        # If replicas are RUNNING, they've already called mark_initialized() and moved from pending to active
-                        if running >= expected_replicas:
-                            print(f"    ✅ All {expected_replicas} replicas RUNNING on {gpu_key}")
-                            return True
-                
-                time.sleep(check_interval)
-            except Exception as e:
-                time.sleep(check_interval)
-        
-        # Final check
-        try:
-            status = serve.status()
-            for app_name, app_info in status.applications.items():
-                if hasattr(app_info, 'deployments') and deployment_name in app_info.deployments:
-                    dep = app_info.deployments[deployment_name]
-                    running = 0
-                    if hasattr(dep, 'replicas') and dep.replicas:
-                        for replica in dep.replicas:
-                            if hasattr(replica, 'state') and str(replica.state).upper() == 'RUNNING':
-                                running += 1
-                    if running >= expected_replicas:
-                        print(f"    Deployment {deployment_name}: {running} replicas RUNNING (proceeding)")
-                        return True
-        except:
-            pass
-        
-        print(f"    WARNING: Timeout waiting for {deployment_name} to be fully ready")
-        return False
-    
     def apply(self, model_configs: Dict):
         """Deploy all models from configuration."""
         for model_id, config in model_configs.items():
@@ -167,32 +80,10 @@ class ModelOrchestrator:
             gpu_info_map = ray.get(allocator.get_all_gpus.remote())
             
             if not gpu_info_map:
-                print(f"  WARNING: No GPU info available, falling back to single deployment")
-                # Fallback to single deployment
-                serve.run(
-                    VLLMModel.options(
-                        name=model_id,
-                        ray_actor_options={
-                            "num_gpus": 0.01,
-                            "memory": 2 * 1024 * 1024 * 1024,
-                        },
-                        autoscaling_config={
-                            "min_replicas": config["replicas"],
-                            "max_replicas": config["replicas"]
-                        }
-                    ).bind(
-                        model_id=model_id,
-                        model_name=config["name"],
-                        required_vram_gb=config["vram_gb"]
-                    ),
-                    name=model_id,
-                    route_prefix=f"/{model_id}"
-                )
-                continue
+                raise RuntimeError("No GPU info available from VRAM allocator")
             
             # Use VRAM requirement directly (no multipliers - already accounts for model + KV cache + overhead)
             required_per_replica_gb = config["vram_gb"]
-            required_per_replica_mb = int(required_per_replica_gb * 1024)  # Convert to MB for resource request
             
             # Distribute replicas across GPUs based on available VRAM
             # Group GPUs and calculate replicas per GPU
@@ -216,7 +107,6 @@ class ModelOrchestrator:
                     break
                 
                 available_gb = gpu_info.get("available", 0)
-                available_mb = int(available_gb * 1024)
                 total_gb = gpu_info.get("total", 16.0)
                 
                 # Apply VRAM buffer (hard buffer per GPU)
@@ -236,9 +126,7 @@ class ModelOrchestrator:
                     resource_name = f"{node_name}_gpu{gpu_id}"
                     
                     # Calculate GPU fraction for this deployment
-                    # Use actual VRAM requirement (no conservative caps)
-                    total_gb = gpu_info.get("total", 16.0)
-                    gpu_fraction = (required_per_replica_gb * replicas_for_gpu) / total_gb / replicas_for_gpu
+                    gpu_fraction = required_per_replica_gb / total_gb
                     gpu_fraction = max(gpu_fraction, 0.01)  # Minimum 0.01 to allow scheduling
                     gpu_fraction = round(gpu_fraction, 2)  # Round to 2 decimal places
                     
@@ -305,15 +193,9 @@ class ModelOrchestrator:
                     route_prefix=f"/{deployment_name}"  # Unique route for direct access
                 )
             
-            # Create router deployment that provides unified endpoint
-            # Router uses Ray Serve's built-in load balancing via deployment handles
+            # Create router deployment that provides unified endpoint (only if multiple GPUs)
             if len(gpu_deployment_names) > 1:
                 print(f"  Creating router deployment for unified endpoint: /{model_id}")
-                self._create_router_deployment(model_id, gpu_deployment_names, gpu_app_names)
-            elif len(gpu_deployment_names) == 1:
-                # Single deployment - no router needed, but create alias for consistency
-                print(f"  Single deployment - accessible at /{gpu_deployment_names[0]} or /{model_id}")
-                # Optionally create router anyway for consistent API
                 self._create_router_deployment(model_id, gpu_deployment_names, gpu_app_names)
         
         print("All models deployed!")

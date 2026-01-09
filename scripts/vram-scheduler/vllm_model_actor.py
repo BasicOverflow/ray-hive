@@ -71,18 +71,10 @@ class VLLMModel:
         else:
             k8s_node_name = hostname
         
-        # Use VRAM requirement directly (already accounts for model + KV cache + overhead)
-        actual_required_gb = required_vram_gb
-        
-        # Determine GPU key based on target_gpu_id
-        if target_gpu_id is not None:
-            # We set CUDA_VISIBLE_DEVICES, so we know exactly which GPU we're using
-            gpu_key = f"{k8s_node_name}:gpu{target_gpu_id}"
-        else:
-            # Legacy: detect actual GPU being used (CUDA is already initialized)
-            actual_gpu_id = torch.cuda.current_device()
-            gpu_key = f"{k8s_node_name}:gpu{actual_gpu_id}"
-        
+        # Determine GPU key - target_gpu_id is always provided now
+        if target_gpu_id is None:
+            raise RuntimeError("target_gpu_id must be provided")
+        gpu_key = f"{k8s_node_name}:gpu{target_gpu_id}"
         self.gpu_key = gpu_key
         
         # Acquire per-GPU lock on the actual GPU BEFORE any memory checks or vLLM initialization
@@ -102,11 +94,11 @@ class VLLMModel:
         
         try:
             # Reserve VRAM on the actual GPU
-            reserved = ray.get(allocator.reserve.remote(replica_id, gpu_key, actual_required_gb))
+            reserved = ray.get(allocator.reserve.remote(replica_id, gpu_key, required_vram_gb))
             if not reserved:
                 gpu_info = ray.get(allocator.get_gpu_vram.remote(gpu_key))
                 available_gb = gpu_info.get("available", 0) if gpu_info else 0
-                raise RuntimeError(f"VRAM reservation failed on {gpu_key}: need {actual_required_gb:.2f}GB, have {available_gb:.2f}GB available")
+                raise RuntimeError(f"VRAM reservation failed on {gpu_key}: need {required_vram_gb:.2f}GB, have {available_gb:.2f}GB available")
             
             # Get GPU memory info from allocator (uses nvidia-smi data from daemonset)
             gpu_info = ray.get(allocator.get_gpu_vram.remote(gpu_key))
@@ -117,20 +109,12 @@ class VLLMModel:
             total_memory_gb = gpu_info.get("total", 0)
             if total_memory_gb == 0:
                 # Fallback to CUDA if allocator doesn't have total
-                total_memory_gb = torch.cuda.get_device_properties(actual_gpu_id).total_memory / (1024**3)
+                cuda_device_id = torch.cuda.current_device()
+                total_memory_gb = torch.cuda.get_device_properties(cuda_device_id).total_memory / (1024**3)
             
-            # Calculate utilization based on actual VRAM requirement (no conservative multipliers)
-            gpu_memory_utilization = actual_required_gb / total_memory_gb
+            # Calculate utilization based on actual VRAM requirement
+            gpu_memory_utilization = required_vram_gb / total_memory_gb
             gpu_memory_utilization = max(0.05, min(gpu_memory_utilization, 0.95))  # Cap at 95% to avoid OOM
-            
-            # Memory check using daemonset's nvidia-smi data (consistent with reservation system)
-            # The reservation already validated availability, but we double-check using the same source
-            free_gb = gpu_info.get("free", 0)  # nvidia-smi free from daemonset
-            requested_by_vllm_gb = gpu_memory_utilization * total_memory_gb
-            
-            if free_gb < requested_by_vllm_gb:
-                available_gb = gpu_info.get("available", 0)
-                raise RuntimeError(f"Insufficient GPU memory on {gpu_key}: need {requested_by_vllm_gb:.2f}GB, have {free_gb:.2f}GB free (available: {available_gb:.2f}GB) from nvidia-smi")
             
             # Import vLLM
             try:
