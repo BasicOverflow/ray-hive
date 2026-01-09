@@ -114,7 +114,7 @@ class VLLMModel:
             
             # Calculate utilization based on actual VRAM requirement
             gpu_memory_utilization = required_vram_gb / total_memory_gb
-            gpu_memory_utilization = max(0.05, min(gpu_memory_utilization, 0.95))  # Cap at 95% to avoid OOM
+            gpu_memory_utilization = max(0.05, min(gpu_memory_utilization, 1.0))  # Cap at 100%
             
             # Import vLLM
             try:
