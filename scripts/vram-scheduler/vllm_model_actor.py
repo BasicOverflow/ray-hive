@@ -166,7 +166,19 @@ class VLLMModel:
     
     def generate(self, prompt: str, **kwargs):
         """Generate text using the model."""
-        outputs = self.llm.generate(prompt, **kwargs)
+        from vllm import SamplingParams
+        
+        # Extract sampling parameters from kwargs
+        sampling_params = SamplingParams(
+            max_tokens=kwargs.get("max_tokens", 256),
+            temperature=kwargs.get("temperature", 1.0),
+            top_p=kwargs.get("top_p", 1.0),
+            top_k=kwargs.get("top_k", -1),
+            stop=kwargs.get("stop", None),
+            stop_token_ids=kwargs.get("stop_token_ids", None),
+        )
+        
+        outputs = self.llm.generate([prompt], sampling_params)
         # Extract text from vLLM RequestOutput objects
         if hasattr(outputs, '__iter__'):
             results = []

@@ -19,13 +19,8 @@ class ModelOrchestrator:
     # VRAM buffer - hard buffer to leave free on every GPU
     VRAM_BUFFER_GB = 0.4  # 0.4GB buffer per GPU
     
-    def _create_router_deployment(self, model_id: str, deployment_names: List[str], app_names: List[str]):
-        """Create a router deployment that forwards requests to all GPU-specific deployments.
-        
-        Uses Ray Serve's built-in load balancing: deployment handles automatically load balance
-        across replicas within each deployment. The router just selects which deployment handle
-        to use, and Ray Serve handles the rest.
-        """
+    def _create_router_deployment(self, model_id: str, deployment_names: List[str], app_names: List[str], replica_counts: List[int]):
+        """Create a router deployment that forwards requests to all GPU-specific deployments with weighted load balancing."""
         import random
         
         @serve.deployment(
@@ -35,30 +30,68 @@ class ModelOrchestrator:
         class Router:
             def __init__(self):
                 self.deployment_handles = []
-                # Get handles to all GPU deployments
-                # Ray Serve handles automatically load balance across replicas within each deployment
-                for dep_name, app_name in zip(deployment_names, app_names):
+                self.deployment_names = []
+                self.weights = []
+                self.request_counts = []
+                self.round_robin_counters = []
+                connected_replicas = []
+                
+                total_replicas = sum(replica_counts)
+                
+                for dep_name, app_name, replicas in zip(deployment_names, app_names, replica_counts):
                     try:
                         handle = serve.get_deployment_handle(dep_name, app_name=app_name)
                         self.deployment_handles.append(handle)
-                        print(f"    Router: Connected to {dep_name} in {app_name}")
+                        self.deployment_names.append(dep_name)
+                        connected_replicas.append(replicas)
+                        self.request_counts.append(0)
+                        self.round_robin_counters.append(0.0)
+                        print(f"    Router: Connected to {dep_name} ({replicas} replicas)")
                     except Exception as e:
                         print(f"    Router: Warning - Could not connect to {dep_name}: {e}")
                 
                 if not self.deployment_handles:
                     raise RuntimeError("Router: No deployment handles available")
                 
-                print(f"    Router: Load balancing across {len(self.deployment_handles)} deployments")
+                # Calculate weights based on connected deployments only
+                connected_total = sum(connected_replicas)
+                if connected_total > 0:
+                    self.weights = [r / connected_total for r in connected_replicas]
+                    for name, weight in zip(self.deployment_names, self.weights):
+                        print(f"    Router: {name} weight: {weight*100:.1f}%")
+                else:
+                    # Fallback to equal weights if no replicas info
+                    self.weights = [1.0 / len(self.deployment_handles)] * len(self.deployment_handles)
             
             async def __call__(self, request):
-                """Forward request to a random deployment handle.
+                """Forward request using weighted round-robin to ensure all deployments get requests."""
+                # Use weighted round-robin: select deployment with lowest (counter / weight)
+                # This ensures all deployments get requests proportional to their weights
+                idx = min(range(len(self.deployment_handles)), 
+                          key=lambda i: self.round_robin_counters[i] / self.weights[i] if self.weights[i] > 0 else float('inf'))
+                handle = self.deployment_handles[idx]
+                self.request_counts[idx] += 1
+                self.round_robin_counters[idx] += 1
                 
-                Ray Serve's deployment handles automatically load balance across replicas
-                within each deployment, so we just need to select which deployment to use.
-                """
-                # Random selection across deployments (Ray Serve handles load balancing within each)
-                handle = random.choice(self.deployment_handles)
-                return await handle.generate.remote(request)
+                prompt = request.get("prompt", "") if isinstance(request, dict) else str(request)
+                kwargs = {k: v for k, v in request.items() if k != "prompt"} if isinstance(request, dict) else {}
+                result = await handle.generate.remote(prompt, **kwargs)
+                # Convert list result to dict format
+                if isinstance(result, list) and len(result) > 0:
+                    return {"text": result[0] if isinstance(result[0], str) else str(result[0])}
+                return {"text": str(result)}
+            
+            def get_stats(self):
+                """Get request distribution statistics."""
+                total = sum(self.request_counts)
+                if total == 0:
+                    return ["No requests processed yet"]
+                stats = []
+                for name, count, weight in zip(self.deployment_names, self.request_counts, self.weights):
+                    pct = (count / total * 100) if total > 0 else 0
+                    expected = weight * 100
+                    stats.append(f"{name}: {count} requests ({pct:.1f}% actual, {expected:.1f}% expected)")
+                return stats
         
         serve.run(
             Router.bind(),
@@ -189,7 +222,8 @@ class ModelOrchestrator:
             # Create router deployment that provides unified endpoint (only if multiple GPUs)
             if len(gpu_deployment_names) > 1:
                 print(f"  Creating router deployment for unified endpoint: /{model_id}")
-                self._create_router_deployment(model_id, gpu_deployment_names, gpu_app_names)
+                replica_counts = [info["replicas"] for info in gpu_deployments]
+                self._create_router_deployment(model_id, gpu_deployment_names, gpu_app_names, replica_counts)
         
         print("All models deployed!")
 
