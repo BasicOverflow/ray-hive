@@ -4,7 +4,6 @@ from ray import serve
 from typing import Dict, List
 import sys
 import os
-import time
 
 vram_scheduler_dir = os.path.dirname(os.path.abspath(__file__))
 if vram_scheduler_dir not in sys.path:
@@ -57,9 +56,6 @@ class ModelOrchestrator:
                 Ray Serve's deployment handles automatically load balance across replicas
                 within each deployment, so we just need to select which deployment to use.
                 """
-                if not self.deployment_handles:
-                    return {"error": "No deployments available"}
-                
                 # Random selection across deployments (Ray Serve handles load balancing within each)
                 handle = random.choice(self.deployment_handles)
                 return await handle.generate.remote(request)
@@ -133,6 +129,7 @@ class ModelOrchestrator:
                     gpu_deployments.append({
                         "gpu_key": gpu_key,
                         "resource_name": resource_name,
+                        "gpu_id": gpu_id,  # Store GPU ID to avoid re-extraction
                         "replicas": replicas_for_gpu,
                         "gpu_fraction": gpu_fraction
                     })
@@ -152,13 +149,9 @@ class ModelOrchestrator:
             
             for deployment_info in gpu_deployments:
                 total_replicas = deployment_info["replicas"]
+                gpu_id = deployment_info["gpu_id"]
                 deployment_name = f"{model_id}-{deployment_info['gpu_key'].replace(':', '-').replace('_', '-')}"
                 app_name = f"{model_id}-gpu-{deployment_info['gpu_key'].replace(':', '-')}"  # Unique app name per GPU
-                
-                # Extract GPU ID from gpu_key (e.g., "ergos-02-nv:gpu2" -> "2")
-                gpu_key = deployment_info["gpu_key"]
-                _, gpu_id_str = gpu_key.split(":")
-                gpu_id = gpu_id_str.replace("gpu", "")
                 
                 gpu_deployment_names.append(deployment_name)
                 gpu_app_names.append(app_name)

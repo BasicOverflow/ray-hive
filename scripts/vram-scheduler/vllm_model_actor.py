@@ -19,17 +19,18 @@ class VLLMModel:
     def __init__(self, model_id: str, model_name: str, required_vram_gb: float, target_gpu_id: str = None):
         self.model_id = model_id
         self.required_vram_gb = required_vram_gb
-        self.replica_id = None
-        self.gpu_key = None
         
         # Set up Python path first
         import sys
         import os
         
-        # Set CUDA_VISIBLE_DEVICES BEFORE importing torch if target_gpu_id is specified
+        # Determine GPU key - target_gpu_id is always provided now
+        if target_gpu_id is None:
+            raise RuntimeError("target_gpu_id must be provided")
+        
+        # Set CUDA_VISIBLE_DEVICES BEFORE importing torch
         # This forces the actor to use only the specified GPU
-        if target_gpu_id is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = target_gpu_id
+        os.environ["CUDA_VISIBLE_DEVICES"] = target_gpu_id
         
         vllm_paths = [
             "/vllm-install",
@@ -51,8 +52,7 @@ class VLLMModel:
         
         # Get unique replica ID
         actor_id = ray.get_runtime_context().get_actor_id()
-        replica_id = f"{model_id}-{actor_id}"
-        self.replica_id = replica_id
+        self.replica_id = f"{model_id}-{actor_id}"
         
         # Get K8s node name from hostname
         import socket
@@ -71,30 +71,24 @@ class VLLMModel:
         else:
             k8s_node_name = hostname
         
-        # Determine GPU key - target_gpu_id is always provided now
-        if target_gpu_id is None:
-            raise RuntimeError("target_gpu_id must be provided")
         gpu_key = f"{k8s_node_name}:gpu{target_gpu_id}"
         self.gpu_key = gpu_key
         
         # Acquire per-GPU lock on the actual GPU BEFORE any memory checks or vLLM initialization
         import time
         max_lock_attempts = 300
-        lock_acquired = False
         for attempt in range(max_lock_attempts):
-            lock_acquired = ray.get(allocator.acquire_gpu_lock.remote(gpu_key, replica_id))
-            if lock_acquired:
+            if ray.get(allocator.acquire_gpu_lock.remote(gpu_key, self.replica_id)):
                 break
             if attempt % 20 == 0:
                 print(f"[{model_id}] Waiting for GPU lock on {gpu_key} (attempt {attempt + 1}/{max_lock_attempts})...", flush=True)
             time.sleep(0.5)
-        
-        if not lock_acquired:
+        else:
             raise RuntimeError(f"Failed to acquire GPU lock on {gpu_key} after {max_lock_attempts} attempts")
         
         try:
             # Reserve VRAM on the actual GPU
-            reserved = ray.get(allocator.reserve.remote(replica_id, gpu_key, required_vram_gb))
+            reserved = ray.get(allocator.reserve.remote(self.replica_id, gpu_key, required_vram_gb))
             if not reserved:
                 gpu_info = ray.get(allocator.get_gpu_vram.remote(gpu_key))
                 available_gb = gpu_info.get("available", 0) if gpu_info else 0
@@ -149,16 +143,16 @@ class VLLMModel:
                         raise
             
             # Mark as successfully initialized
-            ray.get(allocator.mark_initialized.remote(replica_id, gpu_key))
+            ray.get(allocator.mark_initialized.remote(self.replica_id, gpu_key))
             print(f"[{model_id}] ✅ Model loaded on {gpu_key}", flush=True)
             
         except Exception as e:
             # Release reservation and lock on failure
-            ray.get(allocator.release.remote(replica_id, gpu_key))
+            ray.get(allocator.release.remote(self.replica_id, gpu_key))
             raise
         finally:
             # Always release lock
-            ray.get(allocator.release_gpu_lock.remote(gpu_key, replica_id))
+            ray.get(allocator.release_gpu_lock.remote(gpu_key, self.replica_id))
     
     def __del__(self):
         """Cleanup: release VRAM reservation."""
