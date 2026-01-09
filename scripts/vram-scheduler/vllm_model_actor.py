@@ -16,7 +16,7 @@ from ray import serve
 class VLLMModel:
     """vLLM model with per-GPU sequential initialization."""
     
-    def __init__(self, model_id: str, model_name: str, required_vram_gb: float):
+    def __init__(self, model_id: str, model_name: str, required_vram_gb: float, target_gpu_id: str = None):
         self.model_id = model_id
         self.required_vram_gb = required_vram_gb
         self.replica_id = None
@@ -25,6 +25,12 @@ class VLLMModel:
         # Set up Python path first
         import sys
         import os
+        
+        # Set CUDA_VISIBLE_DEVICES BEFORE importing torch if target_gpu_id is specified
+        # This forces the actor to use only the specified GPU
+        if target_gpu_id is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = target_gpu_id
+        
         vllm_paths = [
             "/vllm-install",
             "/vllm-install/lib/python3.12/site-packages"

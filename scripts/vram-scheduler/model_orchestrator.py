@@ -17,8 +17,8 @@ VLLMModel = vllm_model_actor.VLLMModel
 class ModelOrchestrator:
     """Deploys models via Ray Serve based on configuration."""
     
-    # VRAM buffer percentage - leave this percentage of GPU capacity free
-    VRAM_BUFFER_PERCENT = 0.15  # 15% buffer (e.g., 3.6GB on 24GB GPU)
+    # VRAM buffer - hard buffer to leave free on every GPU
+    VRAM_BUFFER_GB = 0.5  # 0.5GB buffer per GPU
     
     def _create_router_deployment(self, model_id: str, deployment_names: List[str], app_names: List[str]):
         """Create a router deployment that forwards requests to all GPU-specific deployments.
@@ -219,8 +219,8 @@ class ModelOrchestrator:
                 available_mb = int(available_gb * 1024)
                 total_gb = gpu_info.get("total", 16.0)
                 
-                # Apply VRAM buffer (percentage of total GPU capacity)
-                buffer_gb = total_gb * self.VRAM_BUFFER_PERCENT
+                # Apply VRAM buffer (hard buffer per GPU)
+                buffer_gb = self.VRAM_BUFFER_GB
                 available_with_buffer = max(0, available_gb - buffer_gb)
                 
                 # Calculate how many replicas can fit on this GPU based on available VRAM (with buffer)
@@ -267,11 +267,17 @@ class ModelOrchestrator:
                 deployment_name = f"{model_id}-{deployment_info['gpu_key'].replace(':', '-').replace('_', '-')}"
                 app_name = f"{model_id}-gpu-{deployment_info['gpu_key'].replace(':', '-')}"  # Unique app name per GPU
                 
+                # Extract GPU ID from gpu_key (e.g., "ergos-02-nv:gpu2" -> "2")
+                gpu_key = deployment_info["gpu_key"]
+                _, gpu_id_str = gpu_key.split(":")
+                gpu_id = gpu_id_str.replace("gpu", "")
+                
                 gpu_deployment_names.append(deployment_name)
                 gpu_app_names.append(app_name)
                 
                 print(f"  Creating deployment {deployment_name} with {total_replicas} replicas")
                 print(f"    Resource: {deployment_info['resource_name']} = 1")
+                print(f"    GPU ID: {gpu_id} (CUDA_VISIBLE_DEVICES={gpu_id})")
                 print(f"    GPU fraction per replica: {deployment_info['gpu_fraction']:.2f}")
                 print(f"    Application: {app_name}")
                 
@@ -292,7 +298,8 @@ class ModelOrchestrator:
                     ).bind(
                         model_id=model_id,
                         model_name=config["name"],
-                        required_vram_gb=config["vram_gb"]
+                        required_vram_gb=config["vram_gb"],
+                        target_gpu_id=gpu_id
                     ),
                     name=app_name,  # Unique app name per GPU deployment
                     route_prefix=f"/{deployment_name}"  # Unique route for direct access
