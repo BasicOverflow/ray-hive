@@ -173,10 +173,36 @@ spec:
         - name: install-vllm
           image: rayproject/ray:2.53.0-py312-cu125
           imagePullPolicy: Always
+          securityContext:
+            privileged: true
           command: ["/bin/bash", "-c"]
           args:
           - |
             set -e  # Exit on any error
+            echo "Installing ninja..."
+            # Install ninja via pip (works in all environments)
+            pip install ninja || {
+              echo "ERROR: ninja installation failed!"
+              exit 1
+            }
+            # Find ninja binary installed by pip and copy to shared location
+            NINJA_PATH=$(python3 -c "import ninja; import os; print(os.path.join(os.path.dirname(ninja.__file__), 'data', 'bin', 'ninja'))" 2>/dev/null || which ninja || find /home/ray -name ninja -type f 2>/dev/null | head -1)
+            if [ -n "$NINJA_PATH" ] && [ -f "$NINJA_PATH" ]; then
+              mkdir -p /vllm-install/bin
+              cp "$NINJA_PATH" /vllm-install/bin/ninja
+              chmod +x /vllm-install/bin/ninja
+              echo "ninja installed and copied to /vllm-install/bin from $NINJA_PATH"
+            else
+              # Fallback: try to find ninja in PATH after pip install
+              if command -v ninja &> /dev/null; then
+                mkdir -p /vllm-install/bin
+                cp $(which ninja) /vllm-install/bin/ninja
+                chmod +x /vllm-install/bin/ninja
+                echo "ninja found in PATH and copied to /vllm-install/bin"
+              else
+                echo "WARNING: ninja installed but binary not found - flashinfer may fail to compile"
+              fi
+            fi
             echo "Installing vllm to /vllm-install..."
             # Install vllm - pip -t creates lib/python3.12/site-packages structure
             pip install --no-cache-dir -t /vllm-install vllm || {
@@ -246,6 +272,8 @@ spec:
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
           - name: PYTHONPATH
             value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
+          - name: PATH
+            value: "/vllm-install/bin:/home/ray/anaconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS
@@ -308,10 +336,36 @@ spec:
         - name: install-vllm
           image: rayproject/ray:2.53.0-py312-cu125
           imagePullPolicy: Always
+          securityContext:
+            privileged: true
           command: ["/bin/bash", "-c"]
           args:
           - |
             set -e  # Exit on any error
+            echo "Installing ninja..."
+            # Install ninja via pip (works in all environments)
+            pip install ninja || {
+              echo "ERROR: ninja installation failed!"
+              exit 1
+            }
+            # Find ninja binary installed by pip and copy to shared location
+            NINJA_PATH=$(python3 -c "import ninja; import os; print(os.path.join(os.path.dirname(ninja.__file__), 'data', 'bin', 'ninja'))" 2>/dev/null || which ninja || find /home/ray -name ninja -type f 2>/dev/null | head -1)
+            if [ -n "$NINJA_PATH" ] && [ -f "$NINJA_PATH" ]; then
+              mkdir -p /vllm-install/bin
+              cp "$NINJA_PATH" /vllm-install/bin/ninja
+              chmod +x /vllm-install/bin/ninja
+              echo "ninja installed and copied to /vllm-install/bin from $NINJA_PATH"
+            else
+              # Fallback: try to find ninja in PATH after pip install
+              if command -v ninja &> /dev/null; then
+                mkdir -p /vllm-install/bin
+                cp $(which ninja) /vllm-install/bin/ninja
+                chmod +x /vllm-install/bin/ninja
+                echo "ninja found in PATH and copied to /vllm-install/bin"
+              else
+                echo "WARNING: ninja installed but binary not found - flashinfer may fail to compile"
+              fi
+            fi
             echo "Installing vllm to /vllm-install..."
             # Install vllm - pip -t creates lib/python3.12/site-packages structure
             pip install --no-cache-dir -t /vllm-install vllm || {
@@ -381,6 +435,8 @@ spec:
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
           - name: PYTHONPATH
             value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
+          - name: PATH
+            value: "/vllm-install/bin:/home/ray/anaconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS
@@ -443,10 +499,36 @@ spec:
         - name: install-vllm
           image: rayproject/ray:2.53.0-py312-cu125
           imagePullPolicy: Always
+          securityContext:
+            privileged: true
           command: ["/bin/bash", "-c"]
           args:
           - |
             set -e  # Exit on any error
+            echo "Installing ninja..."
+            # Install ninja via pip (works in all environments)
+            pip install ninja || {
+              echo "ERROR: ninja installation failed!"
+              exit 1
+            }
+            # Find ninja binary installed by pip and copy to shared location
+            NINJA_PATH=$(python3 -c "import ninja; import os; print(os.path.join(os.path.dirname(ninja.__file__), 'data', 'bin', 'ninja'))" 2>/dev/null || which ninja || find /home/ray -name ninja -type f 2>/dev/null | head -1)
+            if [ -n "$NINJA_PATH" ] && [ -f "$NINJA_PATH" ]; then
+              mkdir -p /vllm-install/bin
+              cp "$NINJA_PATH" /vllm-install/bin/ninja
+              chmod +x /vllm-install/bin/ninja
+              echo "ninja installed and copied to /vllm-install/bin from $NINJA_PATH"
+            else
+              # Fallback: try to find ninja in PATH after pip install
+              if command -v ninja &> /dev/null; then
+                mkdir -p /vllm-install/bin
+                cp $(which ninja) /vllm-install/bin/ninja
+                chmod +x /vllm-install/bin/ninja
+                echo "ninja found in PATH and copied to /vllm-install/bin"
+              else
+                echo "WARNING: ninja installed but binary not found - flashinfer may fail to compile"
+              fi
+            fi
             echo "Installing vllm to /vllm-install..."
             # Install vllm - pip -t creates lib/python3.12/site-packages structure
             pip install --no-cache-dir -t /vllm-install vllm || {
@@ -516,6 +598,8 @@ spec:
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
           - name: PYTHONPATH
             value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
+          - name: PATH
+            value: "/vllm-install/bin:/home/ray/anaconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS

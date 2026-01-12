@@ -61,19 +61,30 @@ ray-k3s-deployment/
 │   ├── ray-vram-monitor-daemonset.yaml # VRAM monitoring DaemonSet
 │   ├── vram-scheduler-configmap.yaml   # VRAM scheduler scripts
 │   └── helm/                           # KubeRay operator Helm config
+├── vram_scheduler/                     # VRAM scheduler Python module
+│   ├── __init__.py                     # Main API exports
+│   ├── client.py                       # VRAMScheduler main client class
+│   ├── inference.py                    # Standalone inference functions
+│   ├── deployment.py                   # Deployment helpers
+│   ├── shutdown.py                     # Shutdown functionality
+│   ├── core/                           # Core components
+│   │   ├── vram_allocator.py          # VRAM allocator actor
+│   │   ├── vllm_model_actor.py       # vLLM model actor
+│   │   └── model_orchestrator.py     # Model orchestrator
+│   └── utils/                          # Utilities
+│       └── ray_utils.py                # Ray utilities
+├── examples/                           # Example scripts
+│   ├── 0_shutdown_models.py          # Shutdown deployments
+│   ├── 1_deploy_models.py            # Deploy models from config
+│   ├── 2_deploy_max_llms.py          # Deploy max replicas
+│   └── 3_test_inference.py           # Test inference
 ├── scripts/
-│   ├── vram-scheduler/                 # VRAM-aware scheduling system
-│   │   ├── 1_deploy_models.py         # Main: Deploy models from config
-│   │   ├── 2_deploy_max_llms.py       # Alternative: Deploy max replicas
-│   │   ├── 3_shutdown_models.py       # Shutdown deployments
-│   │   ├── 4_test_inference.py        # Test inference on models
-│   │   ├── vram_allocator.py          # Global VRAM allocator actor
-│   │   ├── vllm_model_actor.py        # vLLM model with VRAM reservation
-│   │   └── model_orchestrator.py      # Declarative model deployment
-│   │   # Note: vram_monitor.py is in ConfigMap (see below)
 │   └── stress_tests/                   # Cluster testing scripts
 │       ├── test_basic_connection.py   # Basic connectivity test
 │       └── test_vram_resource.py      # VRAM allocator test
+├── setup.py                            # Package setup
+├── pyproject.toml                     # Modern package config
+└── requirements.txt                   # Dependencies
 ```
 
 ## Quick Start
@@ -92,18 +103,92 @@ kubectl apply -f manifests/vram-scheduler-configmap.yaml
 kubectl apply -f manifests/ray-vram-monitor-daemonset.yaml
 ```
 
-### Deploy Models
+### Install VRAM Scheduler Module
 
-**Option 1: Deploy from config (recommended)**
 ```bash
-python scripts/vram-scheduler/1_deploy_models.py
+# Install from local source
+pip install -e .
+
+# Or install from GitLab (update URL with your project)
+pip install vram-scheduler --extra-index-url https://gitlab.com/api/v4/projects/.../packages/pypi/simple
 ```
 
-**Option 2: Deploy maximum replicas**
+### Deploy Models
+
+**Using the VRAM Scheduler Module:**
+
+```python
+from vram_scheduler import VRAMScheduler
+
+scheduler = VRAMScheduler()
+
+# Deploy model with known VRAM
+scheduler.deploy_model(
+    model_id="my-model",
+    model_name="Qwen/Qwen2-0.5B-Instruct",
+    vram_gb=3.89,
+    replicas=5
+)
+
+# Deploy maximum replicas
+scheduler.deploy_model(
+    model_id="max-llm",
+    model_name="Qwen/Qwen2-0.5B-Instruct",
+    vram_gb=3.89,
+    max_replicas=True
+)
+
+# Display VRAM state
+scheduler.display_vram_state()
+```
+
+**Using Example Scripts:**
+
 ```bash
-python scripts/vram-scheduler/2_deploy_max_llms.py
-# Or with custom model:
-MODEL_NAME="microsoft/phi-2" MODEL_VRAM_GB=3.0 python scripts/vram-scheduler/2_deploy_max_llms.py
+# Deploy from config
+python examples/1_deploy_models.py
+
+# Deploy maximum replicas
+python examples/2_deploy_max_llms.py
+```
+
+### Run Inference
+
+**Using Standalone Inference Functions:**
+
+```python
+from vram_scheduler.inference import inference, a_inference, inference_batch
+
+# Synchronous inference
+result = inference("Hello!", model_id="my-model")
+
+# Async inference
+result = await a_inference("Hello!", model_id="my-model")
+
+# Batch inference
+results = inference_batch(
+    ["Prompt 1", "Prompt 2", "Prompt 3"],
+    model_id="my-model"
+)
+
+# Structured output
+from pydantic import BaseModel
+
+class Response(BaseModel):
+    answer: str
+    confidence: float
+
+result = inference(
+    "What is 2+2?",
+    model_id="my-model",
+    structured_output=Response
+)
+```
+
+**Using Example Script:**
+
+```bash
+python examples/4_test_inference.py
 ```
 
 ### Test Cluster
@@ -232,6 +317,49 @@ if __name__ == "__main__":
 ## Troubleshooting
 
 When deploying multiple replicas that share a GPU, transient memory errors during initialization are expected. Ray Serve automatically retries failed deployments until models successfully load. If models consistently fail, verify VRAM requirements include a 70% buffer for overhead and that total VRAM doesn't exceed available GPU memory.
+
+## VRAM Scheduler Module API
+
+### VRAMScheduler Class
+
+Main client for VRAM-aware LLM serving.
+
+**Methods:**
+
+- `deploy_model(model_id, model_name, vram_gb, replicas, ...)` - Deploy a model
+  - `vram_gb` - VRAM requirement per replica in GB (required)
+  - `max_replicas=True` - Deploy maximum possible replicas
+  - `router_name="custom"` - Custom router name
+  - `max_model_len=8192` - Maximum model length
+  - `max_tokens=256` - Maximum tokens to generate
+  - `**vllm_kwargs` - Pass through to vLLM
+
+- `shutdown(model_id=None)` - Shutdown models (None = all)
+- `get_vram_state()` - Get VRAM state dict
+- `display_vram_state()` - Display VRAM state
+
+### Inference Functions
+
+Standalone functions that work independently of the scheduler:
+
+- `inference(prompt, model_id, router_name=None, structured_output=None, ...)`
+- `a_inference(prompt, model_id, ...)` - Async version
+- `inference_batch(prompts, model_id, ...)` - Batch inference
+- `a_inference_batch(prompts, model_id, ...)` - Async batch
+- `streaming_batch(prompts, model_id, ...)` - Streaming (TODO)
+
+All inference functions:
+- Auto-discover deployments from Ray Serve status
+- Support structured output (Pydantic classes)
+- Support max_tokens and input truncation
+- Accept all vLLM sampling parameters
+
+## Future Enhancements
+
+- **LangChain Compatibility**: LangChain LLM wrapper (TODO)
+- **Vision/Audio Support**: Support for vision and audio models (TODO)
+- **OpenAI API Compatibility**: OpenAI-compatible endpoints (TODO)
+- **Streaming**: Full streaming support (TODO)
 
 ## Related Repositories
 

@@ -1,8 +1,4 @@
-"""
-Global VRAM Allocator Actor - singleton, HA-safe, persistent.
-
-Per-GPU tracking: Tracks VRAM state per GPU device (node_id:gpu_id format).
-"""
+"""Global VRAM Allocator Actor - tracks VRAM state per GPU."""
 import ray
 from typing import Dict, Optional
 
@@ -11,51 +7,33 @@ class VRAMAllocator:
     """Global VRAM allocator - singleton, HA-safe, persistent."""
     
     def __init__(self):
-        # gpu_key (node_id:gpu_id) -> {total_gb, free_gb (from nvidia-smi), pending: {replica_id: gb}, active: {replica_id: gb}}
         self.gpus: Dict[str, Dict] = {}
-        # Per-GPU initialization locks - tracks which replica is currently initializing on each GPU
-        # gpu_key -> replica_id (or None if no one is initializing)
         self.gpu_locks: Dict[str, Optional[str]] = {}
     
     def update_gpu(self, node_id: str, gpu_id: int, free_gb: float, total_gb: float):
-        """Update VRAM state for a GPU (called by DaemonSet).
-        
-        free_gb from nvidia-smi is the actual free memory on the GPU.
-        """
+        """Update VRAM state for a GPU (called by DaemonSet)."""
         gpu_key = f"{node_id}:gpu{gpu_id}"
         if gpu_key not in self.gpus:
             self.gpus[gpu_key] = {
                 "total": total_gb, 
-                "free": free_gb,  # Actual free from nvidia-smi
-                "pending": {},  # Reservations not yet initialized
-                "active": {}  # Successfully initialized replicas
+                "free": free_gb,
+                "pending": {},
+                "active": {}
             }
         else:
-            # Update free/total from nvidia-smi, preserve reservations
             self.gpus[gpu_key]["total"] = total_gb
-            self.gpus[gpu_key]["free"] = free_gb  # Ground truth from nvidia-smi
+            self.gpus[gpu_key]["free"] = free_gb
     
     def get_available_vram(self, gpu_key: str) -> float:
-        """Get truly available VRAM: nvidia-smi free minus pending reservations.
-        
-        Note: nvidia-smi 'free' already accounts for active replicas using VRAM.
-        We subtract pending reservations because they will soon start using VRAM.
-        """
+        """Get available VRAM: nvidia-smi free minus pending reservations."""
         if gpu_key not in self.gpus:
             return 0.0
         gpu = self.gpus[gpu_key]
         pending_total = sum(gpu["pending"].values())
-        # Available = actual free (from nvidia-smi, already accounts for active) - pending reservations
-        # This ensures we don't over-allocate while replicas are initializing
-        available = gpu["free"] - pending_total
-        return max(0.0, available)
+        return max(0.0, gpu["free"] - pending_total)
     
     def reserve(self, replica_id: str, gpu_key: str, required_gb: float) -> bool:
-        """Reserve VRAM for a replica. Returns True if successful.
-        
-        This creates a PENDING reservation that's immediately subtracted from available.
-        The reservation becomes ACTIVE when the replica successfully initializes.
-        """
+        """Reserve VRAM for a replica. Returns True if successful."""
         if gpu_key not in self.gpus:
             return False
         
@@ -65,15 +43,11 @@ class VRAMAllocator:
         if available < required_gb:
             return False
         
-        # Create pending reservation (subtracts from available immediately)
         gpu["pending"][replica_id] = required_gb
         return True
     
     def mark_initialized(self, replica_id: str, gpu_key: str):
-        """Mark a replica as successfully initialized.
-        
-        Moves reservation from pending to active.
-        """
+        """Mark replica as initialized. Moves reservation from pending to active."""
         if gpu_key not in self.gpus:
             return
         
@@ -83,10 +57,7 @@ class VRAMAllocator:
             gpu["active"][replica_id] = required_gb
     
     def release(self, replica_id: str, gpu_key: str):
-        """Release VRAM reservation for a replica.
-        
-        Removes from both pending and active.
-        """
+        """Release VRAM reservation for a replica."""
         if gpu_key not in self.gpus:
             return
         
@@ -97,7 +68,7 @@ class VRAMAllocator:
             gpu["active"].pop(replica_id)
     
     def get_gpu_vram(self, gpu_key: str) -> Optional[Dict]:
-        """Get VRAM info for a specific GPU, including available (free - pending)."""
+        """Get VRAM info for a GPU."""
         if gpu_key not in self.gpus:
             return None
         
@@ -114,18 +85,13 @@ class VRAMAllocator:
         }
     
     def find_gpu_with_vram(self, required_gb: float, node_id: Optional[str] = None) -> Optional[str]:
-        """Find a GPU with enough available VRAM (free - pending).
-        
-        If node_id is provided, only searches GPUs on that node.
-        Returns the GPU key with the most available VRAM that has at least required_gb available.
-        """
+        """Find GPU with enough VRAM. If node_id provided, only searches that node."""
         candidates = []
         for gpu_key, gpu in self.gpus.items():
             # Skip old Ray node IDs
             if len(gpu_key) > 50 or gpu_key.startswith('c'):
                 continue
             
-            # Filter by node if specified
             if node_id and not gpu_key.startswith(node_id + ":"):
                 continue
             
@@ -136,7 +102,6 @@ class VRAMAllocator:
         if not candidates:
             return None
         
-        # Return GPU with most available VRAM (least-loaded selection)
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[0][0]
     
@@ -157,30 +122,33 @@ class VRAMAllocator:
         return result
     
     def clear_all_reservations(self) -> int:
-        """Clear all reservations. Returns the number cleared."""
+        """Clear all reservations. Returns number cleared."""
         total_cleared = 0
         for gpu_key in self.gpus:
             gpu = self.gpus[gpu_key]
             total_cleared += len(gpu["pending"]) + len(gpu["active"])
             gpu["pending"] = {}
             gpu["active"] = {}
+        self.gpu_locks.clear()
         return total_cleared
     
     def clear_reservations_by_prefix(self, prefix: str) -> int:
-        """Clear all reservations that start with the given prefix."""
+        """Clear reservations starting with prefix."""
         cleared = 0
         for gpu_key in self.gpus:
             gpu = self.gpus[gpu_key]
-            # Clear from pending
             to_remove = [rid for rid in gpu["pending"].keys() if rid.startswith(prefix)]
             for rid in to_remove:
                 gpu["pending"].pop(rid)
                 cleared += 1
-            # Clear from active
             to_remove = [rid for rid in gpu["active"].keys() if rid.startswith(prefix)]
             for rid in to_remove:
                 gpu["active"].pop(rid)
                 cleared += 1
+            if gpu_key in self.gpu_locks:
+                lock_holder = self.gpu_locks[gpu_key]
+                if lock_holder and lock_holder.startswith(prefix):
+                    self.gpu_locks[gpu_key] = None
         return cleared
     
     def acquire_gpu_lock(self, gpu_key: str, replica_id: str) -> bool:
@@ -189,32 +157,39 @@ class VRAMAllocator:
             self.gpu_locks[gpu_key] = replica_id
             return True
         
-        if self.gpu_locks[gpu_key] is not None:
-            return False
+        current_lock_holder = self.gpu_locks[gpu_key]
         
-        self.gpu_locks[gpu_key] = replica_id
-        return True
+        if current_lock_holder is None or current_lock_holder == replica_id:
+            self.gpu_locks[gpu_key] = replica_id
+            return True
+        
+        if gpu_key not in self.gpus:
+            self.gpu_locks[gpu_key] = replica_id
+            return True
+        
+        gpu = self.gpus[gpu_key]
+        if current_lock_holder not in gpu["active"]:
+            self.gpu_locks[gpu_key] = replica_id
+            return True
+        
+        return False
     
     def release_gpu_lock(self, gpu_key: str, replica_id: str):
         """Release initialization lock for a GPU."""
         if gpu_key in self.gpu_locks and self.gpu_locks[gpu_key] == replica_id:
             self.gpu_locks[gpu_key] = None
     
-    def set_replica_gpu_assignment(self, replica_id: str, gpu_key: str):
-        """Set the expected GPU assignment for a replica."""
-        if not hasattr(self, 'replica_assignments'):
-            self.replica_assignments: Dict[str, str] = {}
-        self.replica_assignments[replica_id] = gpu_key
+    def clear_gpu_locks(self, gpu_key: str = None):
+        """Clear GPU lock(s). If gpu_key is None, clears all locks."""
+        if gpu_key is None:
+            self.gpu_locks.clear()
+        elif gpu_key in self.gpu_locks:
+            self.gpu_locks[gpu_key] = None
     
-    def get_replica_gpu_assignment(self, replica_id: str) -> Optional[str]:
-        """Get the expected GPU assignment for a replica."""
-        if not hasattr(self, 'replica_assignments'):
-            return None
-        return self.replica_assignments.get(replica_id)
 
 
 def get_vram_allocator():
-    """Get or create the global VRAM allocator actor."""
+    """Get or create global VRAM allocator actor."""
     try:
         return ray.get_actor("vram_allocator", namespace="system")
     except ValueError:
@@ -223,3 +198,4 @@ def get_vram_allocator():
             namespace="system",
             lifetime="detached"
         ).remote()
+
