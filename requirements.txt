@@ -2,4 +2,5 @@ ray[serve]>=2.8.0
 vllm>=0.11.1
 pydantic>=2.0.0
 torch>=2.0.0
+pycuda>=2021.1
 

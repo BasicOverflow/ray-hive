@@ -30,17 +30,25 @@ spec:
       containers:
       - name: vram-monitor
         image: rayproject/ray:2.53.0-py312-cu125
-        # Override entrypoint to skip Ray's default startup
-        command: ["python3"]
+        # Override entrypoint to install PyCUDA and run monitor
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          # Install build dependencies first to speed up PyCUDA compilation
+          apt-get update -qq && apt-get install -y -qq gcc g++ python3-dev > /dev/null 2>&1 || true
+          # Install PyCUDA (will build from source, but faster with build deps)
+          pip install --no-cache-dir pycuda || (echo "Failed to install PyCUDA" && exit 1)
+          exec python3 /scripts/vram-scheduler/vram_monitor.py
         securityContext:
           privileged: true
         resources:
           requests:
             cpu: "100m"
-            memory: "256Mi"
-          limits:
-            cpu: "500m"
             memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
         # Mount GPU device files to access them
         volumeMounts:
         - name: dev
@@ -63,8 +71,6 @@ spec:
               fieldPath: spec.nodeName
         - name: RAY_ADDRESS
           value: "ray://10.0.1.53:10001"
-        args:
-        - /scripts/vram-scheduler/vram_monitor.py
       volumes:
       - name: dev
         hostPath:

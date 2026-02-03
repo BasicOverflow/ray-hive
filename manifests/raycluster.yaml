@@ -204,6 +204,11 @@ spec:
               fi
             fi
             echo "Installing vllm to /vllm-install..."
+            # Install compatible NumPy version first (SciPy requires < 1.28.0)
+            pip install --no-cache-dir -t /vllm-install "numpy<1.28.0" "scipy" || {
+              echo "ERROR: NumPy/SciPy installation failed!"
+              exit 1
+            }
             # Install vllm - pip -t creates lib/python3.12/site-packages structure
             # vLLM 0.11.1+ (latest) required for guided_json support
             pip install --no-cache-dir -t /vllm-install "vllm>=0.11.1" || {
@@ -269,6 +274,10 @@ spec:
           - name: vllm-install
             mountPath: /vllm-install
           env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
           - name: LD_LIBRARY_PATH
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
           - name: PYTHONPATH
@@ -368,6 +377,11 @@ spec:
               fi
             fi
             echo "Installing vllm to /vllm-install..."
+            # Install compatible NumPy version first (SciPy requires < 1.28.0)
+            pip install --no-cache-dir -t /vllm-install "numpy<1.28.0" "scipy" || {
+              echo "ERROR: NumPy/SciPy installation failed!"
+              exit 1
+            }
             # Install vllm - pip -t creates lib/python3.12/site-packages structure
             # vLLM 0.11.1+ (latest) required for guided_json support
             pip install --no-cache-dir -t /vllm-install "vllm>=0.11.1" || {
@@ -433,6 +447,10 @@ spec:
           - name: vllm-install
             mountPath: /vllm-install
           env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
           - name: LD_LIBRARY_PATH
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
           - name: PYTHONPATH
@@ -532,6 +550,11 @@ spec:
               fi
             fi
             echo "Installing vllm to /vllm-install..."
+            # Install compatible NumPy version first (SciPy requires < 1.28.0)
+            pip install --no-cache-dir -t /vllm-install "numpy<1.28.0" "scipy" || {
+              echo "ERROR: NumPy/SciPy installation failed!"
+              exit 1
+            }
             # Install vllm - pip -t creates lib/python3.12/site-packages structure
             # vLLM 0.11.1+ (latest) required for guided_json support
             pip install --no-cache-dir -t /vllm-install "vllm>=0.11.1" || {
@@ -597,6 +620,10 @@ spec:
           - name: vllm-install
             mountPath: /vllm-install
           env:
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
           - name: LD_LIBRARY_PATH
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
           - name: PYTHONPATH

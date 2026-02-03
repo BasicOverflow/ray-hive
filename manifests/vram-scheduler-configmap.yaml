@@ -5,11 +5,10 @@ metadata:
   namespace: ray-system
 data:
   vram_allocator.py: |
-    """
-    Global VRAM Allocator Actor - singleton, HA-safe, persistent.
-
-    Per-GPU tracking: Tracks VRAM state per GPU device (node_id:gpu_id format).
-    """
+    # Global VRAM Allocator Actor - singleton, HA-safe, persistent
+    # Per-GPU tracking: Tracks VRAM state per GPU device (node_id:gpu_id format)
+    # Also stores GPU hardware specs (SM count, L2 cache, compute capability, GPU model)
+    
     import ray
     from typing import Dict, Optional
 
@@ -99,7 +98,7 @@ data:
                 gpu["active"].pop(replica_id)
         
         def get_gpu_vram(self, gpu_key: str) -> Optional[Dict]:
-            """Get VRAM info for a specific GPU, including available (free - pending)."""
+            """Get VRAM info for a specific GPU, including available (free - pending) and hardware specs."""
             if gpu_key not in self.gpus:
                 return None
             
@@ -112,7 +111,11 @@ data:
                 "pending": sum(gpu["pending"].values()),
                 "active": sum(gpu["active"].values()),
                 "pending_count": len(gpu["pending"]),
-                "active_count": len(gpu["active"])
+                "active_count": len(gpu["active"]),
+                "sm_count": gpu.get("sm_count"),
+                "gpu_model": gpu.get("gpu_model"),
+                "compute_cap": gpu.get("compute_cap"),
+                "l2_cache_kb": gpu.get("l2_cache_kb")
             }
         
         def find_gpu_with_vram(self, required_gb: float) -> Optional[str]:
@@ -137,7 +140,7 @@ data:
             return candidates[0][0]
         
         def get_all_gpus(self) -> Dict:
-            """Get VRAM state for all GPUs."""
+            """Get VRAM state for all GPUs, including hardware specs."""
             result = {}
             for gpu_key, gpu in self.gpus.items():
                 available = self.get_available_vram(gpu_key)
@@ -146,7 +149,11 @@ data:
                     "free": gpu["free"],
                     "available": available,
                     "pending": sum(gpu["pending"].values()),
-                    "active": sum(gpu["active"].values())
+                    "active": sum(gpu["active"].values()),
+                    "sm_count": gpu.get("sm_count"),
+                    "gpu_model": gpu.get("gpu_model"),
+                    "compute_cap": gpu.get("compute_cap"),
+                    "l2_cache_kb": gpu.get("l2_cache_kb")
                 }
             return result
         
@@ -193,6 +200,32 @@ data:
             """Release initialization lock for a GPU."""
             if gpu_key in self.gpu_locks and self.gpu_locks[gpu_key] == replica_id:
                 self.gpu_locks[gpu_key] = None
+        
+        def update_gpu_specs(self, node_id: str, gpu_id: int, sm_count: Optional[int] = None, 
+                             gpu_model: Optional[str] = None, compute_cap: Optional[str] = None,
+                             l2_cache_kb: Optional[float] = None):
+            """Update GPU hardware specs (called by DaemonSet)."""
+            gpu_key = f"{node_id}:gpu{gpu_id}"
+            if gpu_key not in self.gpus:
+                self.gpus[gpu_key] = {
+                    "total": 0.0,
+                    "free": 0.0,
+                    "pending": {},
+                    "active": {},
+                    "sm_count": sm_count,
+                    "gpu_model": gpu_model,
+                    "compute_cap": compute_cap,
+                    "l2_cache_kb": l2_cache_kb
+                }
+            else:
+                if sm_count is not None:
+                    self.gpus[gpu_key]["sm_count"] = sm_count
+                if gpu_model is not None:
+                    self.gpus[gpu_key]["gpu_model"] = gpu_model
+                if compute_cap is not None:
+                    self.gpus[gpu_key]["compute_cap"] = compute_cap
+                if l2_cache_kb is not None:
+                    self.gpus[gpu_key]["l2_cache_kb"] = l2_cache_kb
 
 
     def get_vram_allocator():
@@ -261,6 +294,28 @@ data:
             print(f"Error getting VRAM for GPU {gpu_id}: {e}", file=sys.stderr, flush=True)
             return None, None
 
+    def get_gpu_specs(gpu_id):
+        """Get GPU hardware specs using PyCUDA. PyCUDA must be available."""
+        import pycuda.driver as cuda
+        import pycuda.autoinit
+        
+        cuda.init()
+        dev = cuda.Device(gpu_id)
+        gpu_model = dev.name()
+        sm_count = dev.get_attribute(cuda.device_attribute.MULTIPROCESSOR_COUNT)
+        l2_cache_bytes = dev.get_attribute(cuda.device_attribute.L2_CACHE_SIZE)
+        l2_cache_kb = l2_cache_bytes / 1024.0 if l2_cache_bytes > 0 else None
+        compute_cap_major = dev.get_attribute(cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR)
+        compute_cap_minor = dev.get_attribute(cuda.device_attribute.COMPUTE_CAPABILITY_MINOR)
+        compute_cap_str = f"{compute_cap_major}.{compute_cap_minor}"
+        
+        return {
+            "gpu_model": gpu_model,
+            "sm_count": sm_count,
+            "l2_cache_kb": l2_cache_kb,
+            "compute_cap": compute_cap_str
+        }
+
     def main():
         # Connect to Ray cluster
         ray_address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
@@ -302,37 +357,42 @@ data:
                     
                     # Find the Ray worker node that corresponds to this K8s node
                     # Ray worker pods have hostnames like "raycluster-gpu-workers-ergos-06-nv-worker-xxx"
-                    ray_node_id = None
-                    try:
-                        nodes = ray.nodes()
-                        current_hostname = os.uname().nodename if hasattr(os, 'uname') else socket.gethostname()
-                        
-                        for node in nodes:
-                            node_hostname = node.get("NodeManagerHostname", "")
-                            node_id = node.get("NodeID", "")
-                            # Match by hostname or node ID containing the K8s node name
-                            if k8s_node_name in node_hostname or k8s_node_name in str(node_id):
-                                ray_node_id = node_id
-                                break
-                    except Exception as e:
-                        print(f"Warning: Could not find Ray node: {e}", file=sys.stderr, flush=True)
+                    nodes = ray.nodes()
+                    current_hostname = os.uname().nodename if hasattr(os, 'uname') else socket.gethostname()
+                    
+                    for node in nodes:
+                        node_hostname = node.get("NodeManagerHostname", "")
+                        node_id = node.get("NodeID", "")
+                        # Match by hostname or node ID containing the K8s node name
+                        if k8s_node_name in node_hostname or k8s_node_name in str(node_id):
+                            break
                     
                     # Update each GPU separately
                     for gpu_id in range(num_gpus):
                         free_gb, total_gb = get_gpu_vram(gpu_id)
                         
                         if free_gb is not None and total_gb is not None:
-                            # Update allocator with per-GPU state
+                            # Update allocator with per-GPU VRAM state
                             ray.get(allocator.update_gpu.remote(k8s_node_name, gpu_id, free_gb, total_gb))
+                            
+                            # Get and update GPU hardware specs
+                            gpu_specs = get_gpu_specs(gpu_id)
+                            ray.get(allocator.update_gpu_specs.remote(
+                                k8s_node_name, gpu_id,
+                                sm_count=gpu_specs["sm_count"],
+                                gpu_model=gpu_specs["gpu_model"],
+                                compute_cap=gpu_specs["compute_cap"],
+                                l2_cache_kb=gpu_specs["l2_cache_kb"]
+                            ))
                             
                             # Update allocator - resources are set statically at node startup
                             # The DaemonSet just tracks VRAM state for the allocator
                             print(f"K8s Node {k8s_node_name} GPU {gpu_id}: {free_gb:.2f}GB free / {total_gb:.2f}GB total", 
                                   file=sys.stderr, flush=True)
                         else:
-                            print(f"Warning: Could not get VRAM for GPU {gpu_id}", file=sys.stderr, flush=True)
+                            raise RuntimeError(f"Could not get VRAM for GPU {gpu_id}")
                 else:
-                    print("Warning: No GPUs found", file=sys.stderr, flush=True)
+                    raise RuntimeError("No GPUs found")
                 
                 time.sleep(0.5)
                 

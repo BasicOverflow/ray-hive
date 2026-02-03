@@ -20,9 +20,6 @@ class StderrFilter:
             "SIGTERM handler is not set",
             "rpc_client.h",
             "gcs_client.cc",
-            "INFO 2026",
-            "WARNING 2026",
-            "[2026-",  # C++ warnings with timestamp
             "InvalidStateError: CANCELLED",
             "state=cancelled",
             "Callback error",
@@ -36,8 +33,12 @@ class StderrFilter:
             return
         
         # Check if it's a C++ warning line (starts with [timestamp])
-        if text.strip().startswith("[2026-") and (" W " in text or "INFO" in text):
-            return
+        # Match format: [YYYY-MM-DD HH:MM:SS,mmm W ...] or [YYYY-MM-DD HH:MM:SS,mmm INFO ...]
+        # Use regex-like pattern: [ followed by 4 digits (year), dash, 2 digits (month), dash
+        import re
+        if re.match(r'\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}', text.strip()):
+            if " W " in text or "INFO" in text or "WARNING" in text:
+                return
         
         # Check if it matches any suppress pattern
         if any(pattern in text for pattern in self.suppress_patterns):
@@ -50,26 +51,36 @@ class StderrFilter:
 
 
 def suppress_ray_warnings(suppress: bool = True):
-    """Suppress all Ray warnings and logs."""
+    """Suppress Ray warnings and logs only, preserving user print statements."""
     if suppress:
-        warnings.filterwarnings("ignore")
+        # Only suppress warnings from Ray modules, not all warnings
+        warnings.filterwarnings("ignore", module="ray.*")
+        warnings.filterwarnings("ignore", message=".*ray.*", category=Warning)
+        
+        # Only suppress Ray loggers, not root logger or other loggers
         logging.getLogger("ray").setLevel(logging.CRITICAL)
         logging.getLogger("ray.serve").setLevel(logging.CRITICAL)
         logging.getLogger("ray.util").setLevel(logging.CRITICAL)
+        logging.getLogger("ray.data").setLevel(logging.CRITICAL)
+        logging.getLogger("ray.train").setLevel(logging.CRITICAL)
+        
         os.environ["RAY_DISABLE_IMPORT_WARNING"] = "1"
         os.environ["RAY_SERVE_QUEUE_LENGTH_RESPONSE_DEADLINE_S"] = "10"
         os.environ["RAY_SCHEDULER_EVENTS"] = "0"
         
-        # Replace stderr with filtered version
+        # Replace stderr with filtered version (only filters Ray C++ output)
         if not isinstance(sys.stderr, StderrFilter):
             _original_stderr = sys.stderr
             sys.stderr = StderrFilter(_original_stderr)
     else:
         # Restore logging if previously suppressed
-        warnings.filterwarnings("default")
+        warnings.filterwarnings("default", module="ray.*")
+        warnings.filterwarnings("default", message=".*ray.*", category=Warning)
         logging.getLogger("ray").setLevel(logging.INFO)
         logging.getLogger("ray.serve").setLevel(logging.INFO)
         logging.getLogger("ray.util").setLevel(logging.INFO)
+        logging.getLogger("ray.data").setLevel(logging.INFO)
+        logging.getLogger("ray.train").setLevel(logging.INFO)
         os.environ.pop("RAY_DISABLE_IMPORT_WARNING", None)
         os.environ.pop("RAY_SERVE_QUEUE_LENGTH_RESPONSE_DEADLINE_S", None)
         os.environ.pop("RAY_SCHEDULER_EVENTS", None)
@@ -91,6 +102,17 @@ def init_ray(address: str = None, suppress_logging: bool = True, **kwargs):
     
     if address is None:
         address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
+    
+    # If connecting to remote cluster via Ray Client (ray://), package ray_hive code
+    # Ray Client mode needs the module to be available on cluster for serialization
+    if address.startswith("ray://") and "runtime_env" not in kwargs:
+        # Find project root (parent of ray_hive directory)
+        current_file_dir = os.path.dirname(os.path.abspath(__file__))  # ray_hive/utils/
+        ray_hive_dir = os.path.dirname(current_file_dir)  # ray_hive/
+        project_root = os.path.dirname(ray_hive_dir)  # project root containing ray_hive/
+        kwargs["runtime_env"] = {
+            "working_dir": project_root
+        }
     
     ray.init(
         address=address,

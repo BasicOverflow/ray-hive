@@ -13,7 +13,6 @@ from .inference import (
     a_inference,
     inference_batch,
     a_inference_batch,
-    streaming_batch,
 )
 from .core import VRAMAllocator, get_vram_allocator, VLLMModel, ModelOrchestrator
 from .shutdown import shutdown_all, shutdown_model
@@ -26,7 +25,6 @@ __all__ = [
     "a_inference",
     "inference_batch",
     "a_inference_batch",
-    "streaming_batch",
     # Core components
     "VRAMAllocator",
     "get_vram_allocator",

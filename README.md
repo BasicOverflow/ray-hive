@@ -4,14 +4,7 @@ Infrastructure as Code for deploying a production-ready Ray cluster on k3s using
 
 ## Overview
 
-This repository contains all the manifests, scripts, and documentation needed to deploy a Ray cluster on k3s with:
-
-- **KubeRay Operator**: Manages RayCluster lifecycle
-- **Dynamic GPU Pool**: Automatic GPU allocation per node (no per-node configuration needed)
-- **VRAM-Based Scheduling**: Tasks request VRAM, not GPU counts - Ray handles GPU assignment
-- **vLLM Inference**: Deploy models via Ray Serve with automatic replica placement
-- **REST API**: Submit jobs remotely via REST API (no CLI required)
-- **Heterogeneous GPU Support**: Treats all GPUs on a node as a VRAM pool
+Deploy a Ray cluster on k3s with VRAM-based GPU scheduling for vLLM inference serving. Features dynamic GPU allocation, automatic replica placement, and heterogeneous GPU support.
 
 ## Architecture
 
@@ -34,60 +27,16 @@ Ray Worker Pods
 
 ## Key Features
 
-### VRAM-Aware Scheduling
-- **Dynamic VRAM tracking**: Custom DaemonSet monitors VRAM on each GPU node every 0.5s
-- **Global allocator actor**: Singleton actor maintains VRAM state across all nodes
-- **Exact VRAM requirements**: Models declare exact VRAM needs, no overcommit
-- **Automatic placement**: Ray Serve places replicas based on available VRAM
-
-### vLLM Model Deployment
-- Deploy models via Ray Serve with VRAM reservation
-- **Multiple models per GPU**: Fractional GPU allocation enables multiple replicas to share a single GPU
-- Declarative model configuration
-- Automatic scaling and placement
-- Zero OOM guarantees through hard reservations
-
-### Cluster Testing
-- Basic connectivity and resource tests
-- VRAM allocator verification
-- CPU/GPU stress testing
+- **VRAM-Aware Scheduling**: Dynamic VRAM tracking via DaemonSet, global allocator actor, exact VRAM requirements
+- **vLLM Model Deployment**: Deploy via Ray Serve with VRAM reservation, multiple models per GPU, zero OOM guarantees
+- **Automatic Placement**: Ray Serve places replicas based on available VRAM
 
 ## Repository Structure
 
-```
-ray-k3s-deployment/
-├── manifests/                          # Kubernetes manifests
-│   ├── raycluster.yaml                 # Main RayCluster deployment
-│   ├── ray-vram-monitor-daemonset.yaml # VRAM monitoring DaemonSet
-│   ├── vram-scheduler-configmap.yaml   # VRAM scheduler scripts
-│   └── helm/                           # KubeRay operator Helm config
-├── ray_hive/                           # Ray Hive Python module
-│   ├── __init__.py                     # Main API exports
-│   ├── client.py                       # RayHive main client class
-│   ├── inference.py                    # Standalone inference functions
-│   ├── shutdown.py                     # Shutdown functionality
-│   ├── openai_compat.py                # OpenAI API compatibility (TODO)
-│   ├── langchain.py                    # LangChain compatibility (TODO)
-│   ├── core/                           # Core components
-│   │   ├── vram_allocator.py          # VRAM allocator actor
-│   │   ├── vllm_model_actor.py       # vLLM model actor
-│   │   ├── model_orchestrator.py     # Model orchestrator
-│   │   └── model_router.py           # Load balancer router
-│   └── utils/                          # Utilities
-│       └── ray_utils.py                # Ray utilities
-├── examples/                           # Example scripts
-│   ├── 0_shutdown_models.py          # Shutdown deployments
-│   ├── 1_deploy_models.py            # Deploy models
-│   └── 2_test_inference.py           # Test inference
-├── basic_ray_tests/                    # Cluster testing scripts
-│   ├── 1_test_basic_connection.py    # Basic connectivity test
-│   ├── 2_test_rest_api.py            # REST API test
-│   ├── 3_test_vram_resource.py       # VRAM allocator test
-│   └── 4_test_cpu_stress.py          # CPU stress test
-├── setup.py                            # Package setup
-├── pyproject.toml                     # Modern package config
-└── requirements.txt                   # Dependencies
-```
+- `manifests/` - Kubernetes manifests (KubeRay operator, Ray cluster, VRAM monitoring)
+- `ray_hive/` - Python module (client, inference, core components)
+- `examples/` - Example scripts
+- `basic_ray_tests/` - Cluster testing scripts
 
 ## Quick Start
 
@@ -95,7 +44,10 @@ ray-k3s-deployment/
 
 ```bash
 # Deploy KubeRay operator (if not already installed)
-kubectl apply -f manifests/helm/kuberay-operator-values.yaml
+kubectl apply -f manifests/kuberay-operator.yaml
+
+# Deploy NVIDIA device plugin (if not already installed)
+kubectl apply -f manifests/nvidia-device-plugin.yaml
 
 # Deploy Ray cluster
 kubectl apply -f manifests/raycluster.yaml
@@ -129,8 +81,12 @@ scheduler.deploy_model(
     model_id="qwen",
     model_name="Qwen/Qwen3-0.6B-GPTQ-Int8",
     vram_weights_gb=0.763,  # Model weights only (KV cache calculated separately)
+    max_input_prompt_length=1024,  # Maximum input prompt length
+    max_output_prompt_length=2048,  # Maximum output tokens
+    max_num_seqs=850,  # Maximum concurrent sequences (required)
+    max_num_batched_tokens=16384,  # Maximum batched tokens (required)
     replicas=6,
-    max_model_len=2048,
+    gpu_utilization_target=0.96,  # GPU VRAM utilization target (default 0.96, can be overridden)
     enforce_eager=True,
     kv_cache_dtype="fp8"
 )
@@ -140,22 +96,16 @@ scheduler.deploy_model(
     model_id="qwen-test",
     model_name="Qwen/Qwen3-0.6B-GPTQ-Int8",
     vram_weights_gb=0.763,
+    max_input_prompt_length=1024,
+    max_output_prompt_length=2048,
+    max_num_seqs=850,
+    max_num_batched_tokens=16384,
     test_mode=True,  # Deploy only on GPU with most VRAM
-    max_model_len=2048
+    test_gpu="ergos-06-nv:gpu0"  # Optional: specify GPU
 )
 
 # Display VRAM state
 scheduler.display_vram_state()
-```
-
-**Using Example Scripts:**
-
-```bash
-# Deploy models
-python examples/1_deploy_models.py
-
-# Shutdown all models
-python examples/0_shutdown_models.py
 ```
 
 ### Run Inference
@@ -191,90 +141,60 @@ result = inference(
 )
 ```
 
-**Using Example Script:**
-
-```bash
-python examples/2_test_inference.py
-```
-
 ## How It Works
 
-### Ray Hive Architecture
+**VRAM Allocator**: Global singleton actor tracks VRAM state per GPU and manages reservations.
 
-1. **VRAM Allocator**: Global singleton actor (detached, HA-safe) that tracks VRAM state per GPU. Maintains pending and active reservations to prevent OOM.
+**VRAM Monitoring**: DaemonSet monitors VRAM on each GPU node via `nvidia-smi` every 0.5s.
 
-2. **VRAM Monitoring**: DaemonSet runs on each GPU node, queries VRAM via `nvidia-smi` every 0.5s and updates the allocator with current free/total VRAM per GPU.
+**Model Deployment**: `RayHive.deploy_model()` queries available GPUs, creates one `VLLMModel` deployment per GPU (targeted via `CUDA_VISIBLE_DEVICES`), and sets up `ModelRouter` for load balancing.
 
-3. **Model Deployment Flow**:
-   - `RayHive.deploy_model()` calls `ModelOrchestrator` to deploy models
-   - Orchestrator queries allocator for available GPUs with sufficient VRAM
-   - Creates one `VLLMModel` deployment per GPU (one replica per GPU)
-   - Each deployment targets a specific GPU via `CUDA_VISIBLE_DEVICES`
-   - `ModelRouter` load balances requests across all GPU deployments
+**VRAM Reservation**: Each replica reserves VRAM before loading, uses fractional GPU allocation, and hard-limits memory usage to prevent OOM.
 
-4. **VRAM Reservation**: Each `VLLMModel` replica:
-   - Reserves VRAM in the allocator before loading (moves from pending to active after init)
-   - Uses fractional GPU allocation (`num_gpus: 0.01`) for Ray scheduling
-   - Hard-limits VRAM usage via `torch.cuda.set_per_process_memory_fraction()` before loading
-   - Calculates KV cache VRAM requirements from model architecture (auto-detected or provided)
+## How the Router Works
 
-5. **Multiple Models Per GPU**: Enabled through fractional GPU allocation and CUDA memory slicing. Each replica uses `gpu_memory_utilization` in vLLM and hard memory limits to prevent OOM.
+The `ModelRouter` provides dynamic, capacity-aware load balancing across heterogeneous GPU deployments:
 
-### Components
+- **Dynamic Capacity-Aware Routing**: Router tracks real-time queue depth and available capacity per GPU deployment, routing requests to GPUs with the most available capacity.
 
-- **`VRAMAllocator`** (`core/vram_allocator.py`): Global VRAM state actor (singleton, detached, HA-safe). Tracks free/available VRAM per GPU and manages reservations.
-- **`ModelOrchestrator`** (`core/model_orchestrator.py`): Deploys models via Ray Serve. Queries allocator for available GPUs, creates one `VLLMModel` deployment per GPU, and sets up routing.
-- **`VLLMModel`** (`core/vllm_model_actor.py`): vLLM deployment actor. Reserves VRAM before loading, targets specific GPU via `CUDA_VISIBLE_DEVICES`, calculates KV cache requirements, and hard-limits memory usage.
-- **`ModelRouter`** (`core/model_router.py`): Load balances inference requests across all GPU deployments for a model.
+- **Performance-Based Selection**: Routes requests to GPUs based on performance factors (SM count, VRAM) and current load. Faster GPUs receive more work, preventing slower GPUs from blocking the pipeline.
 
-## Configuration
+- **Request Size Estimation**: Analyzes incoming requests (prompt length, max_tokens) to match them with appropriate GPU capacity. Large requests are routed to higher-capacity GPUs.
 
-- **Ray Address**: `ray://10.0.1.53:10001` (LoadBalancer IP)
-- **Dashboard**: `http://10.0.1.53:8265`
-- **Cluster**: 6 worker nodes (3 CPU + 3 GPU), 6 GPUs total
-- **VRAM Tracking**: Per-node tracking via K8s node names
+- **Prevents Stalling**: Faster GPUs get more work, slower GPUs don't block the pipeline. The router continuously adapts to changing load conditions.
+
+- **Heterogeneous GPU Support**: Automatically adapts to different GPU types and capacities in the cluster. Performance factors are calculated dynamically based on detected maximum VRAM across all deployments.
+
+## Manifests
+
+- `kuberay-operator.yaml` - KubeRay operator
+- `nvidia-device-plugin.yaml` - NVIDIA device plugin
+- `raycluster.yaml` - Ray cluster deployment
+- `ray-vram-monitor-daemonset.yaml` - VRAM monitoring
+- `vram-scheduler-configmap.yaml` - VRAM scheduler scripts
 
 ## Troubleshooting
 
-When deploying multiple replicas that share a GPU, transient memory errors during initialization are expected. Ray Serve automatically retries failed deployments until models successfully load. If models consistently fail, verify VRAM requirements include a 70% buffer for overhead and that total VRAM doesn't exceed available GPU memory.
+Transient memory errors during initialization are expected when multiple replicas share a GPU. Ray Serve automatically retries failed deployments. If models consistently fail, verify VRAM requirements and ensure total VRAM doesn't exceed available GPU memory.
 
-## Ray Hive Module API
+## API
 
-### RayHive Class
+### RayHive
 
-Main client for distributed LLM serving.
-
-**Methods:**
-
-- `deploy_model(model_id, model_name, vram_weights_gb, replicas, ...)` - Deploy a model
-  - `vram_weights_gb` - Model weights VRAM requirement in GB (required, KV cache calculated separately)
-  - `replicas` - Number of replicas to deploy (optional, defaults to one per GPU)
-  - `test_mode=True` - Deploy single replica on GPU with most VRAM (useful for testing)
-  - `max_num_seqs` - Max concurrent sequences per instance (optional, auto-calculated if not provided)
-  - `max_model_len=8192` - Maximum prompt length
-  - `max_tokens=256` - Maximum tokens to generate
-  - `hidden_dim`, `num_layers`, `dtype` - Architecture params (auto-detected if not provided)
-  - `**vllm_kwargs` - Pass through to vLLM (e.g., `enforce_eager`, `kv_cache_dtype`, etc.)
-
+- `deploy_model(model_id, model_name, vram_weights_gb, max_input_prompt_length, max_output_prompt_length, max_num_seqs, max_num_batched_tokens, replicas=None, test_mode=False, test_gpu=None, gpu_utilization_target=0.96, swap_space_per_instance=0, **vllm_kwargs)` - Deploy a model. `gpu_utilization_target` controls VRAM budget calculation (default 0.96) and can be overridden. `gpu_memory_utilization` can also be set via `vllm_kwargs` to override the value passed to vLLM.
 - `shutdown(model_id=None)` - Shutdown models (None = all)
 - `get_vram_state()` - Get VRAM state dict
 - `display_vram_state()` - Display VRAM state
 
 ### Inference Functions
 
-Standalone functions that work independently of the scheduler:
-
 - `inference(prompt, model_id, structured_output=None, max_tokens=None, ...)` - Synchronous inference
 - `a_inference(prompt, model_id, ...)` - Async inference
-- `inference_batch(prompts, model_id, batch_size=None, ...)` - Batch inference (auto-batches based on max_num_seqs)
+- `inference_batch(prompts, model_id, batch_size=None, ...)` - Batch inference
 - `a_inference_batch(prompts, model_id, batch_size=None, ...)` - Async batch inference
-- `streaming_batch(prompts, model_id, ...)` - Streaming (TODO)
 
-All inference functions:
-- Auto-discover deployments from Ray Serve status
-- Support structured output (Pydantic classes)
-- Support max_tokens and input truncation
-- Accept all vLLM sampling parameters
+All inference functions auto-discover deployments, support structured output (Pydantic), and accept vLLM sampling parameters.
+
 
 ## Future Enhancements
 

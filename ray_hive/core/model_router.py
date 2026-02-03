@@ -1,9 +1,8 @@
-"""Model Router - load balances across multiple GPU deployments."""
-import ray
+"""Model Router - dynamic capacity-aware load balancing."""
 from ray import serve
-from typing import Dict, List, Optional, Union
-import time
+from typing import Dict, List, Union
 import asyncio
+import time
 
 
 @serve.deployment(
@@ -12,214 +11,151 @@ import asyncio
     num_replicas=1
 )
 class ModelRouter:
-    """Router that load balances requests across multiple GPU deployments using weighted selection."""
+    """Router that dynamically load balances based on real-time capacity and queue depth."""
     
     def __init__(self, model_id: str, gpu_deployment_names: List[str]):
-        """Initialize router with list of GPU deployment names to route to.
-        
-        Args:
-            model_id: Model identifier
-            gpu_deployment_names: List of deployment names (one per GPU)
-        """
         self.model_id = model_id
         self.gpu_deployment_names = gpu_deployment_names
         self._handles = None
-        self._base_weights = None  # Base weights from max_num_seqs
-        self._current_weights = None  # Track current_weight for each deployment
-        
-        # Performance and load tracking
-        self._response_times = None  # Exponential moving average of response times
-        self._active_requests = None  # Count of active requests per deployment
-        self._max_num_seqs = None  # max_num_seqs per deployment
-        self._lock = asyncio.Lock()  # Lock for thread-safe updates
+        self._capacity_cache = {}
+        self._queue_depth = {}
+        self._performance_factors = {}
+        self._max_vram_gb = None
+        self._cache_ttl = 0.1
+        self._last_update = {}
+        self._lock = asyncio.Lock()
     
     def _get_handles(self):
-        """Lazy initialization of deployment handles."""
         if self._handles is None:
-            self._handles = []
+            self._handles = {}
             for deployment_name in self.gpu_deployment_names:
-                # Each GPU deployment is in its own application: {model_id}-{gpu_name}
-                app_name = f"{self.model_id}-{deployment_name}"
-                try:
-                    handle = serve.get_deployment_handle(deployment_name, app_name=app_name)
-                    self._handles.append(handle)
-                except Exception as e:
-                    print(f"Warning: Could not get handle for {deployment_name}: {e}")
-        
-        # Filter out None handles
-        self._handles = [h for h in self._handles if h is not None]
+                handle = serve.get_deployment_handle(deployment_name, app_name=deployment_name)
+                self._handles[deployment_name] = handle
         return self._handles
     
-    async def _initialize_weights(self):
-        """Initialize weights and performance tracking."""
-        if self._base_weights is not None:
-            return
+    async def _get_capacity_info(self, deployment_name: str) -> Dict:
+        """Get capacity info for a deployment (cached)."""
+        current_time = time.time()
         
-        handles = self._get_handles()
-        if not handles:
-            raise RuntimeError(f"No available GPU deployments for model {self.model_id}")
-        
-        # Query max_num_seqs from each deployment
-        base_weights = []
-        max_num_seqs_list = []
-        for handle in handles:
-            try:
-                max_num_seqs = await handle.get_max_num_seqs.remote()
-                max_num_seqs = max(max_num_seqs, 1)  # Ensure at least 1
-                base_weights.append(max_num_seqs)
-                max_num_seqs_list.append(max_num_seqs)
-            except Exception as e:
-                print(f"Warning: Could not get max_num_seqs, using default weight: {e}")
-                base_weights.append(32)
-                max_num_seqs_list.append(32)
-        
-        self._base_weights = base_weights
-        self._max_num_seqs = max_num_seqs_list
-        
-        # Initialize tracking
-        num_deployments = len(handles)
-        self._current_weights = [0] * num_deployments
-        self._response_times = [0.1] * num_deployments  # Start with 100ms default
-        self._active_requests = [0] * num_deployments
-        
-        total_weight = sum(base_weights)
-        print(f"[Router] Initialized adaptive load balancing: {dict(zip(self.gpu_deployment_names, base_weights))}")
-        print(f"[Router] Total base weight: {total_weight}")
-    
-    def _calculate_dynamic_weights(self):
-        """Calculate dynamic weights based on performance and load."""
-        if self._base_weights is None:
-            return None
-        
-        # Calculate performance factors (inverse of normalized response time)
-        # Faster GPUs get higher performance factor
-        min_response_time = min(self._response_times) if self._response_times else 0.1
-        max_response_time = max(self._response_times) if self._response_times else 1.0
-        response_range = max(max_response_time - min_response_time, 0.001)  # Avoid division by zero
-        
-        performance_factors = []
-        for i, response_time in enumerate(self._response_times):
-            # Normalize: faster = higher factor
-            # Factor = (max - current) / range, normalized to [0.5, 2.0]
-            normalized = (max_response_time - response_time) / response_range
-            factor = 0.5 + (normalized * 1.5)  # Scale to [0.5, 2.0]
-            performance_factors.append(factor)
-        
-        # Calculate load factors (based on active requests vs capacity)
-        load_factors = []
-        for i, active in enumerate(self._active_requests):
-            max_seqs = self._max_num_seqs[i] if self._max_num_seqs else 32
-            # Load factor: 1.0 when empty, increases with load
-            # Use 1 + (active / max_seqs) to penalize loaded deployments
-            load_factor = 1.0 + (active / max(max_seqs, 1))
-            load_factors.append(load_factor)
-        
-        # Dynamic weight = (base_weight * performance_factor) / load_factor
-        # This biases toward fast, less loaded GPUs
-        dynamic_weights = []
-        for i, base_weight in enumerate(self._base_weights):
-            dynamic_weight = (base_weight * performance_factors[i]) / load_factors[i]
-            dynamic_weights.append(max(dynamic_weight, 0.1))  # Ensure minimum weight
-        
-        return dynamic_weights
-    
-    def _get_next_handle(self):
-        """Get next handle using adaptive weighted round-robin."""
-        if self._base_weights is None or self._current_weights is None:
-            raise RuntimeError("Weights not initialized. Call _initialize_weights() first.")
-        
-        handles = self._get_handles()
-        if not handles:
-            raise RuntimeError(f"No available GPU deployments for model {self.model_id}")
-        
-        if len(handles) != len(self._base_weights):
-            raise RuntimeError(f"Mismatch: {len(handles)} handles but {len(self._base_weights)} weights")
-        
-        # Calculate dynamic weights based on performance and load
-        dynamic_weights = self._calculate_dynamic_weights()
-        if dynamic_weights is None:
-            dynamic_weights = self._base_weights  # Fallback to base weights
-        
-        # Weighted Round-Robin with dynamic weights
-        total_weight = sum(dynamic_weights)
-        max_current_weight = -1
-        selected_index = 0
-        
-        for i, weight in enumerate(dynamic_weights):
-            # Add weight to current_weight
-            self._current_weights[i] += weight
+        if (deployment_name not in self._capacity_cache or 
+            deployment_name not in self._last_update or
+            current_time - self._last_update[deployment_name] > self._cache_ttl):
+            handles = self._get_handles()
+            capacity_info = await handles[deployment_name].get_capacity_info.remote()
+            self._capacity_cache[deployment_name] = capacity_info
+            self._last_update[deployment_name] = current_time
             
-            # Track the highest
-            if self._current_weights[i] > max_current_weight:
-                max_current_weight = self._current_weights[i]
-                selected_index = i
+            # Update max VRAM if needed
+            if capacity_info.get("total_vram_gb") is not None:
+                if self._max_vram_gb is None or capacity_info["total_vram_gb"] > self._max_vram_gb:
+                    self._max_vram_gb = capacity_info["total_vram_gb"]
+                    # Recalculate performance factors when max VRAM changes
+                    self._performance_factors = {}
         
-        # Subtract total weight from selected deployment
-        self._current_weights[selected_index] -= total_weight
+        return self._capacity_cache[deployment_name]
+    
+    def _estimate_request_size(self, request: Union[str, Dict]) -> int:
+        """Estimate request size in tokens."""
+        if isinstance(request, dict):
+            prompt = request.get("prompt") or (request.get("prompts", [""])[0] if request.get("prompts") else "")
+            max_tokens = request.get("max_tokens", 100)
+        else:
+            prompt = str(request)
+            max_tokens = 100
         
-        return handles[selected_index], selected_index
+        # Rough token estimate: word count * 1.3 (approximate tokens per word)
+        if isinstance(prompt, list):
+            prompt = " ".join(str(p) for p in prompt)
+        prompt_tokens = int(len(str(prompt).split()) * 1.3)
+        
+        return int(prompt_tokens + max_tokens)
+    
+    async def _calculate_performance_factor(self, deployment_name: str) -> float:
+        """Calculate performance factor for a deployment."""
+        if deployment_name in self._performance_factors:
+            return self._performance_factors[deployment_name]
+        
+        capacity_info = await self._get_capacity_info(deployment_name)
+        sm_count = capacity_info.get("sm_count")
+        total_vram_gb = capacity_info.get("total_vram_gb")
+        
+        if sm_count is None or total_vram_gb is None or self._max_vram_gb is None:
+            # Fallback: use max_num_seqs as proxy
+            max_num_seqs = capacity_info.get("max_num_seqs", 1)
+            factor = float(max_num_seqs)
+        else:
+            # Normalize by max VRAM across all deployments
+            vram_factor = total_vram_gb / self._max_vram_gb if self._max_vram_gb > 0 else 1.0
+            factor = sm_count * vram_factor
+        
+        self._performance_factors[deployment_name] = factor
+        return factor
+    
+    async def _calculate_score(self, deployment_name: str, request_size: int) -> float:
+        """Calculate routing score for a deployment."""
+        capacity_info = await self._get_capacity_info(deployment_name)
+        performance_factor = await self._calculate_performance_factor(deployment_name)
+        
+        max_num_seqs = capacity_info.get("max_num_seqs", 1)
+        queue_depth = self._queue_depth.get(deployment_name, 0)
+        available_capacity = max(0, max_num_seqs - queue_depth)
+        
+        score = available_capacity * performance_factor
+        
+        # Penalize if request is too large for this deployment
+        if request_size > max_num_seqs * 0.8:
+            score *= 0.5
+        
+        return score
+    
+    async def _select_best_deployment(self, request: Union[str, Dict]) -> str:
+        """Select best deployment based on capacity, queue depth, and request characteristics."""
+        handles = self._get_handles()
+        request_size = self._estimate_request_size(request)
+        
+        best_deployment = None
+        best_score = float('-inf')
+        
+        for deployment_name in self.gpu_deployment_names:
+            score = await self._calculate_score(deployment_name, request_size)
+            if score > best_score:
+                best_score = score
+                best_deployment = deployment_name
+        
+        # Fallback: round-robin if all at capacity
+        if best_deployment is None or best_score <= 0:
+            import random
+            best_deployment = random.choice(self.gpu_deployment_names)
+        
+        return best_deployment
     
     async def __call__(self, request: Union[str, Dict]) -> Union[str, List]:
-        """Route request to a GPU deployment using adaptive load balancing."""
-        # Initialize weights on first call
-        await self._initialize_weights()
+        handles = self._get_handles()
         
-        # Get next handle and track which deployment was selected
-        handle, deployment_index = self._get_next_handle()
+        deployment_name = await self._select_best_deployment(request)
+        handle = handles[deployment_name]
         
-        # Track active request
+        # Track queue depth
         async with self._lock:
-            self._active_requests[deployment_index] += 1
-        
-        start_time = time.time()
+            self._queue_depth[deployment_name] = self._queue_depth.get(deployment_name, 0) + 1
         
         try:
-            # Forward request to the selected GPU deployment
-            # Supports both single prompts and batch prompts
             if isinstance(request, dict):
-                # Already a dict - forward as-is (handles both "prompt" and "prompts" keys)
                 result = await handle.remote(request)
             else:
-                # Single string prompt - wrap in dict
                 result = await handle.remote({"prompt": request})
-            
-            # Update performance metrics
-            response_time = time.time() - start_time
-            
-            # Normalize by batch size (time per prompt) for fair comparison
-            num_prompts = 1
-            if isinstance(request, dict):
-                if "prompts" in request:
-                    num_prompts = len(request["prompts"]) if isinstance(request["prompts"], list) else 1
-                elif "prompt" in request:
-                    num_prompts = 1
-            elif isinstance(result, list):
-                num_prompts = len(result)
-            
-            # Calculate time per prompt
-            time_per_prompt = response_time / max(num_prompts, 1)
-            
-            async with self._lock:
-                # Exponential moving average: new_avg = alpha * new + (1 - alpha) * old
-                alpha = 0.1  # Smoothing factor (10% new, 90% old)
-                self._response_times[deployment_index] = (
-                    alpha * time_per_prompt + (1 - alpha) * self._response_times[deployment_index]
-                )
-            
             return result
         finally:
-            # Decrement active request count
+            # Decrement queue depth
             async with self._lock:
-                self._active_requests[deployment_index] = max(0, self._active_requests[deployment_index] - 1)
+                self._queue_depth[deployment_name] = max(0, self._queue_depth.get(deployment_name, 0) - 1)
     
     async def get_max_num_seqs(self) -> int:
-        """Get max_num_seqs from first available GPU deployment."""
+        """Get total max_num_seqs across all deployments."""
         handles = self._get_handles()
-        if not handles:
-            return 32  # Default fallback
-        
-        try:
-            return await handles[0].get_max_num_seqs.remote()
-        except Exception:
-            return 32  # Default fallback
+        total = 0
+        for deployment_name in self.gpu_deployment_names:
+            capacity_info = await self._get_capacity_info(deployment_name)
+            total += capacity_info.get("max_num_seqs", 0)
+        return total
 
