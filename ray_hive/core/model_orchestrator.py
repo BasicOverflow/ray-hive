@@ -43,13 +43,25 @@ class ModelOrchestrator:
                         "total_gb": gpu_info["total"]
                     })
             
-            if config.get("test_mode"):
-                test_gpu = config.get("test_gpu")
-                if test_gpu:
-                    available_gpus = [g for g in available_gpus if g["gpu_key"] == test_gpu]
+            gpu = config.get("gpu")
+            if gpu is not None:
+                if isinstance(gpu, str):
+                    available_gpus = [g for g in available_gpus if g["gpu_key"] == gpu]
+                    if not available_gpus:
+                        raise ValueError(f"GPU {gpu} not found or does not have sufficient VRAM")
+                    target_replicas = 1
+                elif isinstance(gpu, list):
+                    requested_replicas = config.get("replicas")
+                    if isinstance(requested_replicas, int):
+                        if len(gpu) != requested_replicas:
+                            raise ValueError(f"Length of gpu list ({len(gpu)}) must match num_replicas ({requested_replicas})")
+                    available_gpus = [g for g in available_gpus if g["gpu_key"] in gpu]
+                    if len(available_gpus) != len(gpu):
+                        missing = set(gpu) - {g["gpu_key"] for g in available_gpus}
+                        raise ValueError(f"Some requested GPUs not found or do not have sufficient VRAM: {missing}")
+                    target_replicas = len(gpu)
                 else:
-                    available_gpus = [max(available_gpus, key=lambda g: gpu_info_map[g["gpu_key"]]["available"])]
-                target_replicas = 1
+                    raise ValueError("gpu must be a string, list of strings, or None")
             else:
                 requested_replicas = config.get("replicas")
                 if isinstance(requested_replicas, str) and requested_replicas.lower() == 'max':
@@ -59,26 +71,11 @@ class ModelOrchestrator:
                 else:
                     target_replicas = min(requested_replicas, len(available_gpus))
                         
-            # Calculate swap_space_per_gpu if swap_space_per_instance is 'max'
-            if isinstance(swap_space_per_instance, str) and swap_space_per_instance.lower() == 'max':
-                import psutil
-                total_cpu_ram_gb = psutil.virtual_memory().total / (1024**3)
-                # Count GPUs per instance (group by node_name)
-                gpus_by_node = {}
-                for gpu_info in available_gpus[:target_replicas]:
-                    node_name = gpu_info['gpu_key'].split(':')[0]
-                    if node_name not in gpus_by_node:
-                        gpus_by_node[node_name] = []
-                    gpus_by_node[node_name].append(gpu_info)
-                
-                # Calculate max GPUs on any single instance
-                max_gpus_per_instance = max(len(gpus) for gpus in gpus_by_node.values()) if gpus_by_node else 1
-                swap_space_per_gpu = total_cpu_ram_gb / max_gpus_per_instance
-            else:
-                swap_space_per_gpu = float(swap_space_per_instance) if swap_space_per_instance else 0.0
+            swap_space_per_gpu = float(swap_space_per_instance) if swap_space_per_instance else 0.0
             
             deployments_dict = {}
             gpu_mapping = {}
+            resource_mapping = {}
             for gpu_info in available_gpus[:target_replicas]:
                 gpu_deployment_name = f"{model_id}-{gpu_info['gpu_key'].replace(':', '-').replace('_', '-')}"
                 gpu_fraction = max(0.01, round(vram_weights_gb / gpu_info['total_gb'], 2))
@@ -120,26 +117,30 @@ class ModelOrchestrator:
                 
                 deployments_dict[gpu_deployment_name] = deployment
                 gpu_mapping[gpu_deployment_name] = gpu_info['gpu_key']
+                resource_mapping[gpu_deployment_name] = gpu_info["resource_name"]
             
             if deployments_dict:
                 gpu_deployment_names = list(deployments_dict.keys())
                 
-                # Deploy all GPU deployments in parallel using Ray tasks
+                # Deploy all GPU deployments in parallel using Ray tasks with node-specific placement
                 @ray.remote
                 def deploy_single(deployment, deployment_name: str, route_prefix: str):
                     """Deploy a single deployment in a Ray task."""
                     serve.run(deployment, name=deployment_name, route_prefix=route_prefix)
                     return True
                 
-                # Start all deployments in parallel
-                deploy_futures = [
-                    deploy_single.remote(
+                # Start all deployments in parallel with node-specific resource placement
+                deploy_futures = []
+                for gpu_deployment_name, deployment in deployments_dict.items():
+                    resource_name = resource_mapping[gpu_deployment_name]
+                    future = deploy_single.options(
+                        resources={resource_name: 0.01}
+                    ).remote(
                         deployment, 
                         gpu_deployment_name, 
                         f"/{gpu_deployment_name}"
                     )
-                    for gpu_deployment_name, deployment in deployments_dict.items()
-                ]
+                    deploy_futures.append(future)
                 
                 # Wait for all deployments to complete in parallel
                 ray.get(deploy_futures)

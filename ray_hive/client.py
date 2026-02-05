@@ -3,7 +3,7 @@
 # Wraps ModelOrchestrator and VRAMAllocator for user-friendly interface
 
 import ray
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List
 from .core.vram_allocator import get_vram_allocator
 from .core.model_orchestrator import ModelOrchestrator
 from .shutdown import shutdown_all, shutdown_model
@@ -34,10 +34,9 @@ class RayHive:
         max_num_seqs: int,
         max_num_batched_tokens: int,
         replicas: Optional[Union[int, str]] = None,
-        test_mode: bool = False,
-        test_gpu: Optional[str] = None,
+        gpu: Optional[Union[str, List[str]]] = None,
         gpu_utilization_target: float = 0.96,
-        swap_space_per_instance: Union[int, str] = 0,
+        swap_space_per_instance: int = 0,
         **vllm_kwargs
     ) -> None:
         """Deploy model with VRAM-aware scheduling. One replica per GPU, max replicas possible capped at available GPUs.
@@ -48,17 +47,17 @@ class RayHive:
             max_num_seqs: Maximum number of concurrent sequences
             max_num_batched_tokens: Maximum number of batched tokens
             replicas: Number of replicas to deploy, 'max' to deploy to all available GPUs, or None to use all available GPUs
-            test_gpu: When test_mode=True, specify GPU to deploy to (e.g., "ergos-06-nv:gpu0")
+            gpu: GPU(s) to deploy to. Can be a string (single GPU, e.g., "ergos-06-nv:gpu0"), 
+                 a list of strings (must match num_replicas length), or None to let library determine placement
             gpu_utilization_target: GPU utilization target (default 0.96)
-            swap_space_per_instance: Swap space per instance in GB, or 'max' to use all available CPU RAM divided evenly across GPUs
+            swap_space_per_instance: Swap space per instance in GB
         """
         model_configs = {
             model_id: {
                 "name": model_name,
                 "vram_weights_gb": vram_weights_gb,
                 "replicas": replicas,
-                "test_mode": test_mode,
-                "test_gpu": test_gpu,
+                "gpu": gpu,
                 "max_input_prompt_length": max_input_prompt_length,
                 "max_output_prompt_length": max_output_prompt_length,
                 "max_num_seqs": max_num_seqs,

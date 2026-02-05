@@ -17,8 +17,7 @@ deployments = [
         "model_id": "qwen-short-big-gpu",
         "description": "Custom Tuning",
         "config": {
-            "test_mode": True,
-            "test_gpu": "ergos-06-nv:gpu0",
+            "gpu": "ergos-06-nv:gpu0",
 
             "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
             "vram_weights_gb": 0.763,
@@ -31,96 +30,91 @@ deployments = [
             "swap_space_per_instance": 0,
         }
     },
-    {
-        "model_id": "qwen-short-small-gpu",
-        "description": "Custom Tuning",
-        "config": {
-            "test_mode": True,
-            "test_gpu": "ergos-02-nv:gpu0",
+    # {
+    #     "model_id": "qwen-short-small-gpu",
+    #     "description": "Custom Tuning",
+    #     "config": {
+    #         "gpu": "ergos-02-nv:gpu0",
 
-            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-            "vram_weights_gb": 0.763,
+    #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    #         "vram_weights_gb": 0.763,
 
-            "max_input_prompt_length": 1024,
-            "max_output_prompt_length": 2048,
+    #         "max_input_prompt_length": 1024,
+    #         "max_output_prompt_length": 2048,
 
-            "max_num_seqs": 850,
-            "max_num_batched_tokens": 16384,
-            "swap_space_per_instance": 0,
-        }
-    },
-    {
-        "model_id": "qwen-short-small-gpu-again",
-        "description": "Custom Tuning",
-        "config": {
-            "test_mode": True,
-            "test_gpu": "ergos-02-nv:gpu0",
+    #         "max_num_seqs": 850,
+    #         "max_num_batched_tokens": 16384,
+    #         "swap_space_per_instance": 0,
+    #     }
+    # },
+    # {
+    #     "model_id": "qwen-short-small-gpu-again",
+    #     "description": "Custom Tuning",
+    #     "config": {
+    #         "gpu": "ergos-02-nv:gpu0",
 
-            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-            "vram_weights_gb": 0.763,
+    #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    #         "vram_weights_gb": 0.763,
 
-            "max_input_prompt_length": 1024,
-            "max_output_prompt_length": 2048,
+    #         "max_input_prompt_length": 1024,
+    #         "max_output_prompt_length": 2048,
 
-            "max_num_seqs": 200,
-            "max_num_batched_tokens": 4096,
-            "swap_space_per_instance": 0,
-        }
-    },
-    {
-        "model_id": "qwen-long-big-gpu",
-        "description": "Long variant - same config as short",
-        "config": {
-            "test_mode": True,
-            "test_gpu": "ergos-06-nv:gpu0",
+    #         "max_num_seqs": 200,
+    #         "max_num_batched_tokens": 4096,
+    #         "swap_space_per_instance": 0,
+    #     }
+    # },
+    # {
+    #     "model_id": "qwen-long-big-gpu",
+    #     "description": "Long variant - same config as short",
+    #     "config": {
+    #         "gpu": "ergos-06-nv:gpu0",
 
-            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-            "vram_weights_gb": 0.763,
+    #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    #         "vram_weights_gb": 0.763,
 
-            "max_input_prompt_length": 4096,
-            "max_output_prompt_length": 6144,
+    #         "max_input_prompt_length": 4096,
+    #         "max_output_prompt_length": 6144,
 
-            "max_num_seqs": 850,
-            "max_num_batched_tokens": 16384,
-            "swap_space_per_instance": 0,
-        }
-    },
-    {
-        "model_id": "qwen-long-small-gpu",
-        "description": "Long variant - same config as short",
-        "config": {
-            "test_mode": True,
-            "test_gpu": "ergos-02-nv:gpu0",
+    #         "max_num_seqs": 850,
+    #         "max_num_batched_tokens": 16384,
+    #         "swap_space_per_instance": 0,
+    #     }
+    # },
+    # {
+    #     "model_id": "qwen-long-small-gpu",
+    #     "description": "Long variant - same config as short",
+    #     "config": {
+    #         "gpu": "ergos-02-nv:gpu0",
 
-            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-            "vram_weights_gb": 0.763,
+    #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    #         "vram_weights_gb": 0.763,
 
-            "max_input_prompt_length": 4096,
-            "max_output_prompt_length": 6144,
+    #         "max_input_prompt_length": 4096,
+    #         "max_output_prompt_length": 6144,
 
-            "max_num_seqs": 850,
-            "max_num_batched_tokens": 16384,
-            "swap_space_per_instance": 0,
-        }
-    },
-    {
-        "model_id": "qwen-long-small-gpu-again",
-        "description": "Long variant - same config as short",
-        "config": {
-            "test_mode": True,
-            "test_gpu": "ergos-02-nv:gpu0",
+    #         "max_num_seqs": 850,
+    #         "max_num_batched_tokens": 16384,
+    #         "swap_space_per_instance": 0,
+    #     }
+    # },
+    # {
+    #     "model_id": "qwen-long-small-gpu-again",
+    #     "description": "Long variant - same config as short",
+    #     "config": {
+    #         "gpu": "ergos-02-nv:gpu0",
 
-            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-            "vram_weights_gb": 0.763,
+    #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    #         "vram_weights_gb": 0.763,
 
-            "max_input_prompt_length": 4096,
-            "max_output_prompt_length": 6144,
+    #         "max_input_prompt_length": 4096,
+    #         "max_output_prompt_length": 6144,
 
-            "max_num_seqs": 200,
-            "max_num_batched_tokens": 4096,
-            "swap_space_per_instance": 0,
-        }
-    },
+    #         "max_num_seqs": 200,
+    #         "max_num_batched_tokens": 4096,
+    #         "swap_space_per_instance": 0,
+    #     }
+    # },
 ]
 
 

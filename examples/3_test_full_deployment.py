@@ -14,7 +14,7 @@ model_name = "Qwen/Qwen3-0.6B-GPTQ-Int8"
 vram_weights_gb = 0.763
 
 prompt = "Write a short poem about beer"
-amount = 100_000
+amount = 300_000
 prompts = [f"{prompt} {i}" for i in range(amount)]
 
 
@@ -31,7 +31,7 @@ scheduler.deploy_model(
     max_num_seqs=850,
     max_num_batched_tokens=16384,
     replicas="max",
-    swap_space_per_instance=0,
+    swap_space_per_instance=10,
 )
 
 
