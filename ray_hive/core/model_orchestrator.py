@@ -124,8 +124,25 @@ class ModelOrchestrator:
             if deployments_dict:
                 gpu_deployment_names = list(deployments_dict.keys())
                 
-                for gpu_deployment_name, deployment in deployments_dict.items():
-                    serve.run(deployment, name=gpu_deployment_name, route_prefix=f"/{gpu_deployment_name}")
+                # Deploy all GPU deployments in parallel using Ray tasks
+                @ray.remote
+                def deploy_single(deployment, deployment_name: str, route_prefix: str):
+                    """Deploy a single deployment in a Ray task."""
+                    serve.run(deployment, name=deployment_name, route_prefix=route_prefix)
+                    return True
+                
+                # Start all deployments in parallel
+                deploy_futures = [
+                    deploy_single.remote(
+                        deployment, 
+                        gpu_deployment_name, 
+                        f"/{gpu_deployment_name}"
+                    )
+                    for gpu_deployment_name, deployment in deployments_dict.items()
+                ]
+                
+                # Wait for all deployments to complete in parallel
+                ray.get(deploy_futures)
                 
                 router_deployment = ModelRouter.options(
                     name=f"{model_id}-router",
