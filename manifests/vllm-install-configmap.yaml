@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-vllm-install-script
+  namespace: ray-system
+data:
+  install-vllm.sh: |
+    #!/bin/bash
+    set -e
+    echo "Installing vllm to /vllm-install..."
+    pip install --no-cache-dir -t /vllm-install "vllm>=0.11.1" || {
+      echo "ERROR: vllm installation failed!"
+      exit 1
+    }
+    echo "vllm installed successfully"
+    VLLM_PATH=$(find /vllm-install -type d -name "vllm" | head -1)
+    if [ -z "$VLLM_PATH" ]; then
+      echo "ERROR: vllm directory not found!"
+      exit 1
+    fi
+    if [[ "$VLLM_PATH" == *"site-packages"* ]] && [ ! -d "/vllm-install/vllm" ]; then
+      ln -s "$VLLM_PATH" /vllm-install/vllm
+    fi
+    export PYTHONPATH="/vllm-install:/vllm-install/lib/python3.12/site-packages:$PYTHONPATH"
+    python3 -c "import vllm; print(f'vllm imported successfully from {vllm.__file__}')"
+    echo "vllm installation verified successfully"

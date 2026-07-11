@@ -21,20 +21,20 @@ Ray Worker Pods
     ├── CPU Workers (on CPU-only nodes)
     └── GPU Workers (on GPU nodes)
         ├── All GPUs allocated per pod (dynamic)
-        ├── VRAM reported as custom resource
+        ├── VRAM DaemonSet → gpu_registry actor (per-GPU free/total + PyCUDA specs)
         └── vLLM replicas scheduled by VRAM availability
 ```
 
 ## Key Features
 
-- **VRAM-Aware Scheduling**: Dynamic VRAM tracking via DaemonSet, global allocator actor, exact VRAM requirements
+- **VRAM-Aware Scheduling**: Dynamic VRAM tracking via DaemonSet, global `gpu_registry` actor, exact VRAM requirements
 - **vLLM Model Deployment**: Deploy via Ray Serve with VRAM reservation, multiple models per GPU, zero OOM guarantees
 - **Automatic Placement**: Ray Serve places replicas based on available VRAM
 
 ## Repository Structure
 
 - `manifests/` - Kubernetes manifests (KubeRay operator, Ray cluster, VRAM monitoring)
-- `ray_hive/` - Python module (client, inference, core components)
+- `ray_hive/` - Python module (hive client, inference, core components)
 - `examples/` - Example scripts
 - `basic_ray_tests/` - Cluster testing scripts
 
@@ -52,8 +52,8 @@ kubectl apply -f manifests/nvidia-device-plugin.yaml
 # Deploy Ray cluster
 kubectl apply -f manifests/raycluster.yaml
 
-# Deploy VRAM monitor
-kubectl apply -f manifests/vram-scheduler-configmap.yaml
+# Deploy vLLM install script + VRAM monitor DaemonSet
+kubectl apply -f manifests/vllm-install-configmap.yaml
 kubectl apply -f manifests/ray-vram-monitor-daemonset.yaml
 ```
 
@@ -76,32 +76,25 @@ from ray_hive import RayHive
 
 scheduler = RayHive()
 
-# Deploy model with specific number of replicas
-# Any vLLM LLM() initialization kwargs can be passed via **vllm_kwargs
+# Deploy model — planner auto-computes VRAM settings from HF config
+# replicas=-1 deploys to all eligible GPUs
 scheduler.deploy_model(
     model_id="qwen",
     model_name="Qwen/Qwen3-0.6B-GPTQ-Int8",
-    vram_weights_gb=0.763,  # Model weights only (KV cache calculated separately)
-    max_input_prompt_length=1024,  # Maximum input prompt length
-    max_output_prompt_length=2048,  # Maximum output tokens
-    max_num_seqs=850,  # Maximum concurrent sequences (required)
-    max_num_batched_tokens=16384,  # Maximum batched tokens (required)
+    max_input_prompt_length=1024,
+    max_output_prompt_length=2048,
     replicas=6,
-    gpu_utilization_target=0.96,  # GPU VRAM utilization target (default 0.96, can be overridden)
     enforce_eager=True,
-    kv_cache_dtype="fp8"
+    kv_cache_dtype="fp8",
 )
 
-# Deploy in test mode (single replica on GPU with most VRAM)
+# Single GPU pin
 scheduler.deploy_model(
     model_id="qwen-test",
     model_name="Qwen/Qwen3-0.6B-GPTQ-Int8",
-    vram_weights_gb=0.763,
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
-    max_num_seqs=850,
-    max_num_batched_tokens=16384,
-    gpu="ergos-06-nv:gpu0"  # Optional: specify GPU(s) to deploy to
+    gpu="ergos-06-nv:gpu0",
 )
 
 # Display VRAM state
@@ -146,35 +139,31 @@ result = inference("Hello!", model_id="my-model", temperature=0.7, top_k=50)
 
 ## How It Works
 
-**VRAM Allocator**: Global singleton actor tracks VRAM state per GPU and manages reservations.
+**GPU Registry**: Global singleton actor (`gpu_registry`) tracks live VRAM per GPU and deployment reservations.
 
-**VRAM Monitoring**: DaemonSet monitors VRAM on each GPU node via `nvidia-smi` every 0.5s.
+**VRAM Monitoring**: DaemonSet on each GPU node calls `gpu_registry.update_gpu*` directly via Ray (no ConfigMap). PyCUDA specs once at startup; nvidia-smi VRAM every 0.5s. Start `RayHive()` first so the actor exists.
 
-**Model Deployment**: `RayHive.deploy_model()` queries available GPUs, creates one `VLLMModel` deployment per GPU (targeted via `CUDA_VISIBLE_DEVICES`), and sets up `ModelRouter` for load balancing.
+**Model Deployment**: `DeployService` singleton serializes deploys. Per GPU: `plan_deployment()` computes vLLM settings, `RayLLMActor` loads the model (pinned via custom Ray resources), `ModelRouter` exposes OpenAI-compatible `/v1` endpoints and least-queue routing.
 
-**VRAM Reservation**: Each replica reserves VRAM before loading, uses fractional GPU allocation, and hard-limits memory usage to prevent OOM.
+**OpenAI HTTP API**: Each deployed model is reachable at `/{model_id}/v1/models`, `/{model_id}/v1/chat/completions`, `/{model_id}/v1/completions`.
 
 ## How the Router Works
 
 The `ModelRouter` provides dynamic, capacity-aware load balancing across heterogeneous GPU deployments:
 
-- **Dynamic Capacity-Aware Routing**: Router tracks real-time queue depth and available capacity per GPU deployment, routing requests to GPUs with the most available capacity.
+- **Least-Queue Routing**: Router tracks local queue depth per replica and routes to the replica with the lowest load relative to `max_num_seqs`.
 
-- **Performance-Based Selection**: Routes requests to GPUs based on performance factors (SM count, VRAM) and current load. Faster GPUs receive more work, preventing slower GPUs from blocking the pipeline.
+- **OpenAI-Compatible Ingress**: FastAPI endpoints on the router deployment for `/v1/models`, `/v1/chat/completions`, `/v1/completions` (text-only for now; multimodal schema present but returns 400).
 
-- **Request Size Estimation**: Analyzes incoming requests (prompt length, max_tokens) to match them with appropriate GPU capacity. Large requests are routed to higher-capacity GPUs.
-
-- **Prevents Stalling**: Faster GPUs get more work, slower GPUs don't block the pipeline. The router continuously adapts to changing load conditions.
-
-- **Heterogeneous GPU Support**: Automatically adapts to different GPU types and capacities in the cluster. Performance factors are calculated dynamically based on detected maximum VRAM across all deployments.
+- **Heterogeneous GPU Support**: Per-GPU deployment plans computed independently from live VRAM and registry reservations.
 
 ## Manifests
 
 - `kuberay-operator.yaml` - KubeRay operator
 - `nvidia-device-plugin.yaml` - NVIDIA device plugin
 - `raycluster.yaml` - Ray cluster deployment
-- `ray-vram-monitor-daemonset.yaml` - VRAM monitoring
-- `vram-scheduler-configmap.yaml` - VRAM scheduler scripts
+- `vllm-install-configmap.yaml` - Shared vLLM install script for GPU worker init containers
+- `ray-vram-monitor-daemonset.yaml` - Per-node VRAM + PyCUDA reporter (calls `gpu_registry` actor)
 
 ## Troubleshooting
 
@@ -184,7 +173,7 @@ Transient memory errors during initialization are expected when multiple replica
 
 ### RayHive
 
-- `deploy_model(model_id, model_name, vram_weights_gb, max_input_prompt_length, max_output_prompt_length, max_num_seqs, max_num_batched_tokens, replicas=None, gpu=None, gpu_utilization_target=0.96, swap_space_per_instance=0, **vllm_kwargs)` - Deploy a model. `replicas` can be an integer, `"max"` to deploy to all available GPUs, or `None` to use all available GPUs. `gpu` can be a string (single GPU), a list of strings (must match num_replicas length), or `None` to let library determine placement. `swap_space_per_instance` is the swap space per instance in GB. `gpu_utilization_target` controls VRAM budget calculation (default 0.96) and can be overridden. Any vLLM `LLM()` initialization kwargs can be passed via `**vllm_kwargs`.
+- `deploy_model(model_id, model_name, max_input_prompt_length, max_output_prompt_length, replicas=-1, gpu=None, vram_weights_gb=None, max_num_batched_tokens=None, swap_space_per_instance=0, **vllm_kwargs)` — Deploy a model. `replicas=-1` uses all eligible GPUs. Optional overrides for weights and batched tokens. Any vLLM `LLM()` kwargs via `**vllm_kwargs`.
 - `shutdown(model_id=None)` - Shutdown models (None = all)
 - `get_vram_state()` - Get VRAM state dict
 - `display_vram_state()` - Display VRAM state
@@ -202,8 +191,7 @@ All inference functions auto-discover deployments, support structured output (Py
 ## Future Enhancements
 
 - **LangChain Compatibility**: LangChain LLM wrapper (TODO)
-- **Vision/Audio Support**: Support for vision and audio models (TODO)
-- **OpenAI API Compatibility**: OpenAI-compatible endpoints (TODO)
+- **Vision/Audio Support**: Multimodal routing (schema ready, inference TODO)
 - **Streaming**: Full streaming support (TODO)
 
 ## Related Repositories

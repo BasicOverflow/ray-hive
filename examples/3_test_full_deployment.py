@@ -11,7 +11,6 @@ scheduler = RayHive(suppress_logging=True)
 
 MODEL_ID = "qwen-full-deployment"
 model_name = "Qwen/Qwen3-0.6B-GPTQ-Int8"
-vram_weights_gb = 0.763
 
 prompt = "Write a short poem about beer"
 amount = 50_000
@@ -19,18 +18,15 @@ prompts = [f"{prompt} {i}" for i in range(amount)]
 
 
 print("\n" + "=" * 80)
-print("Test: Deploy with 'max' replicas (all available GPUs)")
+print("Test: Deploy with replicas=-1 (all available GPUs)")
 print("=" * 80)
 
 scheduler.deploy_model(
     model_id=MODEL_ID,
     model_name=model_name,
-    vram_weights_gb=vram_weights_gb,
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
-    max_num_seqs=850,
-    max_num_batched_tokens=16384,
-    replicas="max",
+    replicas=-1,
     swap_space_per_instance=10,
 )
 

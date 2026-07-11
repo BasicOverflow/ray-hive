@@ -30,6 +30,8 @@ setup(
         "vllm>=0.11.1",
         "pydantic>=2.0.0",
         "torch>=2.0.0",
+        "fastapi>=0.100.0",
+        "transformers>=4.40.0",
     ],
 )
 
