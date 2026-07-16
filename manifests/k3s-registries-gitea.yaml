@@ -1,0 +1,11 @@
+# NOT a Kubernetes manifest — copy to every k3s node as:
+#   /etc/rancher/k3s/registries.yaml
+# then: sudo systemctl restart k3s   # or k3s-agent on workers
+#
+# Homelab Ansible should keep this file in sync on all ergos-* nodes
+# (see vaults/Homelab/infrastructure/Gitea.md).
+
+mirrors:
+  "10.0.0.52:3000":
+    endpoint:
+      - "http://10.0.0.52:3000"

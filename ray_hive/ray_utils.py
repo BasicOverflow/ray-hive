@@ -6,6 +6,18 @@ import sys
 import warnings
 
 import ray
+from dotenv import load_dotenv
+
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_env():
+    """Load .env from project root if present."""
+    load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+
+
+load_env()
 
 
 class StderrFilter:
@@ -91,12 +103,12 @@ def init_ray(address: str = None, suppress_logging: bool = True, **kwargs):
     suppress_ray_warnings(suppress_logging)
 
     if address is None:
-        address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
+        address = os.getenv("RAY_ADDRESS")
+        if not address:
+            raise RuntimeError("RAY_ADDRESS not set. Copy .env.example to .env and set your cluster address.")
 
     if address.startswith("ray://") and "runtime_env" not in kwargs:
-        ray_hive_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(ray_hive_dir)
-        kwargs["runtime_env"] = {"working_dir": project_root}
+        kwargs["runtime_env"] = {"working_dir": _PROJECT_ROOT}
 
     ray.init(
         address=address,

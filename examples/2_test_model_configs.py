@@ -3,108 +3,86 @@ import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from dotenv import load_dotenv
 from ray_hive import RayHive
 from ray_hive.inference import inference_batch
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 scheduler = RayHive(suppress_logging=True)
 
 
-# Test configurations - system auto-optimizes based on P_max and R_max
+# Test configurations — planner estimates max_num_seqs / max_num_batched_tokens from prompt lengths
 deployments = [
     {
         "model_id": "qwen-short-big-gpu",
-        "description": "Custom Tuning",
+        "description": "Default planner estimates",
         "config": {
             "gpu": "ergos-06-nv:gpu0",
             "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
             "max_input_prompt_length": 1024,
             "max_output_prompt_length": 2048,
-            "swap_space_per_instance": 0,
+            # "max_num_seqs": 24
         }
     },
     # {
     #     "model_id": "qwen-short-small-gpu",
-    #     "description": "Custom Tuning",
+    #     "description": "Override concurrency settings",
     #     "config": {
     #         "gpu": "ergos-02-nv:gpu0",
-
     #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-    #         "vram_weights_gb": 0.763,
-
     #         "max_input_prompt_length": 1024,
     #         "max_output_prompt_length": 2048,
-
     #         "max_num_seqs": 850,
     #         "max_num_batched_tokens": 16384,
-    #         "swap_space_per_instance": 0,
     #     }
     # },
     # {
     #     "model_id": "qwen-short-small-gpu-again",
-    #     "description": "Custom Tuning",
+    #     "description": "Lower concurrency override",
     #     "config": {
     #         "gpu": "ergos-02-nv:gpu0",
-
     #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-    #         "vram_weights_gb": 0.763,
-
     #         "max_input_prompt_length": 1024,
     #         "max_output_prompt_length": 2048,
-
     #         "max_num_seqs": 200,
     #         "max_num_batched_tokens": 4096,
-    #         "swap_space_per_instance": 0,
     #     }
     # },
     # {
     #     "model_id": "qwen-long-big-gpu",
-    #     "description": "Long variant - same config as short",
+    #     "description": "Long prompts — planner re-estimates from lengths",
     #     "config": {
     #         "gpu": "ergos-06-nv:gpu0",
-
     #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-    #         "vram_weights_gb": 0.763,
-
     #         "max_input_prompt_length": 4096,
     #         "max_output_prompt_length": 6144,
-
     #         "max_num_seqs": 850,
     #         "max_num_batched_tokens": 16384,
-    #         "swap_space_per_instance": 0,
     #     }
     # },
     # {
     #     "model_id": "qwen-long-small-gpu",
-    #     "description": "Long variant - same config as short",
+    #     "description": "Long prompts on smaller GPU",
     #     "config": {
     #         "gpu": "ergos-02-nv:gpu0",
-
     #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-    #         "vram_weights_gb": 0.763,
-
     #         "max_input_prompt_length": 4096,
     #         "max_output_prompt_length": 6144,
-
     #         "max_num_seqs": 850,
     #         "max_num_batched_tokens": 16384,
-    #         "swap_space_per_instance": 0,
     #     }
     # },
     # {
     #     "model_id": "qwen-long-small-gpu-again",
-    #     "description": "Long variant - same config as short",
+    #     "description": "Long prompts, lower concurrency",
     #     "config": {
     #         "gpu": "ergos-02-nv:gpu0",
-
     #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-    #         "vram_weights_gb": 0.763,
-
     #         "max_input_prompt_length": 4096,
     #         "max_output_prompt_length": 6144,
-
     #         "max_num_seqs": 200,
     #         "max_num_batched_tokens": 4096,
-    #         "swap_space_per_instance": 0,
     #     }
     # },
 ]

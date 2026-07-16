@@ -12,8 +12,6 @@ spec:
       labels:
         app: ray-vram-monitor
     spec:
-      hostNetwork: true
-      hostPID: true
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -32,18 +30,22 @@ spec:
         args:
         - |
           set -e
-          apt-get update -qq && apt-get install -y -qq gcc g++ python3-dev > /dev/null 2>&1 || true
-          pip install --no-cache-dir pycuda || (echo "Failed to install PyCUDA" && exit 1)
+          apt-get update -qq && apt-get install -y -qq gcc g++ python3-dev > /dev/null 2>&1
+          HEAD="${RAY_ADDRESS:-raycluster-head-svc:6379}"
+          ray start --address="$HEAD" --num-cpus=0 --num-gpus=0 --disable-usage-stats
+          sleep 3
           exec python3 -u - <<'PY'
           import os
           import subprocess
           import sys
           import time
+          import json
 
           import ray
 
           NVIDIA_SMI = "/host/usr/bin/nvidia-smi"
           LD = "/host/usr/lib/x86_64-linux-gnu"
+          _pycuda_installed = False
 
 
           def smi_env():
@@ -77,30 +79,66 @@ spec:
               return int(free.stdout.strip()) / 1024.0, int(total.stdout.strip()) / 1024.0
 
 
+          def get_gpu_name(gpu_id):
+              result = subprocess.run(
+                  [NVIDIA_SMI, "--id", str(gpu_id), "--query-gpu=name", "--format=csv,noheader"],
+                  capture_output=True, text=True, check=True, timeout=2, env=smi_env(),
+              )
+              return result.stdout.strip()
+
+
+          def ensure_pycuda():
+              global _pycuda_installed
+              if _pycuda_installed:
+                  return
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--no-cache-dir", "pycuda"],
+                  check=True,
+              )
+              _pycuda_installed = True
+
+
           def get_gpu_specs(gpu_id):
-              import pycuda.driver as cuda
-              import pycuda.autoinit
-              dev = cuda.Device(gpu_id)
-              specs = {"name": dev.name()}
-              for attr in cuda.device_attribute:
-                  specs[attr.name.lower()] = dev.get_attribute(attr)
+              # subprocess keeps pycuda out of the Ray driver process entirely
+              ensure_pycuda()
+              code = (
+                  "import json\n"
+                  "import pycuda.autoinit\n"
+                  "import pycuda.driver as cuda\n"
+                  f"dev = cuda.Device({gpu_id})\n"
+                  "da = cuda.device_attribute\n"
+                  "specs = {}\n"
+                  "for attr_name in dir(da):\n"
+                  "    if attr_name.isupper():\n"
+                  "        specs[attr_name.lower()] = dev.get_attribute(getattr(da, attr_name))\n"
+                  "print(json.dumps(specs))\n"
+              )
+              result = subprocess.run(
+                  [sys.executable, "-c", code],
+                  capture_output=True, text=True, check=True,
+              )
+              specs = json.loads(result.stdout.strip())
+              specs["name"] = get_gpu_name(gpu_id)
               return specs
 
 
           def push_gpu_specs(registry, node_name, num_gpus):
               for gpu_id in range(num_gpus):
                   specs = get_gpu_specs(gpu_id)
-                  ray.get(registry.update_gpu_specs.remote(node_name, gpu_id, specs))
+                  # kwargs required when using get_actor handles without class defs
+                  ray.get(registry.update_gpu_specs.remote(
+                      node_id=node_name, gpu_id=gpu_id, pycuda_specs=specs,
+                  ))
 
 
           def main():
-              ray_address = os.getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
               node_name = os.getenv("NODE_NAME", "unknown")
+              specs_pushed = False
 
               while True:
                   try:
                       if not ray.is_initialized():
-                          ray.init(address=ray_address, ignore_reinit_error=True)
+                          ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False)
                       registry = get_registry()
                       break
                   except ValueError:
@@ -113,24 +151,32 @@ spec:
               while True:
                   try:
                       if not ray.is_initialized():
-                          ray.init(address=ray_address, ignore_reinit_error=True)
+                          ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False)
                       registry = get_registry()
 
                       num_gpus = get_gpu_count()
                       if num_gpus <= 0:
                           raise RuntimeError("No GPUs found")
 
-                      push_gpu_specs(registry, node_name, num_gpus)
-
                       while True:
                           if not ray.is_initialized():
-                              ray.init(address=ray_address, ignore_reinit_error=True)
+                              ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False)
                               registry = get_registry()
-                              push_gpu_specs(registry, node_name, num_gpus)
+                              specs_pushed = False
+
+                          if not specs_pushed:
+                              try:
+                                  push_gpu_specs(registry, node_name, num_gpus)
+                                  specs_pushed = True
+                              except Exception as e:
+                                  print(f"Specs push pending: {e}", file=sys.stderr, flush=True)
 
                           for gpu_id in range(num_gpus):
                               free_gb, total_gb = get_gpu_vram(gpu_id)
-                              ray.get(registry.update_gpu.remote(node_name, gpu_id, free_gb, total_gb))
+                              ray.get(registry.update_gpu.remote(
+                                  node_id=node_name, gpu_id=gpu_id,
+                                  free_gb=free_gb, total_gb=total_gb,
+                              ))
 
                           time.sleep(0.5)
 
@@ -147,6 +193,7 @@ spec:
           PY
         securityContext:
           privileged: true
+          runAsUser: 0
         resources:
           requests:
             cpu: "100m"
@@ -155,6 +202,8 @@ spec:
             cpu: "1000m"
             memory: "2Gi"
         volumeMounts:
+        - name: ray-tmp
+          mountPath: /tmp/ray
         - name: dev
           mountPath: /dev
         - name: nvidia-bin
@@ -171,8 +220,10 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         - name: RAY_ADDRESS
-          value: "ray://10.0.1.53:10001"
+          value: "raycluster-head-svc:6379"
       volumes:
+      - name: ray-tmp
+        emptyDir: {}
       - name: dev
         hostPath:
           path: /dev

@@ -1,8 +1,6 @@
-ray[serve]>=2.8.0
+python-dotenv>=1.0.0
+requests>=2.28.0
+ray[serve]==2.53.0
 vllm>=0.11.1
 pydantic>=2.0.0
-torch>=2.0.0
-pycuda>=2021.1
-fastapi>=0.100.0
 transformers>=4.40.0
-

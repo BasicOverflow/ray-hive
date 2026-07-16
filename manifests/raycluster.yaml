@@ -129,16 +129,20 @@ spec:
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
   
-  # GPU Worker Groups - one per GPU node to get all GPUs on each node
+  # GPU workers: Gitea OCI registry (ffmpeg + vllm baked in).
+  # Build/push (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
+  #   docker build -f manifests/Dockerfile.ray-vllm-worker -t 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0 .
+  #   docker push 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
+  # k3s nodes need /etc/rancher/k3s/registries.yaml for plain HTTP (see Homelab Gitea.md).
   # ergos-02-nv: 12 CPUs, 3 GPUs
   - groupName: gpu-workers-ergos-02-nv
     replicas: 1
     minReplicas: 1
     maxReplicas: 1
     rayStartParams:
-      num-cpus: "12"  # Explicitly set to match ergos-02-nv CPU count
-      num-gpus: "3"  # All 3 GPUs on ergos-02-nv
-      resources: '"{\"ergos-02-nv_gpu0\": 100, \"ergos-02-nv_gpu1\": 100, \"ergos-02-nv_gpu2\": 100}"'  # Custom resources per GPU for placement control (high value allows multiple replicas)
+      num-cpus: "12"
+      num-gpus: "3"
+      resources: '"{\"ergos-02-nv_gpu0\": 100, \"ergos-02-nv_gpu1\": 100, \"ergos-02-nv_gpu2\": 100}"'
     template:
       spec:
         affinity:
@@ -167,39 +171,22 @@ spec:
           hostPath:
             path: /usr/lib/x86_64-linux-gnu
             type: Directory
-        - name: vllm-install
+        - name: hf-cache
           emptyDir: {}
-        - name: install-vllm-script
-          configMap:
-            name: ray-vllm-install-script
-            defaultMode: 0755
-        initContainers:
-        - name: install-vllm
-          image: rayproject/ray:2.53.0-py312-cu125
-          imagePullPolicy: Always
-          securityContext:
-            privileged: true
-          command: ["/bin/bash", "/scripts/install-vllm.sh"]
-          volumeMounts:
-          - name: vllm-install
-            mountPath: /vllm-install
-          - name: install-vllm-script
-            mountPath: /scripts
         containers:
         - name: ray-worker
-          image: rayproject/ray:2.53.0-py312-cu125
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
           imagePullPolicy: Always
           securityContext:
             privileged: true
           resources:
             requests:
-              cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 12 CPUs (no limits)
+              cpu: "2"
               memory: "8Gi"
-              nvidia.com/gpu: "3"  # All 3 GPUs on ergos-02-nv
+              nvidia.com/gpu: "3"
             limits:
-              memory: "40Gi"  # ergos-02-nv has 42 GB RAM - leave 2 GB for system
-              nvidia.com/gpu: "3"  # Must match request
-            # No CPU limit - Ray will auto-detect all available CPUs
+              memory: "40Gi"
+              nvidia.com/gpu: "3"
           volumeMounts:
           - name: dev
             mountPath: /dev
@@ -209,8 +196,8 @@ spec:
           - name: nvidia-lib
             mountPath: /host/usr/lib/x86_64-linux-gnu
             readOnly: true
-          - name: vllm-install
-            mountPath: /vllm-install
+          - name: hf-cache
+            mountPath: /home/ray/.cache/huggingface
           env:
           - name: NODE_NAME
             valueFrom:
@@ -218,15 +205,12 @@ spec:
                 fieldPath: spec.nodeName
           - name: LD_LIBRARY_PATH
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
-          - name: PYTHONPATH
-            value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
-          - name: PATH
-            value: "/vllm-install/bin:/home/ray/anaconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          - name: VLLM_VIDEO_LOADER_BACKEND
+            value: "opencv"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS
             value: "raycluster-head-svc:8265"
-          # CUDA memory slicing for multiple replicas per GPU
           - name: PYTORCH_ALLOC_CONF
             value: "max_split_size_mb:128,expandable_segments:True"
           - name: CUDA_DEVICE_MAX_CONNECTIONS
@@ -235,11 +219,10 @@ spec:
             value: "1"
           - name: NCCL_IB_DISABLE
             value: "1"
-          # Shared Hugging Face cache to avoid re-downloading models
           - name: HF_HOME
-            value: "/vllm-install/.cache/huggingface"
+            value: "/home/ray/.cache/huggingface"
           - name: TRANSFORMERS_CACHE
-            value: "/vllm-install/.cache/huggingface"
+            value: "/home/ray/.cache/huggingface"
   
   # ergos-04-nv: 13 CPUs, 2 GPUs
   - groupName: gpu-workers-ergos-04-nv
@@ -247,9 +230,9 @@ spec:
     minReplicas: 1
     maxReplicas: 1
     rayStartParams:
-      num-cpus: "13"  # Explicitly set to match ergos-04-nv CPU count
-      num-gpus: "2"  # All 2 GPUs on ergos-04-nv
-      resources: '"{\"ergos-04-nv_gpu0\": 100, \"ergos-04-nv_gpu1\": 100}"'  # Custom resources per GPU for placement control (high value allows multiple replicas)
+      num-cpus: "13"
+      num-gpus: "2"
+      resources: '"{\"ergos-04-nv_gpu0\": 100, \"ergos-04-nv_gpu1\": 100}"'
     template:
       spec:
         affinity:
@@ -278,39 +261,22 @@ spec:
           hostPath:
             path: /usr/lib/x86_64-linux-gnu
             type: Directory
-        - name: vllm-install
+        - name: hf-cache
           emptyDir: {}
-        - name: install-vllm-script
-          configMap:
-            name: ray-vllm-install-script
-            defaultMode: 0755
-        initContainers:
-        - name: install-vllm
-          image: rayproject/ray:2.53.0-py312-cu125
-          imagePullPolicy: Always
-          securityContext:
-            privileged: true
-          command: ["/bin/bash", "/scripts/install-vllm.sh"]
-          volumeMounts:
-          - name: vllm-install
-            mountPath: /vllm-install
-          - name: install-vllm-script
-            mountPath: /scripts
         containers:
         - name: ray-worker
-          image: rayproject/ray:2.53.0-py312-cu125
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
           imagePullPolicy: Always
           securityContext:
             privileged: true
           resources:
             requests:
-              cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 13 CPUs (no limits)
+              cpu: "2"
               memory: "8Gi"
-              nvidia.com/gpu: "2"  # All 2 GPUs on ergos-04-nv
+              nvidia.com/gpu: "2"
             limits:
-              memory: "18Gi"  # ergos-04-nv has 20 GB RAM - leave 2 GB for system
-              nvidia.com/gpu: "2"  # Must match request
-            # No CPU limit - Ray will auto-detect all available CPUs
+              memory: "18Gi"
+              nvidia.com/gpu: "2"
           volumeMounts:
           - name: dev
             mountPath: /dev
@@ -320,8 +286,8 @@ spec:
           - name: nvidia-lib
             mountPath: /host/usr/lib/x86_64-linux-gnu
             readOnly: true
-          - name: vllm-install
-            mountPath: /vllm-install
+          - name: hf-cache
+            mountPath: /home/ray/.cache/huggingface
           env:
           - name: NODE_NAME
             valueFrom:
@@ -329,15 +295,12 @@ spec:
                 fieldPath: spec.nodeName
           - name: LD_LIBRARY_PATH
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
-          - name: PYTHONPATH
-            value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
-          - name: PATH
-            value: "/vllm-install/bin:/home/ray/anaconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          - name: VLLM_VIDEO_LOADER_BACKEND
+            value: "opencv"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS
             value: "raycluster-head-svc:8265"
-          # CUDA memory slicing for multiple replicas per GPU
           - name: PYTORCH_ALLOC_CONF
             value: "max_split_size_mb:128,expandable_segments:True"
           - name: CUDA_DEVICE_MAX_CONNECTIONS
@@ -346,11 +309,10 @@ spec:
             value: "1"
           - name: NCCL_IB_DISABLE
             value: "1"
-          # Shared Hugging Face cache to avoid re-downloading models
           - name: HF_HOME
-            value: "/vllm-install/.cache/huggingface"
+            value: "/home/ray/.cache/huggingface"
           - name: TRANSFORMERS_CACHE
-            value: "/vllm-install/.cache/huggingface"
+            value: "/home/ray/.cache/huggingface"
   
   # ergos-06-nv: 5 CPUs, 1 GPU
   - groupName: gpu-workers-ergos-06-nv
@@ -358,9 +320,9 @@ spec:
     minReplicas: 1
     maxReplicas: 1
     rayStartParams:
-      num-cpus: "5"  # Explicitly set to match ergos-06-nv CPU count
-      num-gpus: "1"  # All 1 GPU on ergos-06-nv
-      resources: '"{\"ergos-06-nv_gpu0\": 100}"'  # Custom resource per GPU for placement control (high value allows multiple replicas)
+      num-cpus: "5"
+      num-gpus: "1"
+      resources: '"{\"ergos-06-nv_gpu0\": 100}"'
     template:
       spec:
         affinity:
@@ -389,39 +351,22 @@ spec:
           hostPath:
             path: /usr/lib/x86_64-linux-gnu
             type: Directory
-        - name: vllm-install
+        - name: hf-cache
           emptyDir: {}
-        - name: install-vllm-script
-          configMap:
-            name: ray-vllm-install-script
-            defaultMode: 0755
-        initContainers:
-        - name: install-vllm
-          image: rayproject/ray:2.53.0-py312-cu125
-          imagePullPolicy: Always
-          securityContext:
-            privileged: true
-          command: ["/bin/bash", "/scripts/install-vllm.sh"]
-          volumeMounts:
-          - name: vllm-install
-            mountPath: /vllm-install
-          - name: install-vllm-script
-            mountPath: /scripts
         containers:
         - name: ray-worker
-          image: rayproject/ray:2.53.0-py312-cu125
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
           imagePullPolicy: Always
           securityContext:
             privileged: true
           resources:
             requests:
-              cpu: "2"  # Minimal request for scheduling - Ray will auto-detect all 5 CPUs (no limits)
+              cpu: "2"
               memory: "8Gi"
-              nvidia.com/gpu: "1"  # All 1 GPU on ergos-06-nv
+              nvidia.com/gpu: "1"
             limits:
-              memory: "32Gi"  # ergos-06-nv has 34 GB RAM - leave 2 GB for system
-              nvidia.com/gpu: "1"  # Must match request
-            # No CPU limit - Ray will auto-detect all available CPUs
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
           volumeMounts:
           - name: dev
             mountPath: /dev
@@ -431,8 +376,8 @@ spec:
           - name: nvidia-lib
             mountPath: /host/usr/lib/x86_64-linux-gnu
             readOnly: true
-          - name: vllm-install
-            mountPath: /vllm-install
+          - name: hf-cache
+            mountPath: /home/ray/.cache/huggingface
           env:
           - name: NODE_NAME
             valueFrom:
@@ -440,15 +385,12 @@ spec:
                 fieldPath: spec.nodeName
           - name: LD_LIBRARY_PATH
             value: "/host/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
-          - name: PYTHONPATH
-            value: "/vllm-install:/vllm-install/lib/python3.12/site-packages:/home/ray/anaconda3/lib/python3.12/site-packages"
-          - name: PATH
-            value: "/vllm-install/bin:/home/ray/anaconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          - name: VLLM_VIDEO_LOADER_BACKEND
+            value: "opencv"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
           - name: RAY_HEAD_ADDRESS
             value: "raycluster-head-svc:8265"
-          # CUDA memory slicing for multiple replicas per GPU
           - name: PYTORCH_ALLOC_CONF
             value: "max_split_size_mb:128,expandable_segments:True"
           - name: CUDA_DEVICE_MAX_CONNECTIONS
@@ -457,9 +399,7 @@ spec:
             value: "1"
           - name: NCCL_IB_DISABLE
             value: "1"
-          # Shared Hugging Face cache to avoid re-downloading models
           - name: HF_HOME
-            value: "/vllm-install/.cache/huggingface"
+            value: "/home/ray/.cache/huggingface"
           - name: TRANSFORMERS_CACHE
-            value: "/vllm-install/.cache/huggingface"
-
+            value: "/home/ray/.cache/huggingface"

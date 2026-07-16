@@ -1,0 +1,26 @@
+# GPU Ray worker image: Ray + ffmpeg (torchcodec) + vLLM.
+# Official vLLM approach: apt packages live in the RUNTIME image.
+#
+# Build + push to Gitea (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
+#   docker build -f manifests/Dockerfile.ray-vllm-worker -t 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0 .
+#   docker push 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
+#
+# k3s nodes need plain-HTTP pull config — see manifests/k3s-registries-gitea.yaml
+# and Homelab infrastructure/Gitea.md.
+
+FROM rayproject/ray:2.53.0-py312-cu125
+
+USER root
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends \
+        ffmpeg libsm6 libxext6 libgl1 libpulse0 \
+    && rm -rf /var/lib/apt/lists/*
+
+USER ray
+# vLLM pulls protobuf 7.x which breaks Ray Serve (_proto_to_dict uses field.label).
+RUN pip install --no-cache-dir "scipy" "vllm>=0.11.1" \
+    && pip install --no-cache-dir "protobuf==4.25.8"
+
+ENV VLLM_VIDEO_LOADER_BACKEND=opencv
+ENV HF_HOME=/home/ray/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/home/ray/.cache/huggingface

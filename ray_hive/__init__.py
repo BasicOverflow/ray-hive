@@ -2,22 +2,12 @@
 Ray Hive - Distributed LLM serving engine for Ray clusters.
 """
 
-from .hive import RayHive
 from .inference import (
     inference,
     a_inference,
     inference_batch,
     a_inference_batch,
 )
-from .core import (
-    DeployService,
-    get_deploy_service,
-    VRAMAllocator,
-    get_gpu_registry,
-    RayLLMActor,
-    ModelRouter,
-)
-from .shutdown import shutdown_all, shutdown_model, kill_gpu_registry
 
 __all__ = [
     "RayHive",
@@ -37,3 +27,16 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
+
+
+def __getattr__(name):
+    if name == "RayHive":
+        from .hive import RayHive
+        return RayHive
+    if name in ("shutdown_all", "shutdown_model", "kill_gpu_registry"):
+        from . import shutdown
+        return getattr(shutdown, name)
+    if name in ("DeployService", "get_deploy_service", "VRAMAllocator", "get_gpu_registry", "RayLLMActor", "ModelRouter"):
+        from . import core
+        return getattr(core, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

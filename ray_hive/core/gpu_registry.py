@@ -53,8 +53,21 @@ class ClusterStateManager(ABC):
         return {gpu_key: gpu["available"] for gpu_key, gpu in self.get_all_gpus().items()}
 
 
+    def _pending_covers_request(self, replica_gpu_vram_gb: dict[str, dict[str, float]]) -> bool:
+        """True when every replica is already held in pending with enough VRAM."""
+        for replica_id, gpu_vram_gb in replica_gpu_vram_gb.items():
+            for gpu_key, vram_gb in gpu_vram_gb.items():
+                gpu = self.get_gpu_vram(gpu_key)
+                if gpu is None or gpu["pending"].get(replica_id, 0.0) < vram_gb:
+                    return False
+        return True
+
+
     def _check_capacity(self, replica_gpu_vram_gb: dict[str, dict[str, float]], deployment_id: str):
         """Raise if requested replica VRAM exceeds available capacity on any GPU."""
+        if self._pending_covers_request(replica_gpu_vram_gb):
+            return
+
         requested_by_gpu = {}
         for gpu_vram_gb in replica_gpu_vram_gb.values():
             for gpu_key, vram_gb in gpu_vram_gb.items():
@@ -120,7 +133,10 @@ class VRAMAllocator(ClusterStateManager):
 
 
     def _gpu_key(self, node_id: str, gpu_id: int) -> str:
-        """Return canonical GPU key: node_id:gpuN."""
+        """Return canonical GPU key: k8s_hostname:gpuN (never Ray hex node ids)."""
+        # Legacy monitors briefly used Ray's hex node id — reject so they can't reappear.
+        if len(node_id) >= 32 and all(c in "0123456789abcdef" for c in node_id.lower()):
+            raise ValueError(f"node_id must be k8s hostname from NODE_NAME, got Ray node id {node_id!r}")
         return f"{node_id}:gpu{gpu_id}"
 
 

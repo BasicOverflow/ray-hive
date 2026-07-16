@@ -25,7 +25,6 @@ class RayHive:
         suppress_ray_warnings(suppress_logging)
         init_ray(suppress_logging=suppress_logging, **kwargs)
         get_gpu_registry()
-        get_deploy_service()
 
 
     def deploy_model(
@@ -36,6 +35,7 @@ class RayHive:
         max_output_prompt_length: int,
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
+        max_num_seqs: Optional[int] = None,
         max_num_batched_tokens: Optional[int] = None,
         swap_space_per_instance: int = 3,
         **vllm_kwargs
@@ -43,7 +43,8 @@ class RayHive:
         """
         Deploy a model with VRAM-aware scheduling.
 
-        Planner auto-computes weights and vLLM settings unless overridden.
+        max_input_prompt_length and max_output_prompt_length are required.
+        max_num_seqs and max_num_batched_tokens are estimated from VRAM unless overridden.
         replicas=-1 deploys to all eligible GPUs.
         """
         config = {
@@ -54,6 +55,8 @@ class RayHive:
             "max_output_prompt_length": max_output_prompt_length,
             "swap_space_per_instance": swap_space_per_instance,
         }
+        if max_num_seqs is not None:
+            config["max_num_seqs"] = max_num_seqs
         if max_num_batched_tokens is not None:
             config["max_num_batched_tokens"] = max_num_batched_tokens
 
@@ -94,6 +97,4 @@ class RayHive:
         """Print available/total VRAM for each GPU."""
         state = self.get_vram_state()
         for gpu_key, info in sorted(state.items()):
-            if len(gpu_key) > 50 or gpu_key.startswith('c'):
-                continue
             print(f"GPU {gpu_key}: {info.get('available', 0):.2f}GB available / {info.get('total', 0):.2f}GB total")

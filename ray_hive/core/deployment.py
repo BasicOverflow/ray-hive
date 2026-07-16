@@ -8,11 +8,9 @@ import time
 
 import ray
 from ray import serve
-from transformers import AutoConfig
 
 from .gpu_registry import get_gpu_registry
 from .model_specs.planner import build_vram_reqs, plan_deployment
-from .model_router import ModelRouter
 
 
 def _gpu_resource_name(gpu_key: str) -> str:
@@ -27,44 +25,60 @@ def _deployment_name(model_id: str, gpu_key: str) -> str:
     return f"{model_id}-{gpu_key.replace(':', '-').replace('_', '-')}"
 
 
+def _gpu_info_entry(gpu_key: str, gpu_info: dict) -> dict:
+    """Build scheduling info dict from a registry GPU view."""
+    return {
+        "gpu_key": gpu_key,
+        "resource_name": _gpu_resource_name(gpu_key),
+        "gpu_id": gpu_key.split(":")[1].replace("gpu", ""),
+        "total_gb": gpu_info["total"],
+        "free_gb": gpu_info["free"],
+        "available_gb": gpu_info["available"],
+    }
+
+
 def _eligible_gpus(gpu_map: dict, min_vram_gb: float) -> list[dict]:
     """Filter GPUs with enough available VRAM for model weights."""
     eligible = []
     for gpu_key, gpu_info in gpu_map.items():
-        if len(gpu_key) > 50 or gpu_key.startswith("c"):
-            continue
         if gpu_info["available"] < min_vram_gb:
             continue
-        eligible.append({
-            "gpu_key": gpu_key,
-            "resource_name": _gpu_resource_name(gpu_key),
-            "gpu_id": gpu_key.split(":")[1].replace("gpu", ""),
-            "total_gb": gpu_info["total"],
-            "free_gb": gpu_info["free"],
-            "available_gb": gpu_info["available"],
-        })
+        eligible.append(_gpu_info_entry(gpu_key, gpu_info))
     return eligible
 
 
-def _resolve_replicas(available: list[dict], replicas: int, gpu) -> list[dict]:
+def _resolve_pinned_gpu(gpu_map: dict, gpu_key: str, min_vram_gb: float) -> dict:
+    """Resolve an explicit GPU pin from the full registry (not the filtered eligible list)."""
+    if gpu_key not in gpu_map:
+        raise ValueError(f"GPU {gpu_key} not in registry. Known: {sorted(gpu_map)}")
+    gpu_info = gpu_map[gpu_key]
+    if gpu_info["available"] < min_vram_gb:
+        raise ValueError(
+            f"GPU {gpu_key} has {gpu_info['available']:.2f}GB available, "
+            f"need {min_vram_gb:.2f}GB for model weights"
+        )
+    return _gpu_info_entry(gpu_key, gpu_info)
+
+
+def _resolve_replicas(gpu_map: dict, available: list[dict], replicas: int, gpu, min_vram_gb: float) -> list[dict]:
     """Pick target GPUs from available pool based on replicas count or explicit gpu pin."""
     if gpu is not None:
         if isinstance(gpu, str):
-            picked = [g for g in available if g["gpu_key"] == gpu]
-            if not picked:
-                raise ValueError(f"GPU {gpu} not found or insufficient VRAM")
-            return picked[:1]
+            return [_resolve_pinned_gpu(gpu_map, gpu, min_vram_gb)]
         if isinstance(gpu, list):
-            picked = [g for g in available if g["gpu_key"] in gpu]
-            if len(picked) != len(gpu):
-                missing = set(gpu) - {g["gpu_key"] for g in picked}
-                raise ValueError(f"GPUs not found or insufficient VRAM: {missing}")
-            return picked
+            return [_resolve_pinned_gpu(gpu_map, g, min_vram_gb) for g in gpu]
         raise ValueError("gpu must be a string, list of strings, or None")
 
     if replicas == -1:
         return available
     return available[:replicas]
+
+
+@ray.remote(num_gpus=0.01)
+def fetch_hf_config_dict(model_name: str) -> dict:
+    """Load HF config on a GPU worker where transformers/vllm are installed."""
+    from transformers import AutoConfig
+    return AutoConfig.from_pretrained(model_name, trust_remote_code=True).to_dict()
 
 
 @ray.remote
@@ -91,6 +105,32 @@ def deploy_single(
         num_replicas=1,
     ).bind(model_id=model_id, target_gpu_id=target_gpu_id, engine_kwargs=engine_kwargs)
     serve.run(deployment, name=replica_id, route_prefix=route_prefix)
+    return True
+
+
+@ray.remote
+def deploy_router(
+    model_id: str,
+    model_name: str,
+    gpu_deployment_names: list[str],
+    replica_metadata: dict,
+    resource_name: str,
+):
+    """Bind/run ModelRouter on a GPU worker (needs transformers/vllm)."""
+    from ray_hive.core.model_router import ModelRouter
+
+    router = ModelRouter.options(
+        name=f"{model_id}-router",
+        autoscaling_config=None,
+        num_replicas=1,
+        ray_actor_options={"num_cpus": 0.1, "resources": {resource_name: 0.01}},
+    ).bind(
+        model_id=model_id,
+        model_name=model_name,
+        gpu_deployment_names=gpu_deployment_names,
+        replica_metadata=replica_metadata,
+    )
+    serve.run(router, name=model_id, route_prefix=f"/{model_id}")
     return True
 
 
@@ -133,21 +173,24 @@ class DeployService:
 
     def _deploy_model(self, model_id: str, config: dict, model_vllm_kwargs: dict) -> dict:
         """Run the full deploy pipeline for one model."""
-        registry = get_gpu_registry()
-        hf_config = AutoConfig.from_pretrained(config["name"], trust_remote_code=True)
-        vram_reqs = build_vram_reqs(hf_config, **model_vllm_kwargs)
+        if "max_input_prompt_length" not in config or "max_output_prompt_length" not in config:
+            raise ValueError("max_input_prompt_length and max_output_prompt_length are required")
 
-        vram_weights_gb = config.get("vram_weights_gb")
-        if vram_weights_gb is None:
-            vram_weights_gb = vram_reqs.calc_weights_gb()
+        registry = get_gpu_registry()
+        hf_params = ray.get(fetch_hf_config_dict.remote(config["name"]))
+        vram_reqs = build_vram_reqs(hf_params, **model_vllm_kwargs)
 
         gpu_map = ray.get(registry.get_all_gpus.remote())
-        available_gpus = _eligible_gpus(gpu_map, vram_weights_gb)
-        target_gpus = _resolve_replicas(available_gpus, config.get("replicas", -1), config.get("gpu"))
+        min_vram_gb = vram_reqs.calc_weights_gb()
+        available_gpus = _eligible_gpus(gpu_map, min_vram_gb)
+        target_gpus = _resolve_replicas(
+            gpu_map, available_gpus, config.get("replicas", -1), config.get("gpu"), min_vram_gb
+        )
 
         max_model_len = config["max_input_prompt_length"] + config["max_output_prompt_length"]
         swap_space = float(config.get("swap_space_per_instance") or 0)
         batched_tokens_override = config.get("max_num_batched_tokens")
+        max_num_seqs_override = config.get("max_num_seqs")
 
         replica_jobs = []
         gpu_mapping = {}
@@ -157,15 +200,16 @@ class DeployService:
         for gpu_info in target_gpus:
             gpu_key = gpu_info["gpu_key"]
             used_vram = ray.get(registry.used_vram_gb.remote(gpu_key))
+            vram_budget_gb = (gpu_info["available_gb"] - used_vram) * 0.95
             plan = plan_deployment(
                 vram_reqs,
-                used_vram_gb=used_vram,
-                live_free_vram_gb=gpu_info["free_gb"],
+                vram_budget_gb=vram_budget_gb,
                 live_total_vram_gb=gpu_info["total_gb"],
                 max_model_len=max_model_len,
                 input_len=config["max_input_prompt_length"],
                 output_len=config["max_output_prompt_length"],
                 max_num_batched_tokens_override=batched_tokens_override,
+                max_num_seqs_override=max_num_seqs_override,
             )
 
             replica_id = _deployment_name(model_id, gpu_key)
@@ -178,6 +222,7 @@ class DeployService:
                 "max_num_batched_tokens": plan["max_num_batched_tokens"],
                 "gpu_memory_utilization": plan["gpu_memory_utilization"],
                 "swap_space": swap_space,
+                "enforce_eager": True,
                 **model_vllm_kwargs,
             }
 
@@ -221,13 +266,14 @@ class DeployService:
             ray.get(registry.mark_initialized.remote(replica_id, gpu_mapping[replica_id]))
 
         gpu_deployment_names = [job["replica_id"] for job in replica_jobs]
-        router = ModelRouter.options(name=f"{model_id}-router", autoscaling_config=None, num_replicas=1).bind(
-            model_id=model_id,
-            model_name=config["name"],
-            gpu_deployment_names=gpu_deployment_names,
-            replica_metadata=replica_metadata,
-        )
-        serve.run(router, name=model_id, route_prefix=f"/{model_id}")
+        router_resource = replica_jobs[0]["resource_name"]
+        ray.get(deploy_router.options(resources={router_resource: 0.01}).remote(
+            model_id,
+            config["name"],
+            gpu_deployment_names,
+            replica_metadata,
+            router_resource,
+        ))
 
         return {
             replica_id: {"plan": replica_metadata[replica_id], "gpu_key": gpu_mapping[replica_id]}

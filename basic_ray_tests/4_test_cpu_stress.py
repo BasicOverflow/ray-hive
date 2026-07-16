@@ -6,12 +6,17 @@ Tests:
 - Task distribution across CPU workers
 - CPU worker performance
 """
+import os
 import ray
 import time
 import sys
 from collections import Counter
+from pathlib import Path
+from dotenv import load_dotenv
 
-RAY_ADDRESS = "ray://10.0.1.53:10001"
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+RAY_ADDRESS = os.environ["RAY_ADDRESS"]
 
 @ray.remote
 def cpu_task(n):

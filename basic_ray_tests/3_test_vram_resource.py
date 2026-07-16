@@ -1,10 +1,15 @@
 """
 Test gpu_registry actor — verifies VRAM DaemonSet reporting is working.
 """
+import os
 import ray
 import sys
+from pathlib import Path
+from dotenv import load_dotenv
 
-RAY_ADDRESS = "ray://10.0.1.53:10001"
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+RAY_ADDRESS = os.environ["RAY_ADDRESS"]
 
 
 def main():
@@ -25,11 +30,9 @@ def main():
             print("⚠️  No VRAM data available yet. DaemonSet may still be initializing.")
             sys.exit(0)
 
-        gpu_nodes = {k: v for k, v in state.items() if v and len(k) < 50 and not k.startswith('c')}
-
-        print(f"VRAM State ({len(gpu_nodes)} GPUs):")
+        print(f"VRAM State ({len(state)} GPUs):")
         print("-" * 60)
-        for gpu_key, info in sorted(gpu_nodes.items()):
+        for gpu_key, info in sorted(state.items()):
             print(f"GPU: {gpu_key}")
             print(f"  Total VRAM: {info.get('total', 0):.2f} GB")
             print(f"  Free VRAM:  {info.get('free', 0):.2f} GB")
@@ -41,7 +44,7 @@ def main():
             print()
 
         test_required = 5.0
-        found = [k for k, v in gpu_nodes.items() if v.get("available", 0) >= test_required]
+        found = [k for k, v in state.items() if v.get("available", 0) >= test_required]
         if found:
             print(f"✅ Found GPU with {test_required}GB+ available VRAM: {found[0]}")
         else:

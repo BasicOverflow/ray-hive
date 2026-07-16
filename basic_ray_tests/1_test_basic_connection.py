@@ -6,10 +6,15 @@ Verifies:
 - Cluster resources are visible
 - Simple tasks can execute
 """
+import os
 import ray
 import sys
+from pathlib import Path
+from dotenv import load_dotenv
 
-RAY_ADDRESS = "ray://10.0.1.53:10001"
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+RAY_ADDRESS = os.environ["RAY_ADDRESS"]
 
 def main():
     print(f"Connecting to Ray cluster at {RAY_ADDRESS}...")

@@ -2,7 +2,7 @@
 Model router — least-queue load balancing with OpenAI-compatible HTTP ingress.
 
 Exposes /v1/models, /v1/chat/completions, /v1/completions on the router
-deployment. Programmatic inference goes through __call__ → replica handle.
+deployment. Programmatic inference goes through infer() → replica handle.
 """
 import uuid
 from typing import Literal, Union
@@ -225,7 +225,7 @@ class ModelRouter:
         return self._openai_completion_response(text, prompt)
 
 
-    async def __call__(self, request):
+    async def infer(self, request):
         """Programmatic inference entrypoint — routes to least-loaded replica."""
         if isinstance(request, dict):
             prompt = request.get("prompts") or request.get("prompt")

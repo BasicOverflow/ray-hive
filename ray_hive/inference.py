@@ -10,11 +10,16 @@ from typing import Optional, Type, List, Union
 from pydantic import BaseModel
 from os import getenv
 
+from .ray_utils import load_env
+
 
 def _ensure_connected():
     """Ensure Ray is connected to cluster."""
     if not ray.is_initialized():
-        address = getenv("RAY_ADDRESS", "ray://10.0.1.53:10001")
+        load_env()
+        address = getenv("RAY_ADDRESS")
+        if not address:
+            raise RuntimeError("RAY_ADDRESS not set. Copy .env.example to .env and set your cluster address.")
         ray.init(address=address, ignore_reinit_error=True, log_to_driver=False)
 
 
@@ -57,7 +62,7 @@ def inference(prompt: str, model_id: str, structured_output: Optional[Type[BaseM
     
     request.update(kwargs)
     
-    result = handle.remote(request).result()
+    result = handle.infer.remote(request).result()
     text = _extract_text(result)
     
     if structured_output:
@@ -80,7 +85,7 @@ async def a_inference(prompt: str, model_id: str, structured_output: Optional[Ty
     
     request.update(kwargs)
     
-    result = await handle.remote(request)
+    result = await handle.infer.remote(request)
     text = _extract_text(result)
     
     if structured_output:
@@ -114,7 +119,7 @@ def inference_batch(prompts: List[str], model_id: str, structured_output: Option
     
     request.update(kwargs)
     
-    result = handle.remote(request).result()
+    result = handle.infer.remote(request).result()
     results = result if isinstance(result, list) else [result]
     
     output = []
@@ -149,7 +154,7 @@ async def a_inference_batch(prompts: List[str], model_id: str, structured_output
     
     request.update(kwargs)
     
-    result = await handle.remote(request)
+    result = await handle.infer.remote(request)
     results = result if isinstance(result, list) else [result]
     
     output = []

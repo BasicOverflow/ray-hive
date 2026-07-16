@@ -26,7 +26,7 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=[
-        "ray[serve]>=2.8.0",
+        "ray[serve]==2.53.0",
         "vllm>=0.11.1",
         "pydantic>=2.0.0",
         "torch>=2.0.0",

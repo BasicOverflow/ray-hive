@@ -4,8 +4,11 @@ import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from dotenv import load_dotenv
 from ray_hive import RayHive
 from ray_hive.inference import inference_batch
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 scheduler = RayHive(suppress_logging=True)
 
