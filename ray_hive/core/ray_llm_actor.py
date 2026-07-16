@@ -21,3 +21,13 @@ class RayLLMActor(LLM):
         os.environ["VLLM_DISABLE_MARLIN"] = "1"
         self.model_id = model_id
         super().__init__(**engine_kwargs)
+
+
+    def generate(self, prompts, sampling_params=None):
+        """Serve-callable generate wrapper."""
+        return super().generate(prompts, sampling_params=sampling_params)
+
+
+    def chat(self, messages, sampling_params=None):
+        """Serve-callable chat wrapper."""
+        return super().chat(messages, sampling_params=sampling_params)

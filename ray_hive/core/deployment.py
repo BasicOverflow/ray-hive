@@ -140,7 +140,10 @@ class DeployService:
 
     def deploy_models(self, model_configs: dict, vllm_kwargs: dict | None = None) -> dict:
         """Deploy one or more models; returns per-replica plan dicts."""
-        serve.start()
+        serve.start(
+            proxy_location="HeadOnly",
+            http_options={"host": "0.0.0.0", "port": 8000},
+        )
         vllm_kwargs = vllm_kwargs or {}
         results = {}
         for model_id, config in model_configs.items():

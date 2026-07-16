@@ -108,11 +108,19 @@ class ModelRouter:
 
     async def _route_chat(self, messages, max_tokens=None, temperature=None, extra=None):
         """Route a chat conversation to the least-loaded replica."""
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         replica_name = self._select_replica()
         self._queue_depth[replica_name] += 1
         try:
             handle = self._get_handles()[replica_name]
-            return await handle.chat.remote(messages, self._sampling_params(max_tokens, temperature, extra))
+            return await handle.generate.remote(
+                [prompt],
+                self._sampling_params(max_tokens, temperature, extra),
+            )
         finally:
             self._queue_depth[replica_name] = max(0, self._queue_depth[replica_name] - 1)
 
