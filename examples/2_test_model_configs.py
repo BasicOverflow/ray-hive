@@ -22,7 +22,6 @@ deployments = [
             "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
             "max_input_prompt_length": 1024,
             "max_output_prompt_length": 2048,
-            # "max_num_seqs": 24
         }
     },
     # {

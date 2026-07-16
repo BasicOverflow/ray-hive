@@ -25,10 +25,13 @@ class BaseVramReqs(ABC):
 
     attention_cls: type[BaseAttentionSpecs] = BaseAttentionSpecs
 
-    def __init__(self, speculative_decoding_enabled: bool = False, kv_cache_dtype_bytes: float = 8.0, **hf_params: Any):
+    def __init__(self, speculative_decoding_enabled: bool = False, kv_cache_dtype_bytes: float | None = None, **hf_params: Any):
         """Store HF config and build the attention specs calculator."""
         self.hf_params = hf_params
         self.speculative_decoding_enabled = speculative_decoding_enabled
+
+        if kv_cache_dtype_bytes is None:
+            kv_cache_dtype_bytes = 1
 
         self.attention = self.attention_cls(
             kv_bytes_per_element=kv_cache_dtype_bytes,

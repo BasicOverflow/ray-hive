@@ -33,7 +33,7 @@ class BaseAttentionSpecs(ABC):
             HuggingFace config parameters.
     """
 
-    def __init__(self, kv_bytes_per_element: float = 8, **hf_params: Any):
+    def __init__(self, kv_bytes_per_element: float = 1, **hf_params: Any):
         """Store Hugging Face config params used by cache formulas."""
         self.hf_params = hf_params
         self.kv_bytes_per_element = kv_bytes_per_element

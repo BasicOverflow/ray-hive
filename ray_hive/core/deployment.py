@@ -222,7 +222,7 @@ class DeployService:
                 "max_num_batched_tokens": plan["max_num_batched_tokens"],
                 "gpu_memory_utilization": plan["gpu_memory_utilization"],
                 "swap_space": swap_space,
-                "enforce_eager": True,
+                "enforce_eager": False,
                 **model_vllm_kwargs,
             }
 
