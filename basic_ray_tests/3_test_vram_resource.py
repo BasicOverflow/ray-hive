@@ -39,8 +39,9 @@ def main():
             print(f"  Available:  {info.get('available', 0):.2f} GB")
             print(f"  Pending:    {sum(info.get('pending', {}).values()):.2f} GB")
             print(f"  Active:     {sum(info.get('active', {}).values()):.2f} GB")
-            if info.get("specs", {}).get("name"):
-                print(f"  Model:      {info['specs']['name']}")
+            print("  PyCUDA specs:")
+            for name, value in sorted(info.get("specs", {}).items()):
+                print(f"    {name}: {value}")
             print()
 
         test_required = 5.0

@@ -31,6 +31,8 @@ spec:
         - |
           set -e
           apt-get update -qq && apt-get install -y -qq gcc g++ python3-dev > /dev/null 2>&1
+          # Install pycuda before joining Ray so the long build cannot race a killed registry
+          python3 -m pip install --no-cache-dir pycuda
           HEAD="${RAY_ADDRESS:-raycluster-head-svc:6379}"
           ray start --address="$HEAD" --num-cpus=0 --num-gpus=0 --disable-usage-stats
           sleep 3
@@ -122,10 +124,11 @@ spec:
               return specs
 
 
-          def push_gpu_specs(registry, node_name, num_gpus):
+          def push_gpu_specs(node_name, num_gpus):
               for gpu_id in range(num_gpus):
                   specs = get_gpu_specs(gpu_id)
-                  # kwargs required when using get_actor handles without class defs
+                  # Re-resolve after any slow work — stale handles point at killed actors
+                  registry = get_registry()
                   ray.get(registry.update_gpu_specs.remote(
                       node_id=node_name, gpu_id=gpu_id, pycuda_specs=specs,
                   ))
@@ -139,7 +142,7 @@ spec:
                   try:
                       if not ray.is_initialized():
                           ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False)
-                      registry = get_registry()
+                      get_registry()
                       break
                   except ValueError:
                       print("Waiting for gpu_registry actor...", file=sys.stderr, flush=True)
@@ -152,33 +155,29 @@ spec:
                   try:
                       if not ray.is_initialized():
                           ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False)
-                      registry = get_registry()
+                          specs_pushed = False
 
                       num_gpus = get_gpu_count()
                       if num_gpus <= 0:
                           raise RuntimeError("No GPUs found")
 
-                      while True:
-                          if not ray.is_initialized():
-                              ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False)
-                              registry = get_registry()
-                              specs_pushed = False
+                      if not specs_pushed:
+                          try:
+                              push_gpu_specs(node_name, num_gpus)
+                              specs_pushed = True
+                              print(f"Specs pushed for {node_name} ({num_gpus} GPUs)", flush=True)
+                          except Exception as e:
+                              print(f"Specs push pending: {e}", file=sys.stderr, flush=True)
 
-                          if not specs_pushed:
-                              try:
-                                  push_gpu_specs(registry, node_name, num_gpus)
-                                  specs_pushed = True
-                              except Exception as e:
-                                  print(f"Specs push pending: {e}", file=sys.stderr, flush=True)
+                      registry = get_registry()
+                      for gpu_id in range(num_gpus):
+                          free_gb, total_gb = get_gpu_vram(gpu_id)
+                          ray.get(registry.update_gpu.remote(
+                              node_id=node_name, gpu_id=gpu_id,
+                              free_gb=free_gb, total_gb=total_gb,
+                          ))
 
-                          for gpu_id in range(num_gpus):
-                              free_gb, total_gb = get_gpu_vram(gpu_id)
-                              ray.get(registry.update_gpu.remote(
-                                  node_id=node_name, gpu_id=gpu_id,
-                                  free_gb=free_gb, total_gb=total_gb,
-                              ))
-
-                          time.sleep(0.5)
+                      time.sleep(0.5)
 
                   except Exception as e:
                       print(f"Error: {e}", file=sys.stderr, flush=True)
@@ -186,6 +185,7 @@ spec:
                           ray.shutdown()
                       except Exception:
                           pass
+                      specs_pushed = False
                       time.sleep(5)
 
 
