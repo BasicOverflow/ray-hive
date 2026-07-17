@@ -95,33 +95,19 @@ async def a_inference(prompt: str, model_id: str, structured_output: Optional[Ty
 
 
 def inference_batch(prompts: List[str], model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> List[Union[str, BaseModel]]:
-    """Run batch inference on a deployed model. vLLM handles batching internally.
-    
-    All prompts are sent in a single request. vLLM's internal batching mechanism
-    handles optimal batching based on max_num_seqs and max_num_batched_tokens.
-    
-    Args:
-        prompts: List of prompts to process
-        model_id: Model identifier
-        structured_output: Optional Pydantic model for structured output
-        max_tokens: Maximum tokens to generate
-        **kwargs: Additional sampling parameters
-    """
+    """Run batch inference — one client request; router shards across replicas by max_num_seqs."""
     handle = _get_handle(model_id)
-    
+
     request = {"prompts": prompts}
     if max_tokens is not None:
         request["max_tokens"] = max_tokens
-    
-    # Use vLLM's native guided_json for structured output
     if structured_output:
         request["guided_json"] = structured_output.model_json_schema()
-    
     request.update(kwargs)
-    
+
     result = handle.infer.remote(request).result()
     results = result if isinstance(result, list) else [result]
-    
+
     output = []
     for result_item in results:
         text = _extract_text(result_item)
@@ -130,33 +116,19 @@ def inference_batch(prompts: List[str], model_id: str, structured_output: Option
 
 
 async def a_inference_batch(prompts: List[str], model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> List[Union[str, BaseModel]]:
-    """Run async batch inference on a deployed model. vLLM handles batching internally.
-    
-    All prompts are sent in a single request. vLLM's internal batching mechanism
-    handles optimal batching based on max_num_seqs and max_num_batched_tokens.
-    
-    Args:
-        prompts: List of prompts to process
-        model_id: Model identifier
-        structured_output: Optional Pydantic model for structured output
-        max_tokens: Maximum tokens to generate
-        **kwargs: Additional sampling parameters
-    """
+    """Async batch inference — one client request; router shards across replicas by max_num_seqs."""
     handle = _get_handle(model_id)
-    
+
     request = {"prompts": prompts}
     if max_tokens is not None:
         request["max_tokens"] = max_tokens
-    
-    # Use vLLM's native guided_json for structured output
     if structured_output:
         request["guided_json"] = structured_output.model_json_schema()
-    
     request.update(kwargs)
-    
+
     result = await handle.infer.remote(request)
     results = result if isinstance(result, list) else [result]
-    
+
     output = []
     for result_item in results:
         text = _extract_text(result_item)

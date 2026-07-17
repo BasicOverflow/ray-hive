@@ -70,6 +70,18 @@ answer = inference("Explain Ray in one sentence.", model_id="qwen")
 answers = inference_batch(["Prompt one", "Prompt two"], model_id="qwen")
 ```
 
+Ray Hive-specific `deploy_model` arguments:
+
+- `model_id` — local name used for the deployment, router, and API path.
+- `model_name` — Hugging Face model ID or model path passed to vLLM.
+- `max_input_prompt_length` / `max_output_prompt_length` — expected limits used to plan context memory and concurrency.
+- `replicas` — number of GPUs to deploy on; `-1` uses every eligible GPU.
+- `gpu` — optional GPU key or list of keys (for example, `ergos-06-nv:gpu0`) for explicit placement.
+- `max_num_seqs` / `max_num_batched_tokens` — optional overrides for the planner's estimates.
+- `swap_space_per_instance` — CPU swap space in GiB available to each vLLM instance.
+
+Any additional keyword arguments are forwarded to vLLM's `LLM(...)` constructor.
+
 Structured output accepts a Pydantic model:
 
 ```python

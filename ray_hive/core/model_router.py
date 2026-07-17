@@ -4,6 +4,7 @@ Model router — least-queue load balancing with OpenAI-compatible HTTP ingress.
 Exposes /v1/models, /v1/chat/completions, /v1/completions on the router
 deployment. Programmatic inference goes through infer() → replica handle.
 """
+import asyncio
 import uuid
 from typing import Literal, Union
 
@@ -157,17 +158,64 @@ class ModelRouter:
         return [o.outputs[0].text for o in outputs]
 
 
-    async def _route_text(self, prompt, max_tokens=None, temperature=None, extra=None):
-        """Route a text prompt to the least-loaded replica."""
-        prompts = [prompt] if isinstance(prompt, str) else [str(p) for p in prompt]
-        replica_name = self._select_replica()
-        self._queue_depth[replica_name] += 1
+    def _shard_prompts(self, prompts: list[str]) -> list[tuple[str, list[str], list[int]]]:
+        """Split prompts across replicas in proportion to each replica's max_num_seqs."""
+        names = self.gpu_deployment_names
+        weights = [max(self.replica_metadata[n].get("max_num_seqs", 1), 1) for n in names]
+        total_w = sum(weights)
+        n = len(prompts)
+
+        shards = []
+        start = 0
+        for i, (name, weight) in enumerate(zip(names, weights)):
+            if i == len(names) - 1:
+                count = n - start
+            else:
+                count = int(n * weight / total_w)
+            end = start + count
+            if count > 0:
+                shards.append((name, prompts[start:end], list(range(start, end))))
+            start = end
+        return shards
+
+
+    async def _dispatch_prompts(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
+        """Shard a prompt batch by max_num_seqs and run replicas concurrently."""
+        handles = self._get_handles()
+        if len(prompts) == 1:
+            name = self._select_replica()
+            self._queue_depth[name] += 1
+            try:
+                outputs = await handles[name].generate.remote(prompts, sampling_params)
+                return self._extract_texts(outputs)
+            finally:
+                self._queue_depth[name] = max(0, self._queue_depth[name] - 1)
+
+        shards = self._shard_prompts(prompts)
+        for name, chunk, _ in shards:
+            self._queue_depth[name] += len(chunk)
         try:
-            handle = self._get_handles()[replica_name]
-            outputs = await handle.generate.remote(prompts, self._sampling_params(max_tokens, temperature, extra))
-            return self._extract_texts(outputs)
+            outputs = await asyncio.gather(*[
+                handles[name].generate.remote(chunk, sampling_params)
+                for name, chunk, _ in shards
+            ])
+            texts = [None] * len(prompts)
+            for (_, _, idxs), outs in zip(shards, outputs):
+                for local_i, global_i in enumerate(idxs):
+                    texts[global_i] = outs[local_i].outputs[0].text
+            return texts
         finally:
-            self._queue_depth[replica_name] = max(0, self._queue_depth[replica_name] - 1)
+            for name, chunk, _ in shards:
+                self._queue_depth[name] = max(0, self._queue_depth[name] - len(chunk))
+
+
+    async def _route_text(self, prompt, max_tokens=None, temperature=None, extra=None):
+        """Route text prompts across replicas by capacity."""
+        prompts = [prompt] if isinstance(prompt, str) else [str(p) for p in prompt]
+        return await self._dispatch_prompts(
+            prompts,
+            self._sampling_params(max_tokens, temperature, extra),
+        )
 
 
     def _openai_chat_response(self, text: str, prompt: str) -> dict:
@@ -234,7 +282,7 @@ class ModelRouter:
 
 
     async def infer(self, request):
-        """Programmatic inference entrypoint — routes to least-loaded replica."""
+        """Programmatic inference entrypoint — shards batches by replica max_num_seqs."""
         if isinstance(request, dict):
             prompt = request.get("prompts") or request.get("prompt")
             kwargs = {k: v for k, v in request.items() if k not in ("prompt", "prompts")}
@@ -242,11 +290,4 @@ class ModelRouter:
             prompt, kwargs = str(request), {}
 
         prompts = prompt if isinstance(prompt, list) else [prompt]
-        replica_name = self._select_replica()
-        self._queue_depth[replica_name] += 1
-        try:
-            handle = self._get_handles()[replica_name]
-            outputs = await handle.generate.remote(prompts, self._sampling_params(extra=kwargs))
-            return self._extract_texts(outputs)
-        finally:
-            self._queue_depth[replica_name] = max(0, self._queue_depth[replica_name] - 1)
+        return await self._dispatch_prompts(prompts, self._sampling_params(extra=kwargs))
