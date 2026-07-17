@@ -95,7 +95,7 @@ async def a_inference(prompt: str, model_id: str, structured_output: Optional[Ty
 
 
 def inference_batch(prompts: List[str], model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> List[Union[str, BaseModel]]:
-    """Run batch inference — one client request; router shards across replicas by max_num_seqs."""
+    """Run batch inference — one client request; router shards by measured replica tokens/sec."""
     handle = _get_handle(model_id)
 
     request = {"prompts": prompts}
@@ -116,7 +116,7 @@ def inference_batch(prompts: List[str], model_id: str, structured_output: Option
 
 
 async def a_inference_batch(prompts: List[str], model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> List[Union[str, BaseModel]]:
-    """Async batch inference — one client request; router shards across replicas by max_num_seqs."""
+    """Async batch inference — one client request; router shards by measured replica tokens/sec."""
     handle = _get_handle(model_id)
 
     request = {"prompts": prompts}

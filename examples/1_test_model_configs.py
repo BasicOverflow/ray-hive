@@ -24,27 +24,27 @@ deployments = [
     #         "replicas": 1,
     #     },
     # },
-    {
-        "model_id": "qwen-two-replicas",
-        "description": "replicas=2",
-        "config": {
-            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
-            "max_input_prompt_length": 1024,
-            "max_output_prompt_length": 2048,
-            # "replicas": 2,
-            "gpu":["ergos-06-nv:gpu0", "ergos-02-nv:gpu0"]
-        },
-    },
     # {
-    #     "model_id": "qwen-all-gpus",
-    #     "description": "replicas=-1 (all eligible GPUs)",
+    #     "model_id": "qwen-two-replicas",
+    #     "description": "replicas=2",
     #     "config": {
     #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
     #         "max_input_prompt_length": 1024,
     #         "max_output_prompt_length": 2048,
-    #         "replicas": -1,
+    #         # "replicas": 2,
+    #         "gpu":["ergos-06-nv:gpu0", "ergos-02-nv:gpu0"]
     #     },
     # },
+    {
+        "model_id": "qwen-all-gpus",
+        "description": "replicas=-1 (all eligible GPUs)",
+        "config": {
+            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+            "max_input_prompt_length": 1024,
+            "max_output_prompt_length": 2048,
+            "replicas": -1,
+        },
+    },
 ]
 
 prompt = "Write a short poem about beer"

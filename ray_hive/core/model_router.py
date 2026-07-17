@@ -5,6 +5,7 @@ Exposes /v1/models, /v1/chat/completions, /v1/completions on the router
 deployment. Programmatic inference goes through infer() → replica handle.
 """
 import asyncio
+import time
 import uuid
 from typing import Literal, Union
 
@@ -16,6 +17,9 @@ from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 app = FastAPI()
+
+_WARMUP_PROMPTS = 32
+_WARMUP_MAX_TOKENS = 32
 
 
 class TextContentPart(BaseModel):
@@ -79,6 +83,23 @@ class ModelRouter:
         self._handles = None
         self._queue_depth = {name: 0 for name in gpu_deployment_names}
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self._warmup()
+
+
+    def _warmup(self):
+        """Time a fixed batch on each replica and store tokens/sec as throughput."""
+        handles = self._get_handles()
+        prompts = [f"warmup {i}" for i in range(_WARMUP_PROMPTS)]
+        params = SamplingParams(max_tokens=_WARMUP_MAX_TOKENS, temperature=0.0)
+        for name in self.gpu_deployment_names:
+            start = time.perf_counter()
+            outputs = handles[name].generate.remote(prompts, params).result()
+            elapsed = max(time.perf_counter() - start, 1e-6)
+            tokens = sum(
+                len(o.prompt_token_ids) + len(o.outputs[0].token_ids)
+                for o in outputs
+            )
+            self.replica_metadata[name]["throughput"] = tokens / elapsed
 
 
     def _get_handles(self):
@@ -127,13 +148,12 @@ class ModelRouter:
 
 
     def _select_replica(self) -> str:
-        """Pick replica with lowest queue_depth / max_num_seqs ratio."""
+        """Pick replica with lowest queue_depth / measured tokens/sec."""
         best_name = None
         best_score = float("inf")
         for name in self.gpu_deployment_names:
-            meta = self.replica_metadata[name]
-            max_seqs = max(meta.get("max_num_seqs", 1), 1)
-            score = self._queue_depth[name] / max_seqs
+            throughput = max(self.replica_metadata[name]["throughput"], 1e-6)
+            score = self._queue_depth[name] / throughput
             if score < best_score:
                 best_score = score
                 best_name = name
@@ -159,9 +179,9 @@ class ModelRouter:
 
 
     def _shard_prompts(self, prompts: list[str]) -> list[tuple[str, list[str], list[int]]]:
-        """Split prompts across replicas in proportion to each replica's max_num_seqs."""
+        """Split prompts across replicas in proportion to measured tokens/sec."""
         names = self.gpu_deployment_names
-        weights = [max(self.replica_metadata[n].get("max_num_seqs", 1), 1) for n in names]
+        weights = [max(self.replica_metadata[n]["throughput"], 1e-6) for n in names]
         total_w = sum(weights)
         n = len(prompts)
 
@@ -180,7 +200,7 @@ class ModelRouter:
 
 
     async def _dispatch_prompts(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
-        """Shard a prompt batch by max_num_seqs and run replicas concurrently."""
+        """Shard a prompt batch by measured tokens/sec and run replicas concurrently."""
         handles = self._get_handles()
         if len(prompts) == 1:
             name = self._select_replica()
@@ -282,7 +302,7 @@ class ModelRouter:
 
 
     async def infer(self, request):
-        """Programmatic inference entrypoint — shards batches by replica max_num_seqs."""
+        """Programmatic inference entrypoint — shards batches by measured replica tokens/sec."""
         if isinstance(request, dict):
             prompt = request.get("prompts") or request.get("prompt")
             kwargs = {k: v for k, v in request.items() if k not in ("prompt", "prompts")}
