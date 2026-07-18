@@ -69,12 +69,17 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
-@serve.deployment(ray_actor_options={"num_cpus": 0.1}, autoscaling_config=None, num_replicas=1)
+@serve.deployment(
+    ray_actor_options={"num_cpus": 0.1},
+    autoscaling_config=None,
+    num_replicas=1,
+    max_ongoing_requests=100,
+)
 @serve.ingress(app)
 class ModelRouter:
     """Router with least-queue balancing and OpenAI-compatible HTTP ingress."""
 
-    def __init__(self, model_id: str, model_name: str, gpu_deployment_names: list[str], replica_metadata: dict):
+    async def __init__(self, model_id: str, model_name: str, gpu_deployment_names: list[str], replica_metadata: dict):
         """Wire replica handles, queue tracking, and tokenizer for token counting."""
         self.model_id = model_id
         self.model_name = model_name
@@ -83,17 +88,17 @@ class ModelRouter:
         self._handles = None
         self._queue_depth = {name: 0 for name in gpu_deployment_names}
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self._warmup()
+        await self._warmup()
 
 
-    def _warmup(self):
+    async def _warmup(self):
         """Time a fixed batch on each replica and store tokens/sec as throughput."""
         handles = self._get_handles()
         prompts = [f"warmup {i}" for i in range(_WARMUP_PROMPTS)]
         params = SamplingParams(max_tokens=_WARMUP_MAX_TOKENS, temperature=0.0)
         for name in self.gpu_deployment_names:
             start = time.perf_counter()
-            outputs = handles[name].generate.remote(prompts, params).result()
+            outputs = await handles[name].generate.remote(prompts, params)
             elapsed = max(time.perf_counter() - start, 1e-6)
             tokens = sum(
                 len(o.prompt_token_ids) + len(o.outputs[0].token_ids)
