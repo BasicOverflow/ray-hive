@@ -4,7 +4,7 @@ metadata:
   name: raycluster
   namespace: ray-system
 spec:
-  rayVersion: "2.53.0"
+  rayVersion: "2.56.0"
   enableInTreeAutoscaling: false
   headServiceAnnotations:
     metallb.universe.tf/loadBalancerIPs: "10.0.1.52"
@@ -17,7 +17,7 @@ spec:
       spec:
         containers:
         - name: ray-head
-          image: rayproject/ray:2.53.0-py312-cu125
+          image: rayproject/ray:2.56.0-py312-cu125
           imagePullPolicy: Always
           ports:
           - containerPort: 6379
@@ -60,7 +60,7 @@ spec:
                   - ergos-01
         containers:
         - name: ray-worker
-          image: rayproject/ray:2.53.0-py312-cu125
+          image: rayproject/ray:2.56.0-py312-cu125
           imagePullPolicy: Always
           resources:
             requests:
@@ -91,7 +91,7 @@ spec:
                   - ergos-03
         containers:
         - name: ray-worker
-          image: rayproject/ray:2.53.0-py312-cu125
+          image: rayproject/ray:2.56.0-py312-cu125
           imagePullPolicy: Always
           resources:
             requests:
@@ -122,7 +122,7 @@ spec:
                   - ergos-05
         containers:
         - name: ray-worker
-          image: rayproject/ray:2.53.0-py312-cu125
+          image: rayproject/ray:2.56.0-py312-cu125
           imagePullPolicy: Always
           resources:
             requests:
@@ -133,11 +133,7 @@ spec:
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
   
-  # GPU workers: Gitea OCI registry (ffmpeg + vllm baked in).
-  # Build/push (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
-  #   docker build -f manifests/Dockerfile.ray-vllm-worker -t 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0 .
-  #   docker push 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
-  # k3s nodes need /etc/rancher/k3s/registries.yaml for plain HTTP (see Homelab Gitea.md).
+  # GPU workers — image build: manifests/Dockerfile.ray-vllm-worker
   # ergos-02-nv: 12 CPUs, 3 GPUs
   - groupName: gpu-workers-ergos-02-nv
     replicas: 1
@@ -179,7 +175,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0
           imagePullPolicy: Always
           securityContext:
             privileged: true
@@ -213,8 +209,6 @@ spec:
             value: "opencv"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
-          - name: RAY_HEAD_ADDRESS
-            value: "raycluster-head-svc:8265"
           - name: PYTORCH_ALLOC_CONF
             value: "max_split_size_mb:128,expandable_segments:True"
           - name: CUDA_DEVICE_MAX_CONNECTIONS
@@ -224,8 +218,6 @@ spec:
           - name: NCCL_IB_DISABLE
             value: "1"
           - name: HF_HOME
-            value: "/home/ray/.cache/huggingface"
-          - name: TRANSFORMERS_CACHE
             value: "/home/ray/.cache/huggingface"
   
   # ergos-04-nv: 13 CPUs, 2 GPUs
@@ -269,7 +261,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0
           imagePullPolicy: Always
           securityContext:
             privileged: true
@@ -303,8 +295,6 @@ spec:
             value: "opencv"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
-          - name: RAY_HEAD_ADDRESS
-            value: "raycluster-head-svc:8265"
           - name: PYTORCH_ALLOC_CONF
             value: "max_split_size_mb:128,expandable_segments:True"
           - name: CUDA_DEVICE_MAX_CONNECTIONS
@@ -314,8 +304,6 @@ spec:
           - name: NCCL_IB_DISABLE
             value: "1"
           - name: HF_HOME
-            value: "/home/ray/.cache/huggingface"
-          - name: TRANSFORMERS_CACHE
             value: "/home/ray/.cache/huggingface"
   
   # ergos-06-nv: 5 CPUs, 1 GPU
@@ -359,7 +347,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0
           imagePullPolicy: Always
           securityContext:
             privileged: true
@@ -393,8 +381,6 @@ spec:
             value: "opencv"
           - name: RAY_DISABLE_IMPORT_WARNING
             value: "1"
-          - name: RAY_HEAD_ADDRESS
-            value: "raycluster-head-svc:8265"
           - name: PYTORCH_ALLOC_CONF
             value: "max_split_size_mb:128,expandable_segments:True"
           - name: CUDA_DEVICE_MAX_CONNECTIONS
@@ -404,6 +390,4 @@ spec:
           - name: NCCL_IB_DISABLE
             value: "1"
           - name: HF_HOME
-            value: "/home/ray/.cache/huggingface"
-          - name: TRANSFORMERS_CACHE
             value: "/home/ray/.cache/huggingface"

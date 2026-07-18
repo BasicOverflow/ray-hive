@@ -1,14 +1,22 @@
 # GPU Ray worker image: Ray + ffmpeg (torchcodec) + vLLM.
 # Official vLLM approach: apt packages live in the RUNTIME image.
 #
-# Build + push to Gitea (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
-#   docker build -f manifests/Dockerfile.ray-vllm-worker -t 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0 .
-#   docker push 10.0.0.52:3000/peter/ray-vllm-worker:2.53.0
+# Build → verify → push (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
+#
+#   IMG=10.0.0.52:3000/peter/ray-vllm-worker:2.56.0
+#
+#   docker build -f manifests/Dockerfile.ray-vllm-worker -t "$IMG" .
+#
+#   # AFTER build, BEFORE push (MSYS_NO_PATHCONV=1 required on Git Bash / Windows)
+#   MSYS_NO_PATHCONV=1 docker run --rm "$IMG" python /opt/ray-hive/smoke_test_worker_deps.py
+#   MSYS_NO_PATHCONV=1 docker run --rm "$IMG" pip check || true
+#
+#   docker push "$IMG"
 #
 # k3s nodes need plain-HTTP pull config — see manifests/k3s-registries-gitea.yaml
 # and Homelab infrastructure/Gitea.md.
 
-FROM rayproject/ray:2.53.0-py312-cu125
+FROM rayproject/ray:2.56.0-py312-cu125
 
 USER root
 RUN apt-get update -qq \
@@ -16,11 +24,22 @@ RUN apt-get update -qq \
         ffmpeg libsm6 libxext6 libgl1 libpulse0 \
     && rm -rf /var/lib/apt/lists/*
 
+COPY manifests/smoke_test_worker_deps.py /opt/ray-hive/smoke_test_worker_deps.py
+
 USER ray
-# vLLM pulls protobuf 7.x which breaks Ray Serve (_proto_to_dict uses field.label).
-RUN pip install --no-cache-dir "scipy" "vllm>=0.11.1" \
-    && pip install --no-cache-dir "protobuf==4.25.8"
+# PyPI's default vllm wheel links CUDA 13 (libcudart.so.13). Use the cu129 build.
+# numpy>=2.4 needs X86_V2 — pin <2.4 for Proxmox guest CPUs.
+# pyOpenSSL/cryptography mismatch breaks Qwen3.5 import via boto3 (GEN_EMAIL).
+# protobuf: vLLM wants >=5.29.6; Ray Serve breaks on 7.x — pin 5.29.6 after install.
+# Smoke test is the build gate. `pip check` always screams on Ray+vLLM — run it advisory only.
+ARG VLLM_VERSION=0.25.1
+RUN pip install --no-cache-dir --upgrade "uv" \
+    && uv pip install --system --no-cache --upgrade "scipy" \
+        "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
+        --torch-backend=cu129 \
+    && uv pip install --system --no-cache --upgrade "transformers" "numpy<2.4" "cryptography" "pyopenssl" \
+    && pip install --no-cache-dir --force-reinstall "protobuf==5.29.6" \
+    && python /opt/ray-hive/smoke_test_worker_deps.py
 
 ENV VLLM_VIDEO_LOADER_BACKEND=opencv
 ENV HF_HOME=/home/ray/.cache/huggingface
-ENV TRANSFORMERS_CACHE=/home/ray/.cache/huggingface

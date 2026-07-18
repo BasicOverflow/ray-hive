@@ -121,12 +121,6 @@ spec:
               fieldPath: metadata.name
         - name: OPERATOR_NAME
           value: kuberay-operator
-        - name: RAY_IMAGE
-          value: "rayproject/ray:2.53.0-py312-cu125"
-        - name: RAY_HEAD_IMAGE
-          value: "rayproject/ray:2.53.0-py312-cu125"
-        - name: RAY_WORKER_IMAGE
-          value: "rayproject/ray:2.53.0-py312-cu125"
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

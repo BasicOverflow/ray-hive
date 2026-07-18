@@ -25,7 +25,7 @@ spec:
         effect: NoSchedule
       containers:
       - name: vram-monitor
-        image: rayproject/ray:2.53.0-py312-cu125
+        image: rayproject/ray:2.56.0-py312-cu125
         command: ["/bin/bash", "-c"]
         args:
         - |

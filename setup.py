@@ -26,12 +26,12 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=[
-        "ray[serve]==2.53.0",
-        "vllm>=0.11.1",
+        "ray[serve]==2.56.0",
+        "vllm",
         "pydantic>=2.0.0",
         "torch>=2.0.0",
         "fastapi>=0.100.0",
-        "transformers>=4.40.0",
+        "transformers",
     ],
 )
 
