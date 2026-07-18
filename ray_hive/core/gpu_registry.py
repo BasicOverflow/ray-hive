@@ -75,7 +75,8 @@ class ClusterStateManager(ABC):
 
         live_free = self._live_free_vram_gb()
         for gpu_key, requested_gb in requested_by_gpu.items():
-            available_gb = live_free.get(gpu_key, 0.0) - self.used_vram_gb(gpu_key)
+            # available is free - pending; do not subtract used_vram again
+            available_gb = live_free.get(gpu_key, 0.0)
             if available_gb < requested_gb:
                 raise ValueError(
                     f"Not enough VRAM on {gpu_key} for deployment {deployment_id}: "
@@ -94,8 +95,9 @@ class ClusterStateManager(ABC):
         deployment = self.deployments.get(deployment_id)
 
         for replica_id in replica_gpu_vram_gb:
-            if deployment and replica_id in deployment["replicas"]:
-                raise ValueError(f"Replica {replica_id} already exists for deployment {deployment_id}")
+            assert not (deployment and replica_id in deployment["replicas"]), (
+                f"Replica {replica_id} already exists for deployment {deployment_id}"
+            )
 
         self._check_capacity(replica_gpu_vram_gb, deployment_id)
 
@@ -135,8 +137,9 @@ class VRAMAllocator(ClusterStateManager):
     def _gpu_key(self, node_id: str, gpu_id: int) -> str:
         """Return canonical GPU key: k8s_hostname:gpuN (never Ray hex node ids)."""
         # Legacy monitors briefly used Ray's hex node id — reject so they can't reappear.
-        if len(node_id) >= 32 and all(c in "0123456789abcdef" for c in node_id.lower()):
-            raise ValueError(f"node_id must be k8s hostname from NODE_NAME, got Ray node id {node_id!r}")
+        assert not (len(node_id) >= 32 and all(c in "0123456789abcdef" for c in node_id.lower())), (
+            f"node_id must be k8s hostname from NODE_NAME, got Ray node id {node_id!r}"
+        )
         return f"{node_id}:gpu{gpu_id}"
 
 

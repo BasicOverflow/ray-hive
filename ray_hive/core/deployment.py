@@ -67,7 +67,7 @@ def _resolve_replicas(gpu_map: dict, available: list[dict], replicas: int, gpu, 
             return [_resolve_pinned_gpu(gpu_map, gpu, min_vram_gb)]
         if isinstance(gpu, list):
             return [_resolve_pinned_gpu(gpu_map, g, min_vram_gb) for g in gpu]
-        raise ValueError("gpu must be a string, list of strings, or None")
+        assert False, "gpu must be a string, list of strings, or None"
 
     if replicas == -1:
         return available
@@ -76,9 +76,17 @@ def _resolve_replicas(gpu_map: dict, available: list[dict], replicas: int, gpu, 
 
 @ray.remote(num_gpus=0.01)
 def fetch_hf_config_dict(model_name: str) -> dict:
-    """Load HF config on a GPU worker where transformers/vllm are installed."""
-    from transformers import AutoConfig
-    return AutoConfig.from_pretrained(model_name, trust_remote_code=True).to_dict()
+    """Load HF config.json on a GPU worker (no AutoConfig — works for new model_types)."""
+    import json
+    from pathlib import Path
+
+    local = Path(model_name) / "config.json"
+    if local.is_file():
+        return json.loads(local.read_text())
+
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(repo_id=model_name, filename="config.json")
+    return json.loads(Path(path).read_text())
 
 
 @ray.remote
@@ -181,7 +189,11 @@ class DeployService:
 
         registry = get_gpu_registry()
         hf_params = ray.get(fetch_hf_config_dict.remote(config["name"]))
-        vram_reqs = build_vram_reqs(hf_params, **model_vllm_kwargs)
+        vram_reqs = build_vram_reqs(
+            hf_params,
+            attention_cls=config.get("attention_cls"),
+            **model_vllm_kwargs,
+        )
 
         gpu_map = ray.get(registry.get_all_gpus.remote())
         min_vram_gb = vram_reqs.calc_weights_gb()
@@ -202,8 +214,9 @@ class DeployService:
 
         for gpu_info in target_gpus:
             gpu_key = gpu_info["gpu_key"]
-            used_vram = ray.get(registry.used_vram_gb.remote(gpu_key))
-            vram_budget_gb = (gpu_info["available_gb"] - used_vram) * 0.95
+            # available_gb is already free - pending. Loaded models show up in nvidia-smi
+            # free, so do not also subtract deployment used_vram (that double-counts).
+            vram_budget_gb = gpu_info["available_gb"] * 0.95
             plan = plan_deployment(
                 vram_reqs,
                 vram_budget_gb=vram_budget_gb,

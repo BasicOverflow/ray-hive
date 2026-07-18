@@ -7,7 +7,7 @@ covers standard transformer attention; subclasses override KV heads, KV layers,
 sequence length, or tensor-parallel per-GPU sizing. Downstream VRAM calculators
 use them after weights, overhead, and other non-KV memory are accounted for.
 
-NOTE: Standard KV formula will always be upper bound compared to more efficient attentions, 
+NOTE: Standard KV formula will always be upper bound compared to more efficient attentions,
 so if custom KV calculation not provided for given model, it will default to standard KV formula.
 """
 from abc import ABC
@@ -104,54 +104,24 @@ class BaseAttentionSpecs(ABC):
 
     def kv_bytes_per_token(self) -> float:
         """Return KV cache bytes needed per token."""
-        return 2 * self.kv_bytes_per_element * self.kv_layers * self.kv_heads * self.head_dim
+        bpt = 2 * self.kv_bytes_per_element * self.kv_layers * self.kv_heads * self.head_dim
+        assert bpt > 0, "kv_bytes_per_token must be positive"
+        return bpt
 
 
     def kv_bytes_per_sequence(self, max_model_len: int) -> float:
         """Return KV cache bytes needed for one sequence."""
+        assert max_model_len > 0, f"max_model_len must be positive, got {max_model_len}"
         return self.kv_bytes_per_token() * max_model_len
 
 
     def calc_max_num_seqs_given_kv_cache(self, max_model_len: int, kv_cache_gib: float) -> int:
         """Find optimal max concurrent sequences given how much kv cache alloted to this deployment & max input+output prompt lengths."""
+        assert kv_cache_gib > 0, f"kv_cache_gib must be positive, got {kv_cache_gib}"
         kv_budget_bytes = kv_cache_gib * (1024 ** 3)
         bytes_per_seq = self.kv_bytes_per_sequence(max_model_len)
+        assert bytes_per_seq > 0, "bytes_per_seq must be positive"
         return max(1, math.floor(kv_budget_bytes / bytes_per_seq))
-
-
-
-
-
-
-# Example inheritance to calculate non-traditional attention.
-class MQAAttentionSpecs(BaseAttentionSpecs):
-    """KV cache calculator for multi-query attention models."""
-
-    @property
-    def kv_heads(self) -> int:
-        """Return 1 — MQA uses a single shared KV head."""
-        # MQA uses a single KV head shared across all query heads.
-        return 1
-
-    # NOTE: calc_max_num_seqs_given_kv_cache method stays the same, only difference is how kv_heads is calculated.
-    # In Reality, Most MQA models expose:
-    # {
-    #   "num_attention_heads": 32,
-    #   "num_key_value_heads": 1
-    # }
-    # In the hf config anyway, so the BaseAttentionSpecs class will already work for MQA models out of the box. However, this is just to demonstrate how to override a property from the base class.
-
-
-# More custom attention inheritance examples:
-
-
-class Qwen35AttentionSpecs(BaseAttentionSpecs):
-    """KV cache calculator for Qwen3.x hybrid attention models."""
-
-    @property
-    def kv_layers(self) -> int:
-        """Return Qwen hybrid layers that contribute KV cache."""
-        return self.hf_params["num_attention_layers"]
 
 
 # If later want per-GPU KV calculations for tensor parallel models
@@ -161,12 +131,10 @@ class TensorParallelAttentionSpecs(BaseAttentionSpecs):
     def __init__(self, tp_size: int, **kwargs):
         """Store tensor parallel size and attention config."""
         super().__init__(**kwargs)
+        assert tp_size > 0, f"tp_size must be positive, got {tp_size}"
         self.tp_size = tp_size
 
 
     def kv_bytes_per_token(self) -> float:
         """Return per-GPU KV cache bytes needed per token."""
         return super().kv_bytes_per_token() / self.tp_size
-
-
-

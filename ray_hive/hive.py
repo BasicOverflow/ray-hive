@@ -4,10 +4,11 @@ RayHive client — high-level API for deploying models and querying VRAM state.
 Wraps DeployService (serialized deploy/shutdown) and gpu_registry (VRAM tracking).
 """
 import ray
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Type, Union
 
 from .core.deployment import get_deploy_service
 from .core.gpu_registry import get_gpu_registry
+from .core.model_specs.attention import BaseAttentionSpecs
 from .ray_utils import init_ray, suppress_ray_warnings
 from .shutdown import shutdown_all, shutdown_model
 
@@ -38,6 +39,7 @@ class RayHive:
         max_num_seqs: Optional[int] = None,
         max_num_batched_tokens: Optional[int] = None,
         swap_space_per_instance: int = 3,
+        attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         **vllm_kwargs
     ) -> None:
         """
@@ -46,6 +48,7 @@ class RayHive:
         max_input_prompt_length and max_output_prompt_length are required.
         max_num_seqs and max_num_batched_tokens are estimated from VRAM unless overridden.
         replicas=-1 deploys to all eligible GPUs.
+        attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
         """
         config = {
             "name": model_name,
@@ -54,6 +57,7 @@ class RayHive:
             "max_input_prompt_length": max_input_prompt_length,
             "max_output_prompt_length": max_output_prompt_length,
             "swap_space_per_instance": swap_space_per_instance,
+            "attention_cls": attention_cls,
         }
         if max_num_seqs is not None:
             config["max_num_seqs"] = max_num_seqs

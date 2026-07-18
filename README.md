@@ -56,6 +56,7 @@ After placement, requests go to the replica with the lowest queue depth relative
 ```python
 from ray_hive import RayHive
 from ray_hive.inference import inference, inference_batch
+# from ray_hive.core.model_specs import BaseAttentionSpecs  # subclass for custom KV sizing
 
 hive = RayHive()
 hive.deploy_model(
@@ -64,6 +65,7 @@ hive.deploy_model(
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
     replicas=-1,
+    # attention_cls=MyAttentionSpecs,  # omit to default to BaseAttentionSpecs (standard attention)
 )
 
 answer = inference("Explain Ray in one sentence.", model_id="qwen")
@@ -79,6 +81,7 @@ Ray Hive-specific `deploy_model` arguments:
 - `gpu` — optional GPU key or list of keys (for example, `ergos-06-nv:gpu0`) for explicit placement.
 - `max_num_seqs` / `max_num_batched_tokens` — optional overrides for the planner's estimates.
 - `swap_space_per_instance` — CPU swap space in GiB available to each vLLM instance.
+- `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention.
 
 Any additional keyword arguments are forwarded to vLLM's `LLM(...)` constructor.
 

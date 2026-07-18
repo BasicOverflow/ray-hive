@@ -13,9 +13,9 @@ allocated from a pre-reserved memory pool.
 """
 
 from abc import ABC
-from typing import Any
+from typing import Any, Optional, Type
 
-from .attention import BaseAttentionSpecs, Qwen35AttentionSpecs
+from .attention import BaseAttentionSpecs
 
 
 class BaseVramReqs(ABC):
@@ -23,9 +23,13 @@ class BaseVramReqs(ABC):
     Base calculator for model VRAM requirements.
     """
 
-    attention_cls: type[BaseAttentionSpecs] = BaseAttentionSpecs
-
-    def __init__(self, speculative_decoding_enabled: bool = False, kv_cache_dtype_bytes: float | None = None, **hf_params: Any):
+    def __init__(
+        self,
+        speculative_decoding_enabled: bool = False,
+        kv_cache_dtype_bytes: float | None = None,
+        attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
+        **hf_params: Any,
+    ):
         """Store HF config and build the attention specs calculator."""
         self.hf_params = hf_params
         self.speculative_decoding_enabled = speculative_decoding_enabled
@@ -33,7 +37,9 @@ class BaseVramReqs(ABC):
         if kv_cache_dtype_bytes is None:
             kv_cache_dtype_bytes = 1
 
-        self.attention = self.attention_cls(
+        # Default to standard transformer attention when no custom class is provided.
+        cls = attention_cls or BaseAttentionSpecs
+        self.attention = cls(
             kv_bytes_per_element=kv_cache_dtype_bytes,
             **hf_params
         )
@@ -209,13 +215,11 @@ class BaseVramReqs(ABC):
 
 class Qwen35_SmallVarient_VramReqs(BaseVramReqs):
     """
-    VRAM estimator for the Qwen3.5 Small (~0.6B) model.
+    VRAM estimator for the Qwen3.5 Small (~0.8B) model.
     """
 
-    attention_cls: type[BaseAttentionSpecs] = Qwen35AttentionSpecs
-
     # Published parameter count
-    PARAM_COUNT = 610_000_000
+    PARAM_COUNT = 800_000_000
 
     def calc_system_overhead_gb(self) -> float:
         """Return Qwen3.5 system overhead in GiB."""
