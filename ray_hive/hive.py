@@ -10,8 +10,7 @@ from .core.deployment import get_deploy_service
 from .core.gpu_alloc import BaseGpuAllocator
 from .core.gpu_registry import get_gpu_registry
 from .core.model_specs.attention import BaseAttentionSpecs
-from .ray_utils import init_ray, suppress_ray_warnings
-from .shutdown import shutdown_all, shutdown_model
+from .core.ray_utils import init_ray, shutdown_all, shutdown_model, suppress_ray_warnings
 
 
 class RayHive:

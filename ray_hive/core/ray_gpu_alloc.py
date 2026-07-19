@@ -3,7 +3,7 @@ Ray-wired GPU allocators — bind abstract policies to cluster registry specs.
 
 Hardware accessors and Alive-node gating live here; policy math stays in gpu_alloc.
 """
-from ray_hive import ray_utils
+from ray_hive.core import ray_utils
 from ray_hive.core.gpu_alloc import ConserveTdpAllocator, Fp8Allocator, PerformanceAllocator
 
 

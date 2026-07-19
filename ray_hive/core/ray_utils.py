@@ -9,7 +9,7 @@ import ray
 from dotenv import load_dotenv
 
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def load_env():
@@ -208,3 +208,27 @@ def is_node_alive(hostname: str) -> bool:
         if any(key.startswith(f"{hostname}_gpu") for key in resources):
             return True
     return False
+
+
+def shutdown_all():
+    """Shutdown all Serve apps and clear registry state."""
+    from .deployment import get_deploy_service
+    ray.get(get_deploy_service().shutdown_all.remote())
+
+
+def shutdown_model(model_id: str):
+    """Shutdown one model and clear its registry reservations."""
+    from .deployment import get_deploy_service
+    ray.get(get_deploy_service().shutdown_model.remote(model_id))
+
+
+def kill_gpu_registry():
+    """Kill detached singleton actors so they are recreated fresh on next init."""
+    try:
+        ray.kill(ray.get_actor("gpu_registry", namespace="system"))
+    except ValueError:
+        pass
+    try:
+        ray.kill(ray.get_actor("deploy_service", namespace="system"))
+    except ValueError:
+        pass

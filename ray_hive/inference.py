@@ -14,7 +14,7 @@ from typing import Optional, Type, List, Union
 from pydantic import BaseModel
 from os import getenv
 
-from .ray_utils import load_env
+from .core.ray_utils import load_env
 
 
 def _ensure_connected():
