@@ -34,8 +34,8 @@ def __getattr__(name):
         from .hive import RayHive
         return RayHive
     if name in ("shutdown_all", "shutdown_model", "kill_gpu_registry"):
-        from . import shutdown
-        return getattr(shutdown, name)
+        from .core import ray_utils
+        return getattr(ray_utils, name)
     if name in ("DeployService", "get_deploy_service", "VRAMAllocator", "get_gpu_registry", "RayLLMActor", "ModelRouter"):
         from . import core
         return getattr(core, name)
