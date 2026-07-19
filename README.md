@@ -4,6 +4,17 @@ Ray Hive is a small control layer for running a heterogeneous Ray cluster on k3s
 
 The cluster remains a normal Ray cluster: CPU workers can run general distributed tasks while GPU workers host model deployments through Ray Serve.
 
+## Contents
+
+- [Architecture](#architecture)
+- [Capabilities](#capabilities)
+- [Model Planning](#model-planning)
+- [GPU Monitoring and Placement](#gpu-monitoring-and-placement)
+- [GPU Allocation Policies](#gpu-allocation-policies)
+- [Basic Model Usage](#basic-model-usage)
+- [General Ray CPU Tasks](#general-ray-cpu-tasks)
+- [Repository](#repository)
+
 ## Architecture
 
 ```text
@@ -43,29 +54,50 @@ Each GPU is planned independently, allowing different cards and existing deploym
 
 A DaemonSet runs on every GPU node and reports live free/total VRAM and device information to a shared Ray actor. The registry combines those readings with pending and active model reservations so simultaneous deployments do not plan against the same memory.
 
-Placement supports three simple strategies:
+Placement supports:
 
-- Pin a replica to one GPU or an explicit list of GPUs.
-- Deploy to the first requested number of eligible GPUs.
-- Use `replicas=-1` to deploy on every eligible GPU.
+- Pin a replica to one GPU or an explicit list of GPUs (`gpu=` — skips allocation policies).
+- Use an allocation policy to pick the top `replicas` eligible GPUs (default: performance ranking).
+- Use `replicas=-1` to deploy on every eligible GPU under that policy.
 
 After placement, requests go to the replica with the lowest queue depth relative to that replica's planned concurrency.
+
+## GPU Allocation Policies
+
+When `gpu=` is not set, deploy picks GPUs through an `allocation_cls` (same idea as `attention_cls`). Pass a Ray-wired class such as `RayPerformanceAllocator` (the default). Abstract policy math lives in `ray_hive.core.gpu_alloc`; Ray hardware readers and Alive-node gating live in `ray_hive.core.ray_utils` / `ray_gpu_alloc`.
+
+If `gpu=` or `gpu=[...]` is set, allocation policies are skipped and those pins are used (VRAM checks only).
+
+Policies implemented so far:
+
+- **Performance** (`RayPerformanceAllocator`) — ranks eligible GPUs by SM count (with a light memory-bandwidth blend) and takes the top N.
+- **Conserve TDP** (`RayConserveTdpAllocator`) — prefers lower-approximate-power cards for long-uptime / efficiency-minded deploys.
+- **FP8** (`RayFp8Allocator`) — same ranking as performance; when the model/KV uses FP8, prefers Ada (compute capability ≥ 8.9) if any such GPUs are available.
+- **Tensor parallel** (`TensorParallelAllocator`) — stub only; future work to pick a symmetric GPU set for large sharded models.
+
+Ray-wired allocators also drop GPUs whose host is not an Alive Ray node.
 
 ## Basic Model Usage
 
 ```python
 from ray_hive import RayHive
 from ray_hive.inference import inference, inference_batch
+from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
 # from ray_hive.core.model_specs import BaseAttentionSpecs  # subclass for custom KV sizing
 
 hive = RayHive()
 hive.deploy_model(
     model_id="qwen",
-    model_name="Qwen/Qwen3-0.6B-GPTQ-Int8",
+    model_name="Qwen/Qwen3-0.6B-FP8",
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
     replicas=-1,
+    allocation_cls=RayPerformanceAllocator,  # default; can omit
     # attention_cls=MyAttentionSpecs,  # omit to default to BaseAttentionSpecs (standard attention)
+    # Qwen3-0.6B-FP8 suggested vLLM args (HF model card / Qwen deploy docs)
+    trust_remote_code=True,
+    reasoning_parser="qwen3",  # model card also lists deepseek_r1 + deprecated enable-reasoning
+    default_chat_template_kwargs={"enable_thinking": False},
 )
 
 answer = inference("Explain Ray in one sentence.", model_id="qwen")
@@ -78,10 +110,11 @@ Ray Hive-specific `deploy_model` arguments:
 - `model_name` — Hugging Face model ID or model path passed to vLLM.
 - `max_input_prompt_length` / `max_output_prompt_length` — expected limits used to plan context memory and concurrency.
 - `replicas` — number of GPUs to deploy on; `-1` uses every eligible GPU.
-- `gpu` — optional GPU key or list of keys (for example, `ergos-06-nv:gpu0`) for explicit placement.
+- `gpu` — optional GPU key or list of keys (for example, `ergos-06-nv:gpu0`) for explicit placement; overrides `allocation_cls`.
 - `max_num_seqs` / `max_num_batched_tokens` — optional overrides for the planner's estimates.
 - `swap_space_per_instance` — CPU swap space in GiB available to each vLLM instance.
 - `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention.
+- `allocation_cls` — optional GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set).
 
 Any additional keyword arguments are forwarded to vLLM's `LLM(...)` constructor.
 
@@ -137,4 +170,3 @@ results = ray.get([square.remote(value) for value in range(10)])
 - `basic_ray_tests/` — general cluster and resource checks
 
 Related: [rayify](https://github.com/BasicOverflow/rayify), a tool for converting scripts into Ray jobs.
-

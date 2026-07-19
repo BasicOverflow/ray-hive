@@ -43,7 +43,10 @@ chat = request_json(
         "model": MODEL_ID,
         "messages": [{"role": "user", "content": "Write a one-line joke about GPUs."}],
         "max_tokens": 64,
-        "temperature": 0.0,
+        # Qwen3 non-thinking sampling (model card / deploy docs)
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
     },
 )
 print("POST /v1/chat/completions:", chat["choices"][0]["message"]["content"])
@@ -55,7 +58,9 @@ completion = request_json(
         "model": MODEL_ID,
         "prompt": "Ray is a",
         "max_tokens": 32,
-        "temperature": 0.0,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
     },
 )
 print("POST /v1/completions:", completion["choices"][0]["text"])

@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 from ray_hive import RayHive
 from ray_hive.core.model_specs import BaseAttentionSpecs
+from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
 from ray_hive.inference import inference_batch
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -34,103 +35,99 @@ class MQAAttentionSpecs(BaseAttentionSpecs):
 # More custom attention inheritance examples:
 
 
-class Qwen35AttentionSpecs(BaseAttentionSpecs):
+class Qwen3AttentionSpecs(BaseAttentionSpecs):
     """
-    KV + linear-state calculator for Qwen3.5 hybrid attention.
+    KV cache calculator for Qwen3 (GQA + optional hybrid sliding-window layers).
 
-    Full-attention layers: classic seq-len KV cache.
-    Linear-attention (GatedDeltaNet) layers: fixed-size conv + recurrent state per sequence.
+    Qwen3 configs expose head_dim / num_key_value_heads directly. When
+    use_sliding_window is set, layers i >= max_window_layers use sliding_attention
+    (KV capped at sliding_window); earlier layers keep full seq-len KV.
     """
+
+    @property
+    def head_dim(self) -> int:
+        """Return Qwen3 head_dim from config (always set on Qwen3)."""
+        return self.hf_params["head_dim"]
+
+
+    @property
+    def kv_heads(self) -> int:
+        """Return GQA KV heads from num_key_value_heads."""
+        return self.hf_params["num_key_value_heads"]
+
+
+    @property
+    def num_layers(self) -> int:
+        """Return transformer depth from num_hidden_layers."""
+        return self.hf_params["num_hidden_layers"]
+
 
     def _layer_types(self) -> list[str]:
+        """Return per-layer attention type list matching Qwen3Config semantics."""
         types = self.hf_params.get("layer_types")
         if types is not None:
             return list(types)
- 
-        interval = self.hf_params.get("full_attention_interval")
-        if interval is not None:
-            return [
-                "linear_attention" if (i + 1) % interval else "full_attention"
-                for i in range(self.num_layers)
-            ]
 
-        if self.hf_params.get("num_attention_layers") is not None:
-            n_full = self.hf_params["num_attention_layers"]
-            return ["full_attention"] * n_full + ["linear_attention"] * (self.num_layers - n_full)
+        n = self.num_layers
+        if not self.hf_params.get("use_sliding_window"):
+            return ["full_attention"] * n
 
-        return ["full_attention"] * self.num_layers
-
-
-    @property
-    def kv_layers(self) -> int:
-        """Return count of full-attention layers that hold a seq-len KV cache."""
-        return sum(1 for t in self._layer_types() if t == "full_attention")
-
-
-    @property
-    def linear_layers(self) -> int:
-        """Return count of GatedDeltaNet / linear-attention layers."""
-        return sum(1 for t in self._layer_types() if t == "linear_attention")
-
-
-    def _linear_state_dtype_bytes(self) -> float:
-        """Return bytes per element for GatedDeltaNet state (usually fp32)."""
-        dtype_sizes = {
-            "float32": 4, "fp32": 4, "float": 4,
-            "bfloat16": 2, "bf16": 2,
-            "float16": 2, "fp16": 2, "half": 2,
-        }
-        name = str(self.hf_params.get("mamba_ssm_dtype", "float32")).lower().split(".")[-1]
-        return dtype_sizes.get(name, 4)
-
-
-    def linear_state_bytes_per_sequence(self) -> float:
-        """Return fixed GatedDeltaNet conv+recurrent state bytes for one sequence."""
-        value_heads = self.hf_params["linear_num_value_heads"]
-        key_dim = self.hf_params["linear_key_head_dim"]
-        value_dim = self.hf_params["linear_value_head_dim"]
-        conv_dim = self.hf_params["linear_conv_kernel_dim"]
-        b = self._linear_state_dtype_bytes()
-
-        # conv_state ≈ (d_inner, d_conv); recurrent ≈ (value_heads, value_dim, key_dim)
-        d_inner = value_heads * value_dim
-        conv = d_inner * conv_dim * b
-        recurrent = value_heads * value_dim * key_dim * b
-        return self.linear_layers * (conv + recurrent)
+        max_full = self.hf_params.get("max_window_layers", n)
+        # HF: sliding_attention when sliding_window is set and i >= max_window_layers
+        return [
+            "sliding_attention" if i >= max_full else "full_attention"
+            for i in range(n)
+        ]
 
 
     def kv_bytes_per_sequence(self, max_model_len: int) -> float:
-        """Return full-attn KV (scales with len) + linear state (fixed) for one sequence."""
-        return (
-            self.kv_bytes_per_token() * max_model_len
-            + self.linear_state_bytes_per_sequence()
+        """Return KV bytes for one sequence, accounting for sliding-window layers."""
+        assert max_model_len > 0, f"max_model_len must be positive, got {max_model_len}"
+        bytes_per_layer_token = (
+            2 * self.kv_bytes_per_element * self.kv_heads * self.head_dim
         )
+        window = self.hf_params.get("sliding_window")
+        total = 0.0
+        for layer_type in self._layer_types():
+            if layer_type == "sliding_attention" and window is not None:
+                seq_tokens = min(max_model_len, int(window))
+            else:
+                seq_tokens = max_model_len
+            total += bytes_per_layer_token * seq_tokens
+        assert total > 0, "kv_bytes_per_sequence must be positive"
+        return total
 
 
 scheduler = RayHive(suppress_logging=True)
-model_id = "qwen35-custom-attention"
+model_id = "qwen-custom-attention"
 
 scheduler.deploy_model(
     model_id=model_id,
-    model_name="vadery/Qwen3.5-0.8B-W8A8",
+    model_name="Qwen/Qwen3-0.6B-FP8",
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
     replicas=-1,
-    attention_cls=Qwen35AttentionSpecs,
+    attention_cls=Qwen3AttentionSpecs,
+    allocation_cls=RayPerformanceAllocator,
+    # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)
     trust_remote_code=True,
+    reasoning_parser="qwen3",
+    default_chat_template_kwargs={"enable_thinking": False},
 )
 
 prompt = "Write a short poem about beer"
 amount = 10_000
 prompts = [f"{prompt} {i}" for i in range(amount)]
+# Qwen3 non-thinking sampling (model card / deploy docs)
+sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)
 
 time.sleep(2)
-_ = inference_batch(prompts, model_id=model_id, max_tokens=100, temperature=0.0)
+_ = inference_batch(prompts[:10], model_id=model_id, **sample_kwargs)
 
 time.sleep(2)
 
 start = time.time()
-results = inference_batch(prompts, model_id=model_id, max_tokens=100, temperature=0.0)
+results = inference_batch(prompts, model_id=model_id, **sample_kwargs)
 elapsed = time.time() - start
 print(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
 

@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 from ray_hive import RayHive
+from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
 from ray_hive.inference import inference_batch
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -18,31 +19,45 @@ deployments = [
     #     "description": "Single GPU",
     #     "config": {
     #         # "gpu": "ergos-06-nv:gpu0", # pin to specific GPU
-    #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    #         "model_name": "Qwen/Qwen3-0.6B-FP8",
     #         "max_input_prompt_length": 1024,
     #         "max_output_prompt_length": 2048,
     #         "replicas": 1,
+    #         "allocation_cls": RayPerformanceAllocator,
+    #         "trust_remote_code": True,
+    #         "reasoning_parser": "qwen3",
+    #         "default_chat_template_kwargs": {"enable_thinking": False},
     #     },
     # },
     # {
     #     "model_id": "qwen-two-replicas",
     #     "description": "replicas=2",
     #     "config": {
-    #         "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+    #         "model_name": "Qwen/Qwen3-0.6B-FP8",
     #         "max_input_prompt_length": 1024,
     #         "max_output_prompt_length": 2048,
     #         # "replicas": 2,
-    #         "gpu":["ergos-06-nv:gpu0", "ergos-02-nv:gpu0"]
+    #         "gpu":["ergos-06-nv:gpu0", "ergos-02-nv:gpu0"],
+    #         "allocation_cls": RayPerformanceAllocator,
+    #         "trust_remote_code": True,
+    #         "reasoning_parser": "qwen3",
+    #         "default_chat_template_kwargs": {"enable_thinking": False},
     #     },
     # },
     {
         "model_id": "qwen-all-gpus",
         "description": "replicas=-1 (all eligible GPUs)",
         "config": {
-            "model_name": "Qwen/Qwen3-0.6B-GPTQ-Int8",
+            "model_name": "Qwen/Qwen3-0.6B-FP8",
             "max_input_prompt_length": 1024,
             "max_output_prompt_length": 2048,
             "replicas": -1,
+            # RayPerformanceAllocator is the default; shown explicitly here
+            "allocation_cls": RayPerformanceAllocator,
+            # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)
+            "trust_remote_code": True,
+            "reasoning_parser": "qwen3",
+            "default_chat_template_kwargs": {"enable_thinking": False},
         },
     },
 ]
@@ -50,6 +65,8 @@ deployments = [
 prompt = "Write a short poem about beer"
 amount = 1_000
 prompts = [f"{prompt} {i}" for i in range(amount)]
+# Qwen3 non-thinking sampling (model card / deploy docs)
+sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)
 
 for idx, deployment in enumerate(deployments):
     model_id = deployment["model_id"]
@@ -58,11 +75,11 @@ for idx, deployment in enumerate(deployments):
     scheduler.deploy_model(model_id=model_id, **deployment["config"])
     time.sleep(2)
 
-    _ = inference_batch(prompts, model_id=model_id, max_tokens=100, temperature=0.0)
+    _ = inference_batch(prompts[:10], model_id=model_id, **sample_kwargs)
     time.sleep(2)
 
     start = time.time()
-    results = inference_batch(prompts, model_id=model_id, max_tokens=100, temperature=0.0)
+    results = inference_batch(prompts, model_id=model_id, **sample_kwargs)
     elapsed = time.time() - start
     print(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
 
