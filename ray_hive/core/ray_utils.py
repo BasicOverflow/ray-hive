@@ -6,18 +6,10 @@ import sys
 import warnings
 
 import ray
-from dotenv import load_dotenv
 
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def load_env():
-    """Load .env from project root if present."""
-    load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
-
-
-load_env()
+# Repo / install parent of the `ray_hive` package — used as Ray Client working_dir.
+_WORKING_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class StderrFilter:
@@ -93,22 +85,17 @@ def suppress_ray_warnings(suppress: bool = True):
             sys.stderr = sys.stderr.original_stderr
 
 
-def init_ray(address: str = None, suppress_logging: bool = True, **kwargs):
+def init_ray(address: str, suppress_logging: bool = True, **kwargs):
     """
     Initialize Ray with optional warning suppression.
 
-    When connecting via ray://, packages the project root as runtime_env
-    so ray_hive is available on the cluster for serialization.
+    When connecting via ray://, packages the package parent as runtime_env
+    working_dir so ray_hive is available on the cluster for serialization.
     """
     suppress_ray_warnings(suppress_logging)
 
-    if address is None:
-        address = os.getenv("RAY_ADDRESS")
-        if not address:
-            raise RuntimeError("RAY_ADDRESS not set. Copy .env.example to .env and set your cluster address.")
-
     if address.startswith("ray://") and "runtime_env" not in kwargs:
-        kwargs["runtime_env"] = {"working_dir": _PROJECT_ROOT}
+        kwargs["runtime_env"] = {"working_dir": _WORKING_DIR}
 
     ray.init(
         address=address,

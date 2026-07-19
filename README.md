@@ -15,8 +15,6 @@ The cluster remains a normal Ray cluster: CPU workers can run general distribute
 - [General Ray CPU Tasks](#general-ray-cpu-tasks)
 - [Repository](#repository)
 
-
-
 ## Architecture
 
 ```text
@@ -40,8 +38,6 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 - **GPU sharing:** Multiple models can share a GPU when the registry and planner determine that enough VRAM remains.
 - **Flexible placement:** Models can target specific GPUs, a requested replica count, or every eligible GPU.
 - **General compute:** The same cluster continues to run normal distributed Ray tasks on its CPU workers (and GPU workers if not busy serving models).
-
-
 
 ## Model Planning
 
@@ -75,7 +71,7 @@ If `gpu=` or `gpu=[...]` is set, allocation policies are skipped and those pins 
 Policies implemented so far:
 
 - **Performance** (`RayPerformanceAllocator`) — rank eligible GPUs by compute proxy; select top-N for replicas.
-- **Conserve TDP** (`RayConserveTdpAllocator`) — rank eligible GPUs toward lower approximate TDP; SM as tie-break.
+- **Conserve TDP** (`RayConserveTdpAllocator`) — rank eligible GPUs toward lower approximate TDP; SM count as tie-break.
 - **FP8** (`RayFp8Allocator`) — same ranking as PerformanceAllocator; prefer Ada GPUs when FP8 is used.
 - **Tensor parallel** (`TensorParallelAllocator`) — placeholder for future symmetric TP set selection.
 
@@ -89,7 +85,7 @@ from ray_hive.inference import inference, inference_batch
 from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
 # from ray_hive.core.model_specs import BaseAttentionSpecs  # subclass for custom KV sizing
 
-hive = RayHive()
+hive = RayHive(address="ray://YOUR_RAY_HEAD_IP:10001")
 hive.deploy_model(
     model_id="qwen",
     model_name="Qwen/Qwen3-0.6B-FP8",
@@ -134,10 +130,10 @@ class Answer(BaseModel):
 result = inference("Summarize Ray.", model_id="qwen", structured_output=Answer)
 ```
 
-Each deployed model also exposes an OpenAI-compatible HTTP API on Ray Serve (`RAY_SERVE_URL`, default port `8000`):
+Each deployed model also exposes an OpenAI-compatible HTTP API on Ray Serve (default port `8000`):
 
 ```bash
-curl $RAY_SERVE_URL/qwen/v1/chat/completions \
+curl http://YOUR_RAY_HEAD_IP:8000/qwen/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Explain Ray briefly."}]}'
 ```
@@ -154,10 +150,9 @@ Image, audio, and embedding request/response routing still require their model-s
 ## General Ray CPU Tasks
 
 ```python
-import os
 import ray
 
-ray.init(address=os.environ["RAY_ADDRESS"])
+ray.init(address="ray://YOUR_RAY_HEAD_IP:10001")
 
 @ray.remote
 def square(value):
@@ -166,13 +161,11 @@ def square(value):
 results = ray.get([square.remote(value) for value in range(10)])
 ```
 
-
-
 ## Repository
 
 - `ray_hive/` — planner, registry, deployment service, router, and client API
 - `manifests/` — KubeRay cluster, worker image, and VRAM monitor definitions
-- `examples/` — model deployment and inference experiments
+- `examples/` — model deployment and inference experiments (use `.env` / `.env.example` for cluster URLs)
 - `basic_ray_tests/` — general cluster and resource checks
 
 Related: [rayify](https://github.com/BasicOverflow/rayify), a tool for converting scripts into Ray jobs.

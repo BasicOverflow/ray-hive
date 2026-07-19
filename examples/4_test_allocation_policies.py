@@ -1,4 +1,5 @@
 """Deploy once per implemented allocation policy and print which GPUs each picks."""
+import os
 import sys
 import time
 from pathlib import Path
@@ -38,7 +39,7 @@ policies = [
     },
 ]
 
-scheduler = RayHive(suppress_logging=True)
+scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 gpu_map = scheduler.get_vram_state()
 
 print("Cluster GPUs (allocation inputs):")

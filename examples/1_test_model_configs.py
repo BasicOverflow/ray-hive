@@ -1,4 +1,5 @@
 """Deploy/inference configs — single GPU, all GPUs, and 2 replicas."""
+import os
 import sys
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ from ray_hive.inference import inference_batch
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-scheduler = RayHive(suppress_logging=True)
+scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 
 deployments = [
     # {

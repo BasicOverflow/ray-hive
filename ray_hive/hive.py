@@ -16,15 +16,15 @@ from .core.ray_utils import init_ray, shutdown_all, shutdown_model, suppress_ray
 class RayHive:
     """Main client for distributed LLM serving."""
 
-    def __init__(self, suppress_logging: bool = True, **kwargs):
-        """Connect to Ray cluster and ensure singleton actors exist."""
+    def __init__(self, address: str, suppress_logging: bool = True, **kwargs):
+        """Connect to Ray cluster at address and ensure singleton actors exist."""
         print(
             "WARNING: vLLM has model-family usage guides — check them before deploy "
             "so you pass the right HF config / vllm kwargs (quantization, rope, etc.). "
             "Those guides also recommend env vars per GPU architecture for better performance."
         )
         suppress_ray_warnings(suppress_logging)
-        init_ray(suppress_logging=suppress_logging, **kwargs)
+        init_ray(address, suppress_logging=suppress_logging, **kwargs)
         get_gpu_registry()
 
 

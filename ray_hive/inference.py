@@ -12,19 +12,12 @@ import ray
 from ray import serve
 from typing import Optional, Type, List, Union
 from pydantic import BaseModel
-from os import getenv
-
-from .core.ray_utils import load_env
 
 
 def _ensure_connected():
-    """Ensure Ray is connected to cluster."""
+    """Require an existing Ray connection (e.g. via RayHive(address=...))."""
     if not ray.is_initialized():
-        load_env()
-        address = getenv("RAY_ADDRESS")
-        if not address:
-            raise RuntimeError("RAY_ADDRESS not set. Copy .env.example to .env and set your cluster address.")
-        ray.init(address=address, ignore_reinit_error=True, log_to_driver=False)
+        raise RuntimeError("Ray is not connected. Call RayHive(address=...) first.")
 
 
 def _get_handle(model_id: str):

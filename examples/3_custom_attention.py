@@ -1,4 +1,5 @@
 """Deploy a model with externally defined attention specs for VRAM planning."""
+import os
 import sys
 import time
 from pathlib import Path
@@ -98,7 +99,7 @@ class Qwen3AttentionSpecs(BaseAttentionSpecs):
         return total
 
 
-scheduler = RayHive(suppress_logging=True)
+scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 model_id = "qwen-custom-attention"
 
 scheduler.deploy_model(
