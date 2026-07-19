@@ -93,7 +93,7 @@ class BaseVramReqs(ABC):
         """
         Default runtime overhead (CUDA, driver, NCCL, vLLM runtime).
         """
-        return 0.5
+        return 0.25
 
     def calc_weights_gb(self) -> float:
         """
@@ -223,7 +223,7 @@ class Qwen35_SmallVarient_VramReqs(BaseVramReqs):
 
     def calc_system_overhead_gb(self) -> float:
         """Return Qwen3.5 system overhead in GiB."""
-        return 0.5
+        return 0.25
 
     def calc_weights_gb(self) -> float:
         """Return Qwen3.5 weight VRAM from published parameter count."""

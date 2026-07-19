@@ -70,7 +70,7 @@ def plan_deployment(
     max_num_seqs and max_num_batched_tokens are estimated by default.
     Either can be overridden independently; both can be set together.
 
-    vram_budget_gb is the caller's planning budget (typically available_gb * 0.95)
+    vram_budget_gb is the caller's planning budget (typically available_gb * 0.97)
     — max_num_seqs and KV cache sizing are computed against that budget, not raw free VRAM.
     """
     available_vram_gb = vram_budget_gb
