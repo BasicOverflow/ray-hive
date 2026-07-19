@@ -15,6 +15,8 @@ The cluster remains a normal Ray cluster: CPU workers can run general distribute
 - [General Ray CPU Tasks](#general-ray-cpu-tasks)
 - [Repository](#repository)
 
+
+
 ## Architecture
 
 ```text
@@ -38,6 +40,8 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 - **GPU sharing:** Multiple models can share a GPU when the registry and planner determine that enough VRAM remains.
 - **Flexible placement:** Models can target specific GPUs, a requested replica count, or every eligible GPU.
 - **General compute:** The same cluster continues to run normal distributed Ray tasks on its CPU workers (and GPU workers if not busy serving models).
+
+
 
 ## Model Planning
 
@@ -64,16 +68,16 @@ After placement, requests go to the replica with the lowest queue depth relative
 
 ## GPU Allocation Policies
 
-When `gpu=` is not set, deploy picks GPUs through an `allocation_cls` (same idea as `attention_cls`). Pass a Ray-wired class such as `RayPerformanceAllocator` (the default). Abstract policy math lives in `ray_hive.core.gpu_alloc`; Ray hardware readers and Alive-node gating live in `ray_hive.core.ray_utils` / `ray_gpu_alloc`.
+When `gpu=` is not set, deploy picks GPUs through an `allocation_cls`. Abstract policy math lives in `ray_hive.core.gpu_alloc`; `ray_hive.core.ray_utils` / `ray_gpu_alloc`.
 
 If `gpu=` or `gpu=[...]` is set, allocation policies are skipped and those pins are used (VRAM checks only).
 
 Policies implemented so far:
 
-- **Performance** (`RayPerformanceAllocator`) — ranks eligible GPUs by SM count (with a light memory-bandwidth blend) and takes the top N.
-- **Conserve TDP** (`RayConserveTdpAllocator`) — prefers lower-approximate-power cards for long-uptime / efficiency-minded deploys.
-- **FP8** (`RayFp8Allocator`) — same ranking as performance; when the model/KV uses FP8, prefers Ada (compute capability ≥ 8.9) if any such GPUs are available.
-- **Tensor parallel** (`TensorParallelAllocator`) — stub only; future work to pick a symmetric GPU set for large sharded models.
+- **Performance** (`RayPerformanceAllocator`) — rank eligible GPUs by compute proxy; select top-N for replicas.
+- **Conserve TDP** (`RayConserveTdpAllocator`) — rank eligible GPUs toward lower approximate TDP; SM as tie-break.
+- **FP8** (`RayFp8Allocator`) — same ranking as PerformanceAllocator; prefer Ada GPUs when FP8 is used.
+- **Tensor parallel** (`TensorParallelAllocator`) — placeholder for future symmetric TP set selection.
 
 Ray-wired allocators also drop GPUs whose host is not an Alive Ray node.
 
@@ -161,6 +165,8 @@ def square(value):
 
 results = ray.get([square.remote(value) for value in range(10)])
 ```
+
+
 
 ## Repository
 
