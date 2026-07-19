@@ -7,6 +7,7 @@ import ray
 from typing import Dict, List, Optional, Type, Union
 
 from .core.deployment import get_deploy_service
+from .core.gpu_alloc import BaseGpuAllocator
 from .core.gpu_registry import get_gpu_registry
 from .core.model_specs.attention import BaseAttentionSpecs
 from .ray_utils import init_ray, suppress_ray_warnings
@@ -40,6 +41,7 @@ class RayHive:
         max_num_batched_tokens: Optional[int] = None,
         swap_space_per_instance: int = 3,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
+        allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         **vllm_kwargs
     ) -> None:
         """
@@ -49,6 +51,7 @@ class RayHive:
         max_num_seqs and max_num_batched_tokens are estimated from VRAM unless overridden.
         replicas=-1 deploys to all eligible GPUs.
         attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
+        allocation_cls defaults to RayPerformanceAllocator; ignored when gpu= is set.
         """
         config = {
             "name": model_name,
@@ -58,6 +61,7 @@ class RayHive:
             "max_output_prompt_length": max_output_prompt_length,
             "swap_space_per_instance": swap_space_per_instance,
             "attention_cls": attention_cls,
+            "allocation_cls": allocation_cls,
         }
         if max_num_seqs is not None:
             config["max_num_seqs"] = max_num_seqs
@@ -65,7 +69,10 @@ class RayHive:
             config["max_num_batched_tokens"] = max_num_batched_tokens
 
         deploy_svc = get_deploy_service()
-        results = ray.get(deploy_svc.deploy_models.remote({model_id: config}, {model_id: vllm_kwargs}))
+        results = ray.get(deploy_svc.deploy_models.remote(
+            model_configs={model_id: config},
+            vllm_kwargs={model_id: vllm_kwargs},
+        ))
 
         if model_id in results and results[model_id]:
             print(f"\n{'='*80}")

@@ -79,12 +79,20 @@ class CompletionRequest(BaseModel):
 class ModelRouter:
     """Router with least-queue balancing and OpenAI-compatible HTTP ingress."""
 
-    async def __init__(self, model_id: str, model_name: str, gpu_deployment_names: list[str], replica_metadata: dict):
+    async def __init__(
+        self,
+        model_id: str,
+        model_name: str,
+        gpu_deployment_names: list[str],
+        replica_metadata: dict,
+        chat_template_kwargs: dict | None = None,
+    ):
         """Wire replica handles, queue tracking, and tokenizer for token counting."""
         self.model_id = model_id
         self.model_name = model_name
         self.gpu_deployment_names = gpu_deployment_names
         self.replica_metadata = replica_metadata
+        self.chat_template_kwargs = chat_template_kwargs or {}
         self._handles = None
         self._queue_depth = {name: 0 for name in gpu_deployment_names}
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -139,6 +147,7 @@ class ModelRouter:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **self.chat_template_kwargs,
         )
         replica_name = self._select_replica()
         self._queue_depth[replica_name] += 1

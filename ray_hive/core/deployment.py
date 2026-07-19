@@ -11,6 +11,7 @@ from ray import serve
 
 from .gpu_registry import get_gpu_registry
 from .model_specs.planner import build_vram_reqs, plan_deployment
+from .ray_gpu_alloc import RayPerformanceAllocator
 
 
 def _gpu_resource_name(gpu_key: str) -> str:
@@ -37,16 +38,6 @@ def _gpu_info_entry(gpu_key: str, gpu_info: dict) -> dict:
     }
 
 
-def _eligible_gpus(gpu_map: dict, min_vram_gb: float) -> list[dict]:
-    """Filter GPUs with enough available VRAM for model weights."""
-    eligible = []
-    for gpu_key, gpu_info in gpu_map.items():
-        if gpu_info["available"] < min_vram_gb:
-            continue
-        eligible.append(_gpu_info_entry(gpu_key, gpu_info))
-    return eligible
-
-
 def _resolve_pinned_gpu(gpu_map: dict, gpu_key: str, min_vram_gb: float) -> dict:
     """Resolve an explicit GPU pin from the full registry (not the filtered eligible list)."""
     if gpu_key not in gpu_map:
@@ -60,8 +51,16 @@ def _resolve_pinned_gpu(gpu_map: dict, gpu_key: str, min_vram_gb: float) -> dict
     return _gpu_info_entry(gpu_key, gpu_info)
 
 
-def _resolve_replicas(gpu_map: dict, available: list[dict], replicas: int, gpu, min_vram_gb: float) -> list[dict]:
-    """Pick target GPUs from available pool based on replicas count or explicit gpu pin."""
+def _resolve_target_gpus(
+    gpu_map: dict,
+    replicas: int,
+    gpu,
+    min_vram_gb: float,
+    hf_params: dict,
+    vllm_kwargs: dict,
+    allocation_cls,
+) -> list[dict]:
+    """Pick target GPUs: explicit gpu= pins win; else run allocation_cls.select."""
     if gpu is not None:
         if isinstance(gpu, str):
             return [_resolve_pinned_gpu(gpu_map, gpu, min_vram_gb)]
@@ -69,9 +68,9 @@ def _resolve_replicas(gpu_map: dict, available: list[dict], replicas: int, gpu, 
             return [_resolve_pinned_gpu(gpu_map, g, min_vram_gb) for g in gpu]
         assert False, "gpu must be a string, list of strings, or None"
 
-    if replicas == -1:
-        return available
-    return available[:replicas]
+    allocator_cls = allocation_cls or RayPerformanceAllocator
+    chosen = allocator_cls().select(gpu_map, replicas, min_vram_gb, hf_params, vllm_kwargs)
+    return [_gpu_info_entry(gpu_key, gpu_info) for gpu_key, gpu_info in chosen]
 
 
 @ray.remote(num_gpus=0.01)
@@ -123,6 +122,7 @@ def deploy_router(
     gpu_deployment_names: list[str],
     replica_metadata: dict,
     resource_name: str,
+    chat_template_kwargs: dict | None = None,
 ):
     """Bind/run ModelRouter on a GPU worker (needs transformers/vllm)."""
     from ray_hive.core.model_router import ModelRouter
@@ -137,6 +137,7 @@ def deploy_router(
         model_name=model_name,
         gpu_deployment_names=gpu_deployment_names,
         replica_metadata=replica_metadata,
+        chat_template_kwargs=chat_template_kwargs or {},
     )
     serve.run(router, name=model_id, route_prefix=f"/{model_id}")
     return True
@@ -187,6 +188,10 @@ class DeployService:
         if "max_input_prompt_length" not in config or "max_output_prompt_length" not in config:
             raise ValueError("max_input_prompt_length and max_output_prompt_length are required")
 
+        # Serve-frontend only — not valid on LLM()/EngineArgs; applied by ModelRouter.
+        model_vllm_kwargs = dict(model_vllm_kwargs)
+        chat_template_kwargs = model_vllm_kwargs.pop("default_chat_template_kwargs", None) or {}
+
         registry = get_gpu_registry()
         hf_params = ray.get(fetch_hf_config_dict.remote(config["name"]))
         vram_reqs = build_vram_reqs(
@@ -197,9 +202,14 @@ class DeployService:
 
         gpu_map = ray.get(registry.get_all_gpus.remote())
         min_vram_gb = vram_reqs.calc_weights_gb()
-        available_gpus = _eligible_gpus(gpu_map, min_vram_gb)
-        target_gpus = _resolve_replicas(
-            gpu_map, available_gpus, config.get("replicas", -1), config.get("gpu"), min_vram_gb
+        target_gpus = _resolve_target_gpus(
+            gpu_map,
+            config.get("replicas", -1),
+            config.get("gpu"),
+            min_vram_gb,
+            hf_params,
+            model_vllm_kwargs,
+            config.get("allocation_cls"),
         )
 
         max_model_len = config["max_input_prompt_length"] + config["max_output_prompt_length"]
@@ -216,7 +226,7 @@ class DeployService:
             gpu_key = gpu_info["gpu_key"]
             # available_gb is already free - pending. Loaded models show up in nvidia-smi
             # free, so do not also subtract deployment used_vram (that double-counts).
-            vram_budget_gb = gpu_info["available_gb"] * 0.95
+            vram_budget_gb = gpu_info["available_gb"] * 0.97
             plan = plan_deployment(
                 vram_reqs,
                 vram_budget_gb=vram_budget_gb,
@@ -289,6 +299,7 @@ class DeployService:
             gpu_deployment_names,
             replica_metadata,
             router_resource,
+            chat_template_kwargs,
         ))
 
         return {
