@@ -86,6 +86,7 @@ class ModelRouter:
         gpu_deployment_names: list[str],
         replica_metadata: dict,
         chat_template_kwargs: dict | None = None,
+        idle_timeout: int = -1,
     ):
         """Wire replica handles, queue tracking, and tokenizer for token counting."""
         self.model_id = model_id
@@ -93,10 +94,35 @@ class ModelRouter:
         self.gpu_deployment_names = gpu_deployment_names
         self.replica_metadata = replica_metadata
         self.chat_template_kwargs = chat_template_kwargs or {}
+        self.idle_timeout = idle_timeout
         self._handles = None
         self._queue_depth = {name: 0 for name in gpu_deployment_names}
+        self._shutting_down = False
+        self._last_activity = time.time()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         await self._warmup()
+        self._last_activity = time.time()
+        if self.idle_timeout > 0:
+            asyncio.create_task(self._idle_watch())
+
+
+    def _touch(self):
+        """Record inference activity for idle shutdown."""
+        self._last_activity = time.time()
+
+
+    async def _idle_watch(self):
+        """Shutdown model after idle_timeout seconds with no inference."""
+        from ray_hive.core.deployment import get_deploy_service
+
+        interval = min(5, self.idle_timeout)
+        while not self._shutting_down:
+            await asyncio.sleep(interval)
+            if time.time() - self._last_activity < self.idle_timeout:
+                continue
+            self._shutting_down = True
+            get_deploy_service().shutdown_model.remote(self.model_id)
+            return
 
 
     async def _warmup(self):
@@ -293,6 +319,7 @@ class ModelRouter:
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: ChatCompletionRequest):
         """OpenAI-compatible chat completions endpoint (text-only)."""
+        self._touch()
         if request.stream:
             raise HTTPException(status_code=400, detail="stream=true not supported yet")
         messages = self._to_chat_messages(request.messages)
@@ -306,6 +333,7 @@ class ModelRouter:
     @app.post("/v1/completions")
     async def completions(self, request: CompletionRequest):
         """OpenAI-compatible text completions endpoint."""
+        self._touch()
         if request.stream:
             raise HTTPException(status_code=400, detail="stream=true not supported yet")
         prompt = request.prompt if isinstance(request.prompt, str) else "\n".join(request.prompt)
@@ -317,6 +345,7 @@ class ModelRouter:
 
     async def infer(self, request):
         """Programmatic inference entrypoint — shards batches by measured replica tokens/sec."""
+        self._touch()
         if isinstance(request, dict):
             prompt = request.get("prompts") or request.get("prompt")
             kwargs = {k: v for k, v in request.items() if k not in ("prompt", "prompts")}

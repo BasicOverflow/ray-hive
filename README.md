@@ -115,6 +115,7 @@ Ray Hive-specific `deploy_model` arguments:
 - `swap_space_per_instance` — CPU swap space in GiB available to each vLLM instance.
 - `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention.
 - `allocation_cls` — optional GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set).
+- `idle_timeout` — seconds of inference inactivity before the model self-shutdowns; `-1` (default) means never, must be `-1` or a positive integer. Survives client script exit; uses the same cleanup as `hive.shutdown(model_id)`.
 
 Any additional keyword arguments are forwarded to vLLM's `LLM(...)` constructor.
 

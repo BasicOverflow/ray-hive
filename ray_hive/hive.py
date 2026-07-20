@@ -41,6 +41,7 @@ class RayHive:
         swap_space_per_instance: int = 3,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
+        idle_timeout: int = -1,
         **vllm_kwargs
     ) -> None:
         """
@@ -52,6 +53,9 @@ class RayHive:
         attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
         allocation_cls defaults to RayPerformanceAllocator; ignored when gpu= is set.
         """
+        if idle_timeout != -1 and idle_timeout <= 0:
+            raise ValueError("idle_timeout must be -1 (never) or a positive number of seconds")
+
         config = {
             "name": model_name,
             "replicas": replicas,
@@ -61,6 +65,7 @@ class RayHive:
             "swap_space_per_instance": swap_space_per_instance,
             "attention_cls": attention_cls,
             "allocation_cls": allocation_cls,
+            "idle_timeout": idle_timeout,
         }
         if max_num_seqs is not None:
             config["max_num_seqs"] = max_num_seqs

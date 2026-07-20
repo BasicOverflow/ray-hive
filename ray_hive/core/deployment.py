@@ -123,6 +123,7 @@ def deploy_router(
     replica_metadata: dict,
     resource_name: str,
     chat_template_kwargs: dict | None = None,
+    idle_timeout: int = -1,
 ):
     """Bind/run ModelRouter on a GPU worker (needs transformers/vllm)."""
     from ray_hive.core.model_router import ModelRouter
@@ -138,9 +139,19 @@ def deploy_router(
         gpu_deployment_names=gpu_deployment_names,
         replica_metadata=replica_metadata,
         chat_template_kwargs=chat_template_kwargs or {},
+        idle_timeout=idle_timeout,
     )
     serve.run(router, name=model_id, route_prefix=f"/{model_id}")
     return True
+
+
+def _assert_model_id_free(model_id: str, registry) -> None:
+    """Reject model_id if already present in Serve or the GPU registry."""
+    apps = serve.status().applications or {}
+    if model_id in apps:
+        raise ValueError(f"model_id {model_id!r} already has a Serve application")
+    if ray.get(registry.has_deployment.remote(model_id)):
+        raise ValueError(f"model_id {model_id!r} already registered in gpu registry")
 
 
 @ray.remote(num_cpus=0)
@@ -155,19 +166,28 @@ class DeployService:
         )
         vllm_kwargs = vllm_kwargs or {}
         results = {}
+        seen = set()
         for model_id, config in model_configs.items():
+            if model_id in seen:
+                raise ValueError(f"duplicate model_id {model_id!r} in deploy_models batch")
+            seen.add(model_id)
             results[model_id] = self._deploy_model(model_id, config, vllm_kwargs.get(model_id, {}))
         return results
 
 
     def shutdown_model(self, model_id: str) -> dict:
-        """Delete all Serve apps and registry state for a model."""
-        apps = serve.status().applications
-        for app_name in list(apps.keys()):
-            if app_name == model_id or app_name.startswith(f"{model_id}-"):
-                serve.delete(name=app_name)
+        """Delete this model's router + replica apps and registry state (exact ids only)."""
         registry = get_gpu_registry()
-        ray.get(registry.clear_by_prefix.remote(f"{model_id}-"))
+        deployment = ray.get(registry.get_deployment.remote(model_id))
+        replica_ids = list(deployment["replicas"].keys()) if deployment else []
+
+        apps = serve.status().applications or {}
+        for app_name in (model_id, *replica_ids):
+            if app_name in apps:
+                serve.delete(name=app_name)
+
+        if replica_ids:
+            ray.get(registry.clear_replicas.remote(replica_ids))
         ray.get(registry.release_deployment.remote(model_id))
         time.sleep(3.0)
         return {"model_id": model_id, "status": "shutdown"}
@@ -193,6 +213,8 @@ class DeployService:
         chat_template_kwargs = model_vllm_kwargs.pop("default_chat_template_kwargs", None) or {}
 
         registry = get_gpu_registry()
+        _assert_model_id_free(model_id, registry)
+
         hf_params = ray.get(fetch_hf_config_dict.remote(config["name"]))
         vram_reqs = build_vram_reqs(
             hf_params,
@@ -300,6 +322,7 @@ class DeployService:
             replica_metadata,
             router_resource,
             chat_template_kwargs,
+            config.get("idle_timeout", -1),
         ))
 
         return {

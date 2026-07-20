@@ -117,6 +117,16 @@ class ClusterStateManager(ABC):
         self.deployments.pop(deployment_id, None)
 
 
+    def has_deployment(self, deployment_id: str) -> bool:
+        """True when deployment_id is already registered."""
+        return deployment_id in self.deployments
+
+
+    def get_deployment(self, deployment_id: str) -> dict | None:
+        """Return deployment record or None."""
+        return self.deployments.get(deployment_id)
+
+
     def release_replica(self, deployment_id: str, replica_id: str):
         """Remove one replica from a deployment; drop deployment if empty."""
         deployment = self.deployments[deployment_id]
@@ -236,16 +246,17 @@ class VRAMAllocator(ClusterStateManager):
         return cleared
 
 
-    def clear_by_prefix(self, prefix: str) -> int:
-        """Clear pending/active reservations whose replica_id starts with prefix."""
+    def clear_replicas(self, replica_ids: list[str]) -> int:
+        """Clear pending/active reservations for exact replica ids only."""
+        ids = set(replica_ids)
         cleared = 0
         for gpu in self.gpus.values():
             for rid in list(gpu["pending"]):
-                if rid.startswith(prefix):
+                if rid in ids:
                     gpu["pending"].pop(rid)
                     cleared += 1
             for rid in list(gpu["active"]):
-                if rid.startswith(prefix):
+                if rid in ids:
                     gpu["active"].pop(rid)
                     cleared += 1
         return cleared
