@@ -11,6 +11,7 @@ The cluster remains a normal Ray cluster: CPU workers can run general distribute
 - [Model Planning](#model-planning)
 - [GPU Monitoring and Placement](#gpu-monitoring-and-placement)
 - [GPU Allocation Policies](#gpu-allocation-policies)
+- [Tensor Parallelism](#tensor-parallelism)
 - [Basic Model Usage](#basic-model-usage)
 - [General Ray CPU Tasks](#general-ray-cpu-tasks)
 - [Repository](#repository)
@@ -37,18 +38,20 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 - **Live VRAM scheduling:** Placement uses current GPU memory rather than static card specifications and reserves memory during deployment.
 - **GPU sharing:** Multiple models can share a GPU when the registry and planner determine that enough VRAM remains.
 - **Flexible placement:** Models can target specific GPUs, a requested replica count, or every eligible GPU.
+- **Same-node tensor parallelism:** If a model does not fit on any one GPU, auto placement escalates to same-node TP; or pin an explicit `gpu=[...]` set. Each TP group is one Serve replica with vLLM’s multiprocessing backend.
+- **Host RAM extension (`cpu_ram_per_instance`):** Sole hive arg for extending beyond GPU VRAM. Weights stay on GPU if they fit; overflow spills to host (`cpu_offload_gb`); leftover host RAM becomes CPU KV and raises `max_num_seqs`.
 - **General compute:** The same cluster continues to run normal distributed Ray tasks on its CPU workers (and GPU workers if not busy serving models).
 
 ## Model Planning
 
 Before loading a model, Ray Hive reads its Hugging Face configuration and builds a per-GPU memory plan:
 
-- **Weights** are estimated from the architecture, parameter dimensions, and model dtype.
-- **Attention/KV cache** is estimated from attention layers, KV heads, head size, context length, cache dtype, and concurrent sequences. Specialized attention layouts can provide their own calculation.
-- **Runtime memory** includes a small system allowance, model-specific overhead, and activation memory based on batched tokens.
-- **Concurrency** (`max_num_seqs`) and batched-token limits are pushed as high as the remaining VRAM allows, with 5% left outside the plan for runtime headroom.
+- **Weights** are estimated from the architecture, parameter dimensions, and model dtype (divided by TP size for per-GPU planning).
+- **Attention/KV cache** is estimated from attention layers, KV heads, head size, context length, cache dtype, and concurrent sequences. Specialized attention layouts can provide their own calculation; TP sharding is applied in the planner, not in attention classes.
+- **Runtime memory** includes a small system allowance (plus a coarse NCCL/TP term when TP>1), model-specific overhead, and activation memory based on batched tokens.
+- **Host RAM (`cpu_ram_per_instance`):** If weights fit in the GPU budget, they stay on GPU and the full host budget goes to CPU KV. If not, overflow spills to host first; remaining host GiB becomes CPU KV. Concurrency (`max_num_seqs`) uses GPU KV plus that CPU KV. Activations, batched tokens, VRAM reservation, and `gpu_memory_utilization` stay GPU-only.
 
-Each GPU is planned independently, allowing different cards and existing deployments to have different concurrency limits.
+Each GPU (or TP group bottleneck) is planned independently, allowing different cards and existing deployments to have different concurrency limits.
 
 ## GPU Monitoring and Placement
 
@@ -56,15 +59,17 @@ A DaemonSet runs on every GPU node and reports live free/total VRAM and device i
 
 Placement supports:
 
-- Pin a replica to one GPU or an explicit list of GPUs (`gpu=` — skips allocation policies).
-- Use an allocation policy to pick the top `replicas` eligible GPUs (default: performance ranking).
-- Use `replicas=-1` to deploy on every eligible GPU under that policy.
+- `gpu="host:gpu0"` — pin one replica to one GPU.
+- `gpu=[a,b,...]` with `replicas == len(list)` and `replicas > 1` — **N single-GPU pins** (one replica per listed GPU, TP=1 each).
+- `gpu=[a,b,...]` with `replicas == 1` — **one same-node TP group** (`tp_size = len(list)`).
+- With `gpu=None`, try single-GPU placement via `allocation_cls` (default: performance ranking); if nothing fits, escalate to same-node TP packs.
+- Use `replicas=-1` to deploy on every eligible GPU (or every non-overlapping TP group) under that policy.
 
-After placement, requests go to the replica with the lowest queue depth relative to that replica's planned concurrency.
+After placement, requests go to the replica with the lowest queue depth relative to that replica's measured throughput.
 
 ## GPU Allocation Policies
 
-When `gpu=` is not set, deploy picks GPUs through an `allocation_cls`. Abstract policy math lives in `ray_hive.core.gpu_alloc`; `ray_hive.core.ray_utils` / `ray_gpu_alloc`.
+When `gpu=` is not set, deploy picks GPUs through an `allocation_cls`. Abstract policy math lives in `ray_hive.core.gpu_alloc`; Ray helpers live in `ray_hive.core.ray_utils` / `ray_gpu_alloc`.
 
 If `gpu=` or `gpu=[...]` is set, allocation policies are skipped and those pins are used (VRAM checks only).
 
@@ -73,9 +78,50 @@ Policies implemented so far:
 - **Performance** (`RayPerformanceAllocator`) — rank eligible GPUs by compute proxy; select top-N for replicas.
 - **Conserve TDP** (`RayConserveTdpAllocator`) — rank eligible GPUs toward lower approximate TDP; SM count as tie-break.
 - **FP8** (`RayFp8Allocator`) — same ranking as PerformanceAllocator; prefer Ada GPUs when FP8 is used.
-- **Tensor parallel** (`TensorParallelAllocator`) — placeholder for future symmetric TP set selection.
+- **Tensor parallel** (`RayTensorParallelAllocator`) — pack same-node GPU sets (usable ≈ N × min available); used automatically when single-GPU placement fails and `gpu=` is unset.
 
 Ray-wired allocators also drop GPUs whose host is not an Alive Ray node.
+
+## Tensor Parallelism
+
+Same-node only for now. Cross-node TP / pipeline parallel are not wired yet.
+
+- **Auto (`gpu=None`):** try TP=1; if no GPU has enough free VRAM for weights+overhead, escalate TP=2,3,… via `RayTensorParallelAllocator` until a same-node pack fits.
+- **Pin TP (`gpu=[a,b,...]`, `replicas=1`):** that list *is* one TP group (`tp_size = len(list)`); must be same host.
+- **Multi-pin (`gpu=[a,b,...]`, `replicas=len(list)`):** N independent TP=1 replicas, one per listed GPU (hosts may differ).
+- **Pin (`gpu="host:gpu0"`):** single-GPU placement.
+- **One TP replica per deploy:** a TP-sized `gpu=` list with `replicas` other than `1` or `len(gpu)` is rejected. To run a second TP copy, call `deploy_model` again with a different `model_id` / pin.
+- `replicas` — number of independent GPUs when TP=1 (including multi-pin); number of independent TP *groups* when auto TP>1; must be `1` for a pinned TP group.
+- Engine uses `distributed_executor_backend="mp"` (vLLM multiprocessing inside the Serve actor). Do not pass vLLM’s Ray executor for this path.
+- Custom `attention_cls` stays architecture-only; the planner divides weights/KV by TP size.
+- There is no user-facing `tensor_parallel_size` deploy arg — TP size comes from auto escalation or `len(gpu)` when `replicas=1`.
+
+```python
+# Force TP across two cards on one host
+hive.deploy_model(
+    model_id="qwen-tp",
+    model_name="Qwen/Qwen3-8B-FP8",
+    max_input_prompt_length=1024,
+    max_output_prompt_length=2048,
+    replicas=1,
+    gpu=["ergos-02-nv:gpu0", "ergos-02-nv:gpu1"],
+    trust_remote_code=True,
+    reasoning_parser="qwen3",
+    default_chat_template_kwargs={"enable_thinking": False},
+)
+
+# Or omit gpu= — single GPU if it fits, else same-node TP
+hive.deploy_model(
+    model_id="qwen-auto",
+    model_name="Qwen/Qwen3-8B-FP8",
+    max_input_prompt_length=1024,
+    max_output_prompt_length=2048,
+    replicas=1,
+    trust_remote_code=True,
+    reasoning_parser="qwen3",
+    default_chat_template_kwargs={"enable_thinking": False},
+)
+```
 
 ## Basic Model Usage
 
@@ -109,15 +155,20 @@ Ray Hive-specific `deploy_model` arguments:
 - `model_id` — local name used for the deployment, router, and API path.
 - `model_name` — Hugging Face model ID or model path passed to vLLM.
 - `max_input_prompt_length` / `max_output_prompt_length` — expected limits used to plan context memory and concurrency.
-- `replicas` — number of GPUs to deploy on; `-1` uses every eligible GPU.
-- `gpu` — optional GPU key or list of keys (for example, `ergos-06-nv:gpu0`) for explicit placement; overrides `allocation_cls`.
+- `replicas` — number of GPUs when TP=1 (including multi-pin); number of TP *groups* when auto TP>1; must be `1` for a pinned TP group; `-1` uses every eligible GPU/group.
+- `gpu` — optional pin: a string for one GPU; a list with `replicas=1` for one same-node TP group; a list with `replicas=len(list)` for N single-GPU pins. Overrides `allocation_cls`. Omit to auto-place (single GPU, else same-node TP).
 - `max_num_seqs` / `max_num_batched_tokens` — optional overrides for the planner's estimates.
-- `swap_space_per_instance` — CPU swap space in GiB available to each vLLM instance.
-- `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention.
-- `allocation_cls` — optional GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set).
+- `cpu_ram_per_instance` — sole host-RAM extension arg (default `0`):
+  - `0` — off (GPU-only; no weight spill, no CPU KV)
+  - `-1` — host budget = `0.85 × min(free VRAM)` in the replica / TP group
+  - `>0` — hard host budget in GiB
+  Policy: keep weights on GPU if they fit; else spill overflow to host; leftover host RAM → CPU KV → higher `max_num_seqs`.
+- `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention (no TP awareness required).
+- `allocation_cls` — optional single-GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set; auto TP always uses `RayTensorParallelAllocator`).
 - `idle_timeout` — seconds of inference inactivity before the model self-shutdowns; `-1` (default) means never, must be `-1` or a positive integer. Survives client script exit; uses the same cleanup as `hive.shutdown(model_id)`.
 
 Any additional keyword arguments are forwarded to vLLM's `LLM(...)` constructor.
+
 
 Structured output accepts a Pydantic model:
 

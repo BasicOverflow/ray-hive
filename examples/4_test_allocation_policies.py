@@ -59,7 +59,7 @@ for policy in policies:
     chosen = allocator.select(gpu_map, REPLICAS, 0.5, hf, {})
     print(f"  {policy['allocation_cls'].__name__}: {[k for k, _ in chosen]}")
 
-print("\nNote: TensorParallelAllocator is a stub (NotImplemented) — not deployed here.")
+print("\nNote: RayTensorParallelAllocator is covered in examples/5_tensor_parallel.py.")
 
 for idx, policy in enumerate(policies):
     model_id = policy["model_id"]

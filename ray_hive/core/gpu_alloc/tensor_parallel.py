@@ -1,30 +1,17 @@
 """
-Tensor-parallel GPU allocator — not implemented yet.
+Tensor-parallel GPU allocator — same-node TP group packing.
 
-TODO — vLLM only knows how to shard models on symmetric GPUs, not heterogeneous
-ones, so come up with an algorithm to find an ideal set of GPUs that would spread
-out a big model of size X such that the smallest GPU wouldn't limit the total
-space deployable, even if that means fewer GPUs total. Because shards on each
-GPU can only be as big as the smallest GPU's capacity
-(usable ≈ N * min(available_i)). Prefer same-node sets (cross-node TP is painful
-on this cluster). Return one multi-GPU placement, not N independent single-GPU
-replicas. Not wired into deploy yet.
+vLLM shards evenly across GPUs, so usable VRAM ≈ N * min(available_i).
+Prefer same-node sets; return a flat list of (gpu_key, gpu) in contiguous
+groups of tp_size (deploy chunks by tensor_parallel_size).
 """
+from itertools import combinations
+
 from .base import BaseGpuAllocator
 
 
 class TensorParallelAllocator(BaseGpuAllocator):
-    """Placeholder for future symmetric TP set selection."""
-
-    def score(
-        self,
-        gpu_key: str,
-        gpu: dict,
-        hf_params: dict,
-        vllm_kwargs: dict,
-    ) -> float:
-        raise NotImplementedError("TP allocation not wired yet")
-
+    """Select same-node GPU sets for tensor-parallel replicas."""
 
     def select(
         self,
@@ -35,12 +22,50 @@ class TensorParallelAllocator(BaseGpuAllocator):
         vllm_kwargs: dict,
     ) -> list[tuple[str, dict]]:
         """
-        TODO — vLLM only knows how to shard models on symmetric GPUs, not
-        heterogeneous ones, so come up with an algorithm to find an ideal set of
-        GPUs that would spread out a big model of size X such that the smallest
-        GPU wouldn't limit the total space deployable, even if that means fewer
-        GPUs total. Because shards on each GPU can only be as big as the smallest
-        GPU's capacity (usable ≈ N * min(available_i)). Prefer same-node sets;
-        return one multi-GPU placement, not N independent replicas.
+        Pack same-node GPU groups of size tensor_parallel_size.
+
+        Returns a flat list of length replicas * tp_size (or all non-overlapping
+        groups when replicas=-1), ordered as contiguous TP groups.
         """
-        raise NotImplementedError("TP allocation not wired yet")
+        tp_size = int(vllm_kwargs.get("tensor_parallel_size", 1))
+        assert tp_size >= 2, f"TensorParallelAllocator requires tensor_parallel_size >= 2, got {tp_size}"
+
+        eligible = self.filter_eligible(gpu_map, min_vram_gb, hf_params, vllm_kwargs)
+        by_host: dict[str, list[tuple[str, dict]]] = {}
+        for gpu_key, gpu in eligible:
+            by_host.setdefault(gpu_key.split(":")[0], []).append((gpu_key, gpu))
+
+        candidates: list[tuple[tuple, list[tuple[str, dict]]]] = []
+        for gpus in by_host.values():
+            if len(gpus) < tp_size:
+                continue
+            for combo in combinations(gpus, tp_size):
+                group = list(combo)
+                avails = [g["available"] for _, g in group]
+                min_avail = min(avails)
+                if min_avail < min_vram_gb:
+                    continue
+                leftover = sum(a - min_avail for a in avails)
+                totals = [g["total"] for _, g in group]
+                total_spread = max(totals) - min(totals)
+                sm_sum = sum(self.sm_count(g) for _, g in group)
+                # Prefer matched card sizes (vLLM TP wants symmetric GPUs), then capacity.
+                rank = (-total_spread, min_avail, -leftover, sm_sum)
+                candidates.append((rank, group))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        used: set[str] = set()
+        result: list[tuple[str, dict]] = []
+        for _, group in candidates:
+            keys = {k for k, _ in group}
+            if keys & used:
+                continue
+            result.extend(group)
+            used |= keys
+            if replicas != -1 and len(result) // tp_size >= replicas:
+                break
+
+        if replicas == -1:
+            return result
+        return result[: replicas * tp_size]

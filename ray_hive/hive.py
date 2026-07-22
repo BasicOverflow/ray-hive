@@ -38,7 +38,7 @@ class RayHive:
         gpu: Optional[Union[str, List[str]]] = None,
         max_num_seqs: Optional[int] = None,
         max_num_batched_tokens: Optional[int] = None,
-        swap_space_per_instance: int = 3,
+        cpu_ram_per_instance: float = 0,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         idle_timeout: int = -1,
@@ -49,9 +49,15 @@ class RayHive:
 
         max_input_prompt_length and max_output_prompt_length are required.
         max_num_seqs and max_num_batched_tokens are estimated from VRAM unless overridden.
-        replicas=-1 deploys to all eligible GPUs.
+        replicas=-1 deploys to all eligible GPUs (or all eligible TP groups when auto TP>1).
         attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
-        allocation_cls defaults to RayPerformanceAllocator; ignored when gpu= is set.
+        allocation_cls defaults to RayPerformanceAllocator for single-GPU auto placement;
+        ignored when gpu= is set. Auto TP packing always uses RayTensorParallelAllocator.
+        gpu=None: place on one GPU if any fits; otherwise same-node TP (2, 3, ...).
+        gpu=[a,b,...] + replicas=1: one same-node TP group.
+        gpu=[a,b,...] + replicas=len(list): N single-GPU pins (one replica per GPU).
+        cpu_ram_per_instance: sole host-RAM extension arg — 0 off; -1 = 85% free VRAM;
+          >0 hard GiB. Weights stay on GPU if they fit; overflow spills to host; leftover → KV.
         """
         if idle_timeout != -1 and idle_timeout <= 0:
             raise ValueError("idle_timeout must be -1 (never) or a positive number of seconds")
@@ -62,7 +68,7 @@ class RayHive:
             "gpu": gpu,
             "max_input_prompt_length": max_input_prompt_length,
             "max_output_prompt_length": max_output_prompt_length,
-            "swap_space_per_instance": swap_space_per_instance,
+            "cpu_ram_per_instance": cpu_ram_per_instance,
             "attention_cls": attention_cls,
             "allocation_cls": allocation_cls,
             "idle_timeout": idle_timeout,
@@ -84,13 +90,18 @@ class RayHive:
             print(f"{'='*80}")
             for replica_id, summary in results[model_id].items():
                 plan = summary["plan"]
-                gpu_key = summary["gpu_key"]
+                gpu_keys = summary.get("gpu_keys") or [summary["gpu_key"]]
+                tp = plan.get("tensor_parallel_size", len(gpu_keys))
                 print(f"\nReplica: {replica_id}")
-                print(f"  GPU: {gpu_key}")
+                print(f"  GPU(s): {', '.join(gpu_keys)}")
+                print(f"  tensor_parallel_size: {tp}")
                 print(f"  max_num_seqs: {plan['max_num_seqs']}")
                 print(f"  max_num_batched_tokens: {plan['max_num_batched_tokens']}")
                 print(f"  gpu_memory_utilization: {plan['gpu_memory_utilization']:.3f}")
-                print(f"  total_vram_gb: {plan['total_vram_gb']:.2f}")
+                print(f"  total_vram_gb (per GPU): {plan['total_vram_gb']:.2f}")
+                print(f"  cpu_ram_budget_gb: {plan.get('cpu_ram_budget_gb', 0):.2f}")
+                print(f"  cpu_kv_offload_gb: {plan.get('cpu_kv_offload_gb', 0):.2f}")
+                print(f"  cpu_offload_gb (weights): {plan.get('cpu_offload_gb', 0):.2f}")
             print(f"{'='*80}\n")
 
 
@@ -106,10 +117,3 @@ class RayHive:
         """Return live VRAM state dict for all GPUs from the registry."""
         registry = get_gpu_registry()
         return ray.get(registry.get_all_gpus.remote())
-
-
-    def display_vram_state(self):
-        """Print available/total VRAM for each GPU."""
-        state = self.get_vram_state()
-        for gpu_key, info in sorted(state.items()):
-            print(f"GPU {gpu_key}: {info.get('available', 0):.2f}GB available / {info.get('total', 0):.2f}GB total")
