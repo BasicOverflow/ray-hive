@@ -4,205 +4,22 @@ Deployment service — singleton Ray actor that serializes deploy/shutdown.
 DeployService runs the full per-model pipeline: HF config → planner → GPU
 selection → replica reservation → parallel RayLLMActor deploy → ModelRouter.
 """
-import time
-
 import ray
 from ray import serve
 
 from .gpu_registry import get_gpu_registry
+from .gpu_alloc import assert_cpu_ram_tp_allowed, resolve_group_cpu_spill
 from .model_specs.planner import normalize_hf_config, plan_deployment
-from .ray_gpu_alloc import RayPerformanceAllocator, RayTensorParallelAllocator
 from .ray_utils import (
     assert_model_id_free,
-    assert_tp_shardable,
-    build_vram_reqs_for_tp,
     chunk_gpu_groups,
     deployment_name,
     fixed_non_kv_gb,
-    gpu_info_entry,
-    gpu_inventory_lines,
-    max_gpus_on_any_host,
-    resolve_cpu_ram_budget,
-    resolve_cpu_spill,
-    resolve_pinned_gpu,
-    tp_shardable,
+    gpu_budget_frac,
+    host_memory_available_gb,
+    replicas_per_host,
+    resolve_target_gpus,
 )
-
-
-def _budget_frac(tp_size: int) -> float:
-    """TP needs headroom for NCCL / cudagraph peaks; packing ~0.97 OOMs on small cards."""
-    return 0.80 if tp_size > 1 else 0.97
-
-
-def _pin_weight_need_gb(weight_need: float, available_gb: float, cpu_ram_cfg: float, tp_size: int) -> float:
-    """On-GPU GiB required after optional host weight spill; raises if spill budget too small."""
-    gpu_budget = available_gb * _budget_frac(tp_size)
-    cpu_ram = resolve_cpu_ram_budget(cpu_ram_cfg, available_gb)
-    cpu_offload, _ = resolve_cpu_spill(cpu_ram, weight_need, gpu_budget, tp_size)
-    return weight_need - cpu_offload
-
-
-def _resolve_target_gpus(
-    gpu_map: dict,
-    replicas: int,
-    gpu,
-    hf_params: dict,
-    allocation_cls,
-    attention_cls,
-    model_vllm_kwargs: dict,
-    cpu_ram_cfg: float = 0,
-) -> tuple[int, list[dict], object]:
-    """
-    Resolve placement and TP size.
-
-    Returns (tp_size, flat gpu info list, vram_reqs for that tp_size).
-
-    - gpu=str / gpu=[one]: TP=1 pin
-    - gpu=[a,b,...] + replicas == len(list) + replicas > 1: N single-GPU pins
-    - gpu=[a,b,...] + replicas == 1: one same-node TP group
-    - gpu=None: try TP=1; if nothing fits, escalate same-node TP=2,3,...
-    """
-    if gpu is not None:
-        if isinstance(gpu, str):
-            tp_size = 1
-            vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-            weight_need = fixed_non_kv_gb(vram_reqs)
-            if gpu not in gpu_map:
-                raise ValueError(f"GPU {gpu} not in registry. Known: {sorted(gpu_map)}")
-            avail = float(gpu_map[gpu]["available"])
-            need = _pin_weight_need_gb(weight_need, avail, cpu_ram_cfg, tp_size)
-            return tp_size, [resolve_pinned_gpu(gpu_map, gpu, need)], vram_reqs
-
-        if isinstance(gpu, list):
-            if not gpu:
-                raise ValueError("gpu=[] is empty")
-            if len(gpu) == 1:
-                tp_size = 1
-                vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-                weight_need = fixed_non_kv_gb(vram_reqs)
-                if gpu[0] not in gpu_map:
-                    raise ValueError(f"GPU {gpu[0]} not in registry. Known: {sorted(gpu_map)}")
-                avail = float(gpu_map[gpu[0]]["available"])
-                need = _pin_weight_need_gb(weight_need, avail, cpu_ram_cfg, tp_size)
-                return tp_size, [resolve_pinned_gpu(gpu_map, gpu[0], need)], vram_reqs
-
-            if replicas == len(gpu) and replicas > 1:
-                tp_size = 1
-                vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-                weight_need = fixed_non_kv_gb(vram_reqs)
-                resolved = []
-                for g in gpu:
-                    if g not in gpu_map:
-                        raise ValueError(f"GPU {g} not in registry. Known: {sorted(gpu_map)}")
-                    avail = float(gpu_map[g]["available"])
-                    need = _pin_weight_need_gb(weight_need, avail, cpu_ram_cfg, tp_size)
-                    resolved.append(resolve_pinned_gpu(gpu_map, g, need))
-                return tp_size, resolved, vram_reqs
-
-            if replicas != 1:
-                raise ValueError(
-                    "Pinned gpu=[...] with len>1 is either one TP group (replicas=1) "
-                    "or N single-GPU pins (replicas=len(gpu)). One deploy creates at most "
-                    "one TP replica — for a second TP copy, call deploy_model again with a "
-                    f"different model_id / pin. Got replicas={replicas}, len(gpu)={len(gpu)}."
-                )
-
-            tp_size = len(gpu)
-            hosts = {g.split(":")[0] for g in gpu}
-            if len(hosts) != 1:
-                raise ValueError(
-                    f"Same-node TP only — pinned GPUs span hosts {sorted(hosts)}"
-                )
-            assert_tp_shardable(hf_params, tp_size)
-            vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-            weight_need = fixed_non_kv_gb(vram_reqs)
-            resolved = []
-            short = []
-            for g in gpu:
-                if g not in gpu_map:
-                    raise ValueError(f"GPU {g} not in registry. Known: {sorted(gpu_map)}")
-                info = gpu_map[g]
-                resolved.append(gpu_info_entry(g, info))
-            avail = min(e["available_gb"] for e in resolved)
-            try:
-                need = _pin_weight_need_gb(weight_need, avail, cpu_ram_cfg, tp_size)
-            except ValueError as e:
-                raise ValueError(
-                    f"Model does not fit on pinned gpu={gpu} (TP={tp_size}): {e}"
-                ) from e
-            for entry in resolved:
-                if entry["available_gb"] < need:
-                    short.append(
-                        f"{entry['gpu_key']}: {entry['available_gb']:.2f}GB avail "
-                        f"(need {need:.2f}GB/GPU after TP={tp_size})"
-                    )
-            if short:
-                raise ValueError(
-                    f"Model does not fit on pinned gpu={gpu} (TP={tp_size}): "
-                    + "; ".join(short)
-                )
-            return tp_size, resolved, vram_reqs
-
-        assert False, "gpu must be a string, list of strings, or None"
-
-    if not gpu_map:
-        raise ValueError("No GPUs in registry — cannot place model")
-
-    # Auto: prefer single-GPU, then escalate TP on same-node packs.
-    vram_reqs_1 = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, 1)
-    weight_need_1 = fixed_non_kv_gb(vram_reqs_1)
-    # Hard cpu_ram credits selection floor; -1 is per-GPU so keep weight_need for filter.
-    if cpu_ram_cfg > 0:
-        min_1 = max(0.01, weight_need_1 - float(cpu_ram_cfg))
-    else:
-        min_1 = weight_need_1
-    single_cls = allocation_cls or RayPerformanceAllocator
-    chosen = single_cls().select(gpu_map, replicas, min_1, hf_params, model_vllm_kwargs)
-    if chosen:
-        if replicas != -1 and len(chosen) < replicas:
-            raise ValueError(
-                f"Only {len(chosen)} GPU(s) can hold the model (need {min_1:.2f}GB each), "
-                f"but replicas={replicas}.\nCluster:\n{gpu_inventory_lines(gpu_map)}"
-            )
-        return 1, [gpu_info_entry(k, g) for k, g in chosen], vram_reqs_1
-
-    max_tp = max_gpus_on_any_host(gpu_map)
-    best_partial = None  # (tp_size, n_groups, min_vram) when some groups fit but < replicas
-    for tp_size in range(2, max_tp + 1):
-        if not tp_shardable(hf_params, tp_size):
-            continue
-        vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-        weight_need = fixed_non_kv_gb(vram_reqs)
-        if cpu_ram_cfg > 0:
-            min_vram = max(0.01, weight_need - float(cpu_ram_cfg) / tp_size)
-        else:
-            min_vram = weight_need
-        alloc_kwargs = dict(model_vllm_kwargs)
-        alloc_kwargs["tensor_parallel_size"] = tp_size
-        # TP packing always uses the TP allocator (symmetric same-node sets).
-        chosen = RayTensorParallelAllocator().select(
-            gpu_map, replicas, min_vram, hf_params, alloc_kwargs
-        )
-        n_groups = len(chosen) // tp_size if chosen else 0
-        if n_groups == 0:
-            continue
-        if replicas == -1 or n_groups >= replicas:
-            return tp_size, [gpu_info_entry(k, g) for k, g in chosen], vram_reqs
-        best_partial = (tp_size, n_groups, min_vram)
-
-    if best_partial is not None:
-        tp_size, n_groups, min_vram = best_partial
-        raise ValueError(
-            f"Only {n_groups} same-node TP={tp_size} group(s) fit "
-            f"(need {min_vram:.2f}GB/GPU), but replicas={replicas}.\n"
-            f"Cluster:\n{gpu_inventory_lines(gpu_map)}"
-        )
-
-    raise ValueError(
-        f"No GPU set in the cluster can support this model "
-        f"(need >={min_1:.2f}GB on one GPU, or same-node TP=2..{max_tp}).\n"
-        f"Cluster:\n{gpu_inventory_lines(gpu_map)}"
-    )
 
 
 @ray.remote(num_gpus=0.01)
@@ -226,7 +43,6 @@ def deploy_single(
     model_id: str,
     target_gpu_id: str,
     engine_kwargs: dict,
-    gpu_fraction: float,
     resource_names: list[str],
     route_prefix: str,
     memory_bytes: int,
@@ -235,19 +51,20 @@ def deploy_single(
     from ray_hive.core.ray_llm_actor import RayLLMActor
 
     resources = {name: 0.01 for name in resource_names}
-    # Ray remaps CUDA_VISIBLE_DEVICES when num_gpus>0; that breaks multi-GPU TP.
-    # Pin devices via runtime_env + custom resources; keep fractional num_gpus only for single-GPU.
-    multi_gpu = len(resource_names) > 1
+    # num_gpus>0 makes Ray remap CUDA_VISIBLE_DEVICES and breaks custom-resource pinning
+    # on multi-GPU nodes (wrong card → OOM / Serve "Failed to update"). Pin via CVD only.
     env_vars = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
         "CUDA_VISIBLE_DEVICES": target_gpu_id,
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
     }
-    if multi_gpu:
+    if len(resource_names) > 1:
         env_vars["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
     deployment = RayLLMActor.options(
         name=replica_id,
+        graceful_shutdown_timeout_s=0,
         ray_actor_options={
-            "num_gpus": 0 if multi_gpu else gpu_fraction,
+            "num_gpus": 0,
             "memory": memory_bytes,
             "resources": resources,
             "runtime_env": {"env_vars": env_vars},
@@ -274,6 +91,7 @@ def deploy_router(
 
     router = ModelRouter.options(
         name=f"{model_id}-router",
+        graceful_shutdown_timeout_s=0,
         autoscaling_config=None,
         num_replicas=1,
         ray_actor_options={"num_cpus": 0.1, "resources": {resource_name: 0.01}},
@@ -312,29 +130,17 @@ class DeployService:
 
     def shutdown_model(self, model_id: str) -> dict:
         """Delete this model's router + replica apps and registry state (exact ids only)."""
-        registry = get_gpu_registry()
-        deployment = ray.get(registry.get_deployment.remote(model_id))
-        replica_ids = list(deployment["replicas"].keys()) if deployment else []
+        from ray_hive.core.ray_utils.lifecycle import shutdown_model as _shutdown_model
 
-        apps = serve.status().applications or {}
-        for app_name in (model_id, *replica_ids):
-            if app_name in apps:
-                serve.delete(name=app_name)
-
-        if replica_ids:
-            ray.get(registry.clear_replicas.remote(replica_ids))
-        ray.get(registry.release_deployment.remote(model_id))
-        time.sleep(3.0)
+        _shutdown_model(model_id)
         return {"model_id": model_id, "status": "shutdown"}
 
 
     def shutdown_all(self) -> dict:
         """Shutdown all Serve apps and clear registry state."""
-        if serve.status().applications:
-            serve.shutdown()
-        registry = get_gpu_registry()
-        ray.get(registry.clear_all.remote())
-        time.sleep(5.0)
+        from ray_hive.core.ray_utils.lifecycle import shutdown_all as _shutdown_all
+
+        _shutdown_all()
         return {"status": "shutdown_all"}
 
 
@@ -358,7 +164,7 @@ class DeployService:
         hf_params = normalize_hf_config(ray.get(fetch_hf_config_dict.remote(config["name"])))
         gpu_map = ray.get(registry.get_all_gpus.remote())
         cpu_ram_cfg = float(config.get("cpu_ram_per_instance") or 0)
-        tp_size, target_gpus, vram_reqs = _resolve_target_gpus(
+        tp_size, target_gpus, vram_reqs = resolve_target_gpus(
             gpu_map,
             config.get("replicas", -1),
             config.get("gpu"),
@@ -368,7 +174,9 @@ class DeployService:
             model_vllm_kwargs,
             cpu_ram_cfg=cpu_ram_cfg,
         )
+        assert_cpu_ram_tp_allowed(tp_size, cpu_ram_cfg)
         gpu_groups = chunk_gpu_groups(target_gpus, tp_size)
+        per_host = replicas_per_host(gpu_groups)
 
         max_model_len = config["max_input_prompt_length"] + config["max_output_prompt_length"]
         batched_tokens_override = config.get("max_num_batched_tokens")
@@ -384,11 +192,15 @@ class DeployService:
             gpu_keys = [g["gpu_key"] for g in group]
             bottleneck = min(group, key=lambda g: g["available_gb"])
             avail = min(g["available_gb"] for g in group)
-            per_gpu_budget = avail * _budget_frac(tp_size)
-            cpu_ram = resolve_cpu_ram_budget(cpu_ram_cfg, avail)
-            cpu_offload, kv_offload = resolve_cpu_spill(
-                cpu_ram, weight_need, per_gpu_budget, tp_size
-            )
+            host = group[0]["gpu_key"].split(":")[0]
+            if tp_size > 1:
+                per_gpu_budget = avail * gpu_budget_frac(tp_size)
+                cpu_ram = cpu_offload = kv_offload = 0.0
+                memory_bytes = 0
+            else:
+                per_gpu_budget, cpu_ram, cpu_offload, kv_offload, memory_bytes = resolve_group_cpu_spill(
+                    weight_need, avail, cpu_ram_cfg, host_memory_available_gb(host), per_host[host]
+                )
             plan = plan_deployment(
                 vram_reqs,
                 vram_budget_gb=per_gpu_budget,
@@ -403,6 +215,8 @@ class DeployService:
             )
             plan = dict(plan)
             plan["tensor_parallel_size"] = tp_size
+            plan["weights_gb"] = vram_reqs.calc_weights_gb() * tp_size
+            plan["weight_need_gb"] = weight_need
             plan["cpu_ram_budget_gb"] = cpu_ram
 
             replica_id = deployment_name(model_id, gpu_keys)
@@ -435,16 +249,11 @@ class DeployService:
                 engine_kwargs["distributed_executor_backend"] = "mp"
 
             resource_names = [g["resource_name"] for g in group]
-            # Match single-GPU pinning: small Ray num_gpus + custom resources; CUDA_VISIBLE_DEVICES selects devices.
-            per_card = max(0.01, round(plan["total_vram_gb"] / bottleneck["total_gb"], 2))
-            gpu_fraction = per_card * tp_size
-            memory_bytes = int((2 + kv_offload + cpu_offload * tp_size) * 1024 ** 3)
             replica_jobs.append({
                 "replica_id": replica_id,
                 "model_id": model_id,
                 "target_gpu_id": ",".join(g["gpu_id"] for g in group),
                 "engine_kwargs": engine_kwargs,
-                "gpu_fraction": gpu_fraction,
                 "resource_names": resource_names,
                 "memory_bytes": memory_bytes,
             })
@@ -457,18 +266,27 @@ class DeployService:
         deploy_futures = []
         for job in replica_jobs:
             resources = {name: 0.01 for name in job["resource_names"]}
-            future = deploy_single.options(resources=resources).remote(
+            deploy_futures.append(deploy_single.options(resources=resources).remote(
                 job["replica_id"],
                 job["model_id"],
                 job["target_gpu_id"],
                 job["engine_kwargs"],
-                job["gpu_fraction"],
                 job["resource_names"],
                 f"/{job['replica_id']}",
                 job["memory_bytes"],
-            )
-            deploy_futures.append(future)
-        ray.get(deploy_futures)
+            ))
+        try:
+            ray.get(deploy_futures)
+        except Exception:
+            for f in deploy_futures:
+                ray.cancel(f, force=True)
+            replica_ids = [job["replica_id"] for job in replica_jobs]
+            apps = serve.status().applications or {}
+            for app_name in replica_ids:
+                if app_name in apps:
+                    serve.delete(name=app_name)
+            ray.get(registry.clear_replicas.remote(replica_ids))
+            raise
 
         replica_gpu_vram_gb = {
             replica_id: {

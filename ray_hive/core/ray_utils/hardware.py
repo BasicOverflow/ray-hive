@@ -80,17 +80,30 @@ def mem_bandwidth(gpu: dict) -> float:
     return float(specs["global_memory_bus_width"]) * float(specs["memory_clock_rate"])
 
 
+def _node_matches_hostname(node: dict, hostname: str) -> bool:
+    """True when a Ray node dict corresponds to a registry hostname."""
+    if node.get("NodeManagerHostname") == hostname or node.get("NodeName") == hostname:
+        return True
+    resources = node.get("Resources") or {}
+    return any(key.startswith(f"{hostname}_gpu") for key in resources)
+
+
 def is_node_alive(hostname: str) -> bool:
     """True when an Alive Ray node matches the registry hostname."""
     for node in ray.nodes():
-        if not node.get("Alive"):
-            continue
-        if node.get("NodeManagerHostname") == hostname or node.get("NodeName") == hostname:
-            return True
-        resources = node.get("Resources") or {}
-        if any(key.startswith(f"{hostname}_gpu") for key in resources):
+        if node.get("Alive") and _node_matches_hostname(node, hostname):
             return True
     return False
+
+
+def host_memory_available_gb(hostname: str) -> float:
+    """Ray logical memory capacity (GiB) for a registry hostname."""
+    for node in ray.nodes():
+        if not node.get("Alive") or not _node_matches_hostname(node, hostname):
+            continue
+        # Ray advertises memory in bytes on the node resource map.
+        return float((node.get("Resources") or {}).get("memory", 0)) / (1024 ** 3)
+    return 0.0
 
 
 def filter_alive(eligible: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
@@ -106,9 +119,16 @@ def gpu_inventory_lines(gpu_map: dict) -> str:
     )
 
 
+def count_by_host(gpu_keys) -> dict[str, int]:
+    """Count gpu keys (or any 'host:...' strings) per hostname."""
+    counts: dict[str, int] = {}
+    for key in gpu_keys:
+        h = key.split(":")[0]
+        counts[h] = counts.get(h, 0) + 1
+    return counts
+
+
 def max_gpus_on_any_host(gpu_map: dict) -> int:
     """Largest same-host GPU count in the registry."""
-    counts: dict[str, int] = {}
-    for key in gpu_map:
-        counts[key.split(":")[0]] = counts.get(key.split(":")[0], 0) + 1
+    counts = count_by_host(gpu_map)
     return max(counts.values()) if counts else 0

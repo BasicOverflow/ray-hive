@@ -105,9 +105,9 @@ model_id = "qwen-custom-attention"
 scheduler.deploy_model(
     model_id=model_id,
     model_name="Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length=1024,
-    max_output_prompt_length=2048,
-    replicas=1,
+    max_input_prompt_length=24,
+    max_output_prompt_length=100,
+    replicas=-11,
     attention_cls=Qwen3AttentionSpecs,
     allocation_cls=RayPerformanceAllocator,
     # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)

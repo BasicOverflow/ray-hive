@@ -116,21 +116,19 @@ class BaseVramReqs(ABC):
 
     def calc_weights_gb(self) -> float:
         """
-        HF-derived dense transformer weight estimate (per GPU when TP > 1).
-        Override for MoE, unusual projections, shared weights, or non-SwiGLU MLP blocks.
-        """
+        HF-derived weight estimate (per GPU when TP > 1).
 
+        Dense transformers: every layer is attn + MLP.
+        hybrid_override_pattern (NemotronH): per-char layer type —
+        '*' attention, '-' MLP, 'M' Mamba-2 — so we do not count attn+MLP on every layer.
+        """
         hidden = self._hf("hidden_size")
-        layers = self._hf("num_hidden_layers")
         vocab = self._hf("vocab_size")
         intermediate = self._hf("intermediate_size")
 
-        # Attention projections: Q + K + V + output.
-        # Uses attention specs so GQA/MQA reduce K/V params while MHA stays 4 * hidden^2.
         kv_width = self.attention.kv_heads * self.attention.head_dim
         attn = (2 * hidden * hidden) + (2 * hidden * kv_width)
 
-        # SwiGLU (silu/swish): gate + up + down. GELU/ReLU MLPs: up + down only.
         act = str(
             self.hf_params.get("mlp_hidden_act")
             or self.hf_params.get("hidden_act", "silu")
@@ -140,13 +138,30 @@ class BaseVramReqs(ABC):
         else:
             mlp = 3 * hidden * intermediate
 
-        # embeddings + optional untied LM head
-        # Override for partial tying, output projection reuse, or learned positional embeddings.
         embed_factor = 1 if self.hf_params.get("tie_word_embeddings") else 2
         embed = embed_factor * vocab * hidden
 
-        # Norms and biases are omitted here; override if those small systematic terms matter.
-        params = layers * (attn + mlp) + embed
+        pattern = self.hf_params.get("hybrid_override_pattern")
+        if isinstance(pattern, str) and pattern:
+            d_inner = int(self.hf_params.get("mamba_num_heads", 0)) * int(
+                self.hf_params.get("mamba_head_dim", 0)
+            )
+            if d_inner <= 0:
+                d_inner = int(self.hf_params.get("expand", 2)) * hidden
+            d_conv = int(self.hf_params.get("conv_kernel", 4))
+            # in_proj (~2*d_inner) + out_proj + depthwise conv — coarse Mamba-2 block size
+            mamba = 3 * hidden * d_inner + d_inner * d_conv
+            params = embed
+            for ch in pattern:
+                if ch == "*":
+                    params += attn
+                elif ch == "-":
+                    params += mlp
+                elif ch == "M":
+                    params += mamba
+        else:
+            layers = self._hf("num_hidden_layers")
+            params = layers * (attn + mlp) + embed
 
         bytes_per_param = self._param_dtype_bytes()
         return (params * bytes_per_param) / (1024 ** 3) / self.tp_size

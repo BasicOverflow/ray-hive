@@ -3,15 +3,35 @@ import ray
 
 
 def shutdown_all():
-    """Shutdown all Serve apps and clear registry state."""
-    from ray_hive.core.deployment import get_deploy_service
-    ray.get(get_deploy_service().shutdown_all.remote())
+    """Shutdown all Serve apps and clear registry state (from caller / driver)."""
+    from ray import serve
+
+    from ray_hive.core.gpu_registry import get_gpu_registry
+
+    if serve.status().applications:
+        serve.shutdown()
+    registry = get_gpu_registry()
+    ray.get(registry.clear_all.remote())
 
 
 def shutdown_model(model_id: str):
     """Shutdown one model and clear its registry reservations."""
-    from ray_hive.core.deployment import get_deploy_service
-    ray.get(get_deploy_service().shutdown_model.remote(model_id))
+    from ray import serve
+
+    from ray_hive.core.gpu_registry import get_gpu_registry
+
+    registry = get_gpu_registry()
+    deployment = ray.get(registry.get_deployment.remote(model_id))
+    replica_ids = list(deployment["replicas"].keys()) if deployment else []
+
+    apps = serve.status().applications or {}
+    for app_name in (model_id, *replica_ids):
+        if app_name in apps:
+            serve.delete(name=app_name)
+
+    if replica_ids:
+        ray.get(registry.clear_replicas.remote(replica_ids))
+    ray.get(registry.release_deployment.remote(model_id))
 
 
 def kill_gpu_registry():

@@ -9,7 +9,7 @@ from vllm import LLM
 
 
 @serve.deployment(
-    ray_actor_options={"num_gpus": 0.01, "memory": 2 * 1024 * 1024 * 1024},
+    ray_actor_options={"num_gpus": 0, "memory": 2 * 1024 * 1024 * 1024},
     autoscaling_config=None,
     num_replicas=1,
     max_ongoing_requests=64,

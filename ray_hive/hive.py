@@ -56,8 +56,9 @@ class RayHive:
         gpu=None: place on one GPU if any fits; otherwise same-node TP (2, 3, ...).
         gpu=[a,b,...] + replicas=1: one same-node TP group.
         gpu=[a,b,...] + replicas=len(list): N single-GPU pins (one replica per GPU).
-        cpu_ram_per_instance: sole host-RAM extension arg — 0 off; -1 = 85% free VRAM;
-          >0 hard GiB. Weights stay on GPU if they fit; overflow spills to host; leftover → KV.
+        cpu_ram_per_instance: sole host-RAM extension arg — TP=1 only. 0 off; -1 = 50% of Ray's
+          memory resource on that host / replicas (spill/KV); >0 hard GiB per replica.
+          Weights stay on GPU if they fit; overflow spills to host; leftover → KV.
         """
         if idle_timeout != -1 and idle_timeout <= 0:
             raise ValueError("idle_timeout must be -1 (never) or a positive number of seconds")
@@ -95,6 +96,8 @@ class RayHive:
                 print(f"\nReplica: {replica_id}")
                 print(f"  GPU(s): {', '.join(gpu_keys)}")
                 print(f"  tensor_parallel_size: {tp}")
+                print(f"  weights_gb: {plan.get('weights_gb', 0):.2f}")
+                print(f"  weight_need_gb (per GPU): {plan.get('weight_need_gb', 0):.2f}")
                 print(f"  max_num_seqs: {plan['max_num_seqs']}")
                 print(f"  max_num_batched_tokens: {plan['max_num_batched_tokens']}")
                 print(f"  gpu_memory_utilization: {plan['gpu_memory_utilization']:.3f}")

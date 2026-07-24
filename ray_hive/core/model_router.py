@@ -113,7 +113,7 @@ class ModelRouter:
 
     async def _idle_watch(self):
         """Shutdown model after idle_timeout seconds with no inference."""
-        from ray_hive.core.deployment import get_deploy_service
+        from ray_hive.core.ray_utils.lifecycle import shutdown_model
 
         interval = min(5, self.idle_timeout)
         while not self._shutting_down:
@@ -121,7 +121,7 @@ class ModelRouter:
             if time.time() - self._last_activity < self.idle_timeout:
                 continue
             self._shutting_down = True
-            get_deploy_service().shutdown_model.remote(self.model_id)
+            await asyncio.to_thread(shutdown_model, self.model_id)
             return
 
 

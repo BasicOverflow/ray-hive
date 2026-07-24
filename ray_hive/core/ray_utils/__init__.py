@@ -1,5 +1,5 @@
 """
-Ray utility helpers — session, hardware, naming, placement, TP, lifecycle.
+Ray utility helpers — session, hardware, naming, placement, GPU selection, TP, lifecycle.
 
 Import from this package (``from ray_hive.core.ray_utils import sm_count``) or
 from the typed submodules (``from ray_hive.core.ray_utils.hardware import sm_count``).
@@ -7,8 +7,10 @@ from the typed submodules (``from ray_hive.core.ray_utils.hardware import sm_cou
 from .hardware import (
     approx_tdp,
     compute_cap,
+    count_by_host,
     filter_alive,
     gpu_inventory_lines,
+    host_memory_available_gb,
     is_node_alive,
     max_gpus_on_any_host,
     mem_bandwidth,
@@ -25,10 +27,10 @@ from .placement import (
     build_vram_reqs_for_tp,
     chunk_gpu_groups,
     fixed_non_kv_gb,
-    resolve_cpu_ram_budget,
-    resolve_cpu_spill,
-    resolve_pinned_gpu,
+    gpu_budget_frac,
+    replicas_per_host,
 )
+from .select_gpus import resolve_target_gpus
 from .session import StderrFilter, init_ray, suppress_ray_warnings
 from .tensor_parallel import assert_tp_shardable, tp_shardable
 
@@ -40,20 +42,22 @@ __all__ = [
     "build_vram_reqs_for_tp",
     "chunk_gpu_groups",
     "compute_cap",
+    "count_by_host",
     "deployment_name",
     "filter_alive",
     "fixed_non_kv_gb",
+    "gpu_budget_frac",
     "gpu_info_entry",
     "gpu_inventory_lines",
     "gpu_resource_name",
+    "host_memory_available_gb",
     "init_ray",
     "is_node_alive",
     "kill_gpu_registry",
     "max_gpus_on_any_host",
     "mem_bandwidth",
-    "resolve_cpu_ram_budget",
-    "resolve_cpu_spill",
-    "resolve_pinned_gpu",
+    "resolve_target_gpus",
+    "replicas_per_host",
     "shutdown_all",
     "shutdown_model",
     "sm_count",

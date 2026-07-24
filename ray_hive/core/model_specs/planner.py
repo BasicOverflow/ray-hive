@@ -81,16 +81,10 @@ def plan_deployment(
     """
     Solve inverse VRAM problem → vLLM deployment settings dict.
 
-    max_num_seqs and max_num_batched_tokens are estimated by default.
-    Either can be overridden independently; both can be set together.
-
-    vram_budget_gb is the caller's planning budget (typically available * 0.97,
-    or available * 0.80 when TP > 1) — GPU KV sizing uses that budget.
-    cpu_kv_offload_gb is engine-total CPU KV (vLLM kv_offloading_size); when TP>1
-    it is summed across ranks. Auto max_num_seqs uses GPU KV + cpu/tp_size.
-    cpu_weight_offload_gb is per-rank weight spill (vLLM cpu_offload_gb); subtracted
-    from on-GPU fixed non-KV so spilled weights do not consume the GPU budget.
-    Batched tokens and VRAM reservation stay GPU-only (activations never on CPU).
+    vram_budget_gb is typically available × gpu_budget_frac(tp_size).
+    cpu_kv_offload_gb / cpu_weight_offload_gb are TP=1 host extensions.
+    vLLM requires max_num_batched_tokens >= max_num_seqs. CPU KV that pushes
+    decode sampling scratch (3× float32 logits) past budget-frac slack raises.
     """
     available_vram_gb = vram_budget_gb
     assert available_vram_gb > 0, f"vram_budget_gb must be positive, got {available_vram_gb}"
@@ -122,10 +116,7 @@ def plan_deployment(
         max_num_seqs = max_num_seqs_override
         kv_cache_gb = vram_reqs.calc_kv_cache_gb(max_model_len, max_num_seqs)
         max_num_batched_tokens = estimate_max_num_batched_tokens(
-            vram_reqs,
-            input_len,
-            output_len,
-            kv_cache_gb,
+            vram_reqs, input_len, output_len, kv_cache_gb
         )
         non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
         total_vram_gb = non_kv_vram_gb + kv_cache_gb
@@ -138,17 +129,17 @@ def plan_deployment(
         )
         kv_cache_gb_est = available_vram_gb - fixed_on_gpu
         if kv_cache_gb_est <= 0:
+            fit_hint = "Need a larger GPU or larger same-node TP pin."
+            if vram_reqs.tp_size == 1:
+                fit_hint += " Or more cpu_ram_per_instance."
             raise ValueError(
                 f"Model does not fit in VRAM budget {available_vram_gb:.2f}GB: "
                 f"fixed non-KV on GPU is {fixed_on_gpu:.2f}GB "
                 f"(tp_size={vram_reqs.tp_size}, cpu_weight_offload={cpu_weight_offload_gb:.2f}GB). "
-                f"Need a larger GPU, larger same-node TP pin, or more cpu_ram_per_instance."
+                f"{fit_hint}"
             )
         max_num_batched_tokens = estimate_max_num_batched_tokens(
-            vram_reqs,
-            input_len,
-            output_len,
-            kv_cache_gb_est,
+            vram_reqs, input_len, output_len, kv_cache_gb_est
         )
         non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
         kv_cache_gb = available_vram_gb - non_kv_vram_gb
@@ -161,6 +152,33 @@ def plan_deployment(
             vram_reqs, max_model_len, kv_cache_gb + cpu_kv_per_gpu
         )
         total_vram_gb = non_kv_vram_gb + kv_cache_gb
+
+    if max_num_batched_tokens < max_num_seqs:
+        max_num_batched_tokens = max_num_seqs
+        non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
+        kv_cache_gb = available_vram_gb - non_kv_vram_gb
+        if kv_cache_gb <= 0:
+            raise ValueError(
+                f"Model does not fit after raising max_num_batched_tokens to {max_num_seqs}: "
+                f"budget {available_vram_gb:.2f}GB, non-KV {non_kv_vram_gb:.2f}GB"
+            )
+        total_vram_gb = non_kv_vram_gb + kv_cache_gb
+
+    if cpu_kv_offload_gb > 0:
+        # FlashInfer sample path keeps ~3x float32 [seqs, vocab] outside the KV pool.
+        scratch_gb = (
+            max_num_seqs * float(vram_reqs.hf_params["vocab_size"]) * 4.0 * 3 / (1024 ** 3)
+        )
+        slack_gb = live_total_vram_gb - available_vram_gb
+        if scratch_gb > slack_gb:
+            per_seq = float(vram_reqs.hf_params["vocab_size"]) * 4.0 * 3 / (1024 ** 3)
+            raise ValueError(
+                f"cpu_ram_per_instance concurrency is too high for this GPU to decode safely: "
+                f"max_num_seqs={max_num_seqs} needs {scratch_gb:.2f}GB sampling scratch, "
+                f"but budget-frac slack is only {slack_gb:.2f}GB "
+                f"(safe max_num_seqs<={int(slack_gb / per_seq)}). "
+                f"Use cpu_ram_per_instance=0, a smaller host budget, or a larger GPU."
+            )
 
     gpu_memory_utilization = total_vram_gb / live_total_vram_gb
     assert max_num_seqs >= 1 and max_num_batched_tokens >= 1

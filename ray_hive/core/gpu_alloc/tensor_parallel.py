@@ -43,8 +43,6 @@ class TensorParallelAllocator(BaseGpuAllocator):
                 group = list(combo)
                 avails = [g["available"] for _, g in group]
                 min_avail = min(avails)
-                if min_avail < min_vram_gb:
-                    continue
                 leftover = sum(a - min_avail for a in avails)
                 totals = [g["total"] for _, g in group]
                 total_spread = max(totals) - min(totals)
