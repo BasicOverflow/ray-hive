@@ -39,10 +39,10 @@ def main():
             print(f"  Available:  {info.get('available', 0):.2f} GB")
             print(f"  Pending:    {sum(info.get('pending', {}).values()):.2f} GB")
             print(f"  Active:     {sum(info.get('active', {}).values()):.2f} GB")
-            print("  PyCUDA specs:")
-            for name, value in sorted(info.get("specs", {}).items()):
-                print(f"    {name}: {value}")
-            print()
+            # print("  PyCUDA specs:")
+            # for name, value in sorted(info.get("specs", {}).items()):
+            #     print(f"    {name}: {value}")
+            # print()
 
         test_required = 5.0
         found = [k for k, v in state.items() if v.get("available", 0) >= test_required]

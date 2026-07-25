@@ -1,5 +1,5 @@
 """
-Ray Serve vLLM replica — one LLM engine pinned to a single GPU.
+Ray Serve vLLM replica — one LLM engine pinned to one or more GPUs (same-node TP).
 """
 import asyncio
 import os
@@ -9,18 +9,25 @@ from vllm import LLM
 
 
 @serve.deployment(
-    ray_actor_options={"num_gpus": 0.01, "memory": 2 * 1024 * 1024 * 1024},
+    ray_actor_options={"num_gpus": 0, "memory": 2 * 1024 * 1024 * 1024},
     autoscaling_config=None,
     num_replicas=1,
     max_ongoing_requests=64,
 )
 class RayLLMActor(LLM):
-    """Ray Serve replica — vLLM LLM engine pinned to one GPU."""
+    """Ray Serve replica — vLLM LLM engine on one GPU or a same-node TP group."""
 
     def __init__(self, model_id: str, target_gpu_id: str, engine_kwargs: dict):
-        """Pin to target GPU and initialize vLLM engine with pre-computed settings."""
+        """
+        Pin to target GPU id(s) and initialize vLLM.
+
+        target_gpu_id is a single local id ("0") or comma-separated ids ("0,1")
+        for tensor_parallel_size > 1. Serve still exposes one handle per replica.
+        """
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = target_gpu_id
+        if "," in target_gpu_id:
+            os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
         self.model_id = model_id
         self._infer_lock = None
         super().__init__(**engine_kwargs)

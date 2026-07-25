@@ -4,73 +4,22 @@ Deployment service — singleton Ray actor that serializes deploy/shutdown.
 DeployService runs the full per-model pipeline: HF config → planner → GPU
 selection → replica reservation → parallel RayLLMActor deploy → ModelRouter.
 """
-import time
-
 import ray
 from ray import serve
 
 from .gpu_registry import get_gpu_registry
-from .model_specs.planner import build_vram_reqs, plan_deployment
-from .ray_gpu_alloc import RayPerformanceAllocator
-
-
-def _gpu_resource_name(gpu_key: str) -> str:
-    """Return Ray custom resource name for a GPU key (node_gpuN)."""
-    node_name, gpu_id_str = gpu_key.split(":")
-    gpu_id = gpu_id_str.replace("gpu", "")
-    return f"{node_name}_gpu{gpu_id}"
-
-
-def _deployment_name(model_id: str, gpu_key: str) -> str:
-    """Return Serve app/deployment name for a model replica on a GPU."""
-    return f"{model_id}-{gpu_key.replace(':', '-').replace('_', '-')}"
-
-
-def _gpu_info_entry(gpu_key: str, gpu_info: dict) -> dict:
-    """Build scheduling info dict from a registry GPU view."""
-    return {
-        "gpu_key": gpu_key,
-        "resource_name": _gpu_resource_name(gpu_key),
-        "gpu_id": gpu_key.split(":")[1].replace("gpu", ""),
-        "total_gb": gpu_info["total"],
-        "free_gb": gpu_info["free"],
-        "available_gb": gpu_info["available"],
-    }
-
-
-def _resolve_pinned_gpu(gpu_map: dict, gpu_key: str, min_vram_gb: float) -> dict:
-    """Resolve an explicit GPU pin from the full registry (not the filtered eligible list)."""
-    if gpu_key not in gpu_map:
-        raise ValueError(f"GPU {gpu_key} not in registry. Known: {sorted(gpu_map)}")
-    gpu_info = gpu_map[gpu_key]
-    if gpu_info["available"] < min_vram_gb:
-        raise ValueError(
-            f"GPU {gpu_key} has {gpu_info['available']:.2f}GB available, "
-            f"need {min_vram_gb:.2f}GB for model weights"
-        )
-    return _gpu_info_entry(gpu_key, gpu_info)
-
-
-def _resolve_target_gpus(
-    gpu_map: dict,
-    replicas: int,
-    gpu,
-    min_vram_gb: float,
-    hf_params: dict,
-    vllm_kwargs: dict,
-    allocation_cls,
-) -> list[dict]:
-    """Pick target GPUs: explicit gpu= pins win; else run allocation_cls.select."""
-    if gpu is not None:
-        if isinstance(gpu, str):
-            return [_resolve_pinned_gpu(gpu_map, gpu, min_vram_gb)]
-        if isinstance(gpu, list):
-            return [_resolve_pinned_gpu(gpu_map, g, min_vram_gb) for g in gpu]
-        assert False, "gpu must be a string, list of strings, or None"
-
-    allocator_cls = allocation_cls or RayPerformanceAllocator
-    chosen = allocator_cls().select(gpu_map, replicas, min_vram_gb, hf_params, vllm_kwargs)
-    return [_gpu_info_entry(gpu_key, gpu_info) for gpu_key, gpu_info in chosen]
+from .gpu_alloc import assert_cpu_ram_tp_allowed, resolve_group_cpu_spill
+from .model_specs.planner import normalize_hf_config, plan_deployment
+from .ray_utils import (
+    assert_model_id_free,
+    chunk_gpu_groups,
+    deployment_name,
+    fixed_non_kv_gb,
+    gpu_budget_frac,
+    host_memory_available_gb,
+    replicas_per_host,
+    resolve_target_gpus,
+)
 
 
 @ray.remote(num_gpus=0.01)
@@ -94,19 +43,31 @@ def deploy_single(
     model_id: str,
     target_gpu_id: str,
     engine_kwargs: dict,
-    gpu_fraction: float,
-    resource_name: str,
+    resource_names: list[str],
     route_prefix: str,
+    memory_bytes: int,
 ):
     """Deploy one RayLLMActor replica on a GPU worker (imports vllm here only)."""
     from ray_hive.core.ray_llm_actor import RayLLMActor
 
+    resources = {name: 0.01 for name in resource_names}
+    # num_gpus>0 makes Ray remap CUDA_VISIBLE_DEVICES and breaks custom-resource pinning
+    # on multi-GPU nodes (wrong card → OOM / Serve "Failed to update"). Pin via CVD only.
+    env_vars = {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": target_gpu_id,
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+    }
+    if len(resource_names) > 1:
+        env_vars["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
     deployment = RayLLMActor.options(
         name=replica_id,
+        graceful_shutdown_timeout_s=0,
         ray_actor_options={
-            "num_gpus": gpu_fraction,
-            "memory": 2 * 1024 * 1024 * 1024,
-            "resources": {resource_name: 0.01},
+            "num_gpus": 0,
+            "memory": memory_bytes,
+            "resources": resources,
+            "runtime_env": {"env_vars": env_vars},
         },
         autoscaling_config=None,
         num_replicas=1,
@@ -130,6 +91,7 @@ def deploy_router(
 
     router = ModelRouter.options(
         name=f"{model_id}-router",
+        graceful_shutdown_timeout_s=0,
         autoscaling_config=None,
         num_replicas=1,
         ray_actor_options={"num_cpus": 0.1, "resources": {resource_name: 0.01}},
@@ -143,15 +105,6 @@ def deploy_router(
     )
     serve.run(router, name=model_id, route_prefix=f"/{model_id}")
     return True
-
-
-def _assert_model_id_free(model_id: str, registry) -> None:
-    """Reject model_id if already present in Serve or the GPU registry."""
-    apps = serve.status().applications or {}
-    if model_id in apps:
-        raise ValueError(f"model_id {model_id!r} already has a Serve application")
-    if ray.get(registry.has_deployment.remote(model_id)):
-        raise ValueError(f"model_id {model_id!r} already registered in gpu registry")
 
 
 @ray.remote(num_cpus=0)
@@ -177,29 +130,17 @@ class DeployService:
 
     def shutdown_model(self, model_id: str) -> dict:
         """Delete this model's router + replica apps and registry state (exact ids only)."""
-        registry = get_gpu_registry()
-        deployment = ray.get(registry.get_deployment.remote(model_id))
-        replica_ids = list(deployment["replicas"].keys()) if deployment else []
+        from ray_hive.core.ray_utils.lifecycle import shutdown_model as _shutdown_model
 
-        apps = serve.status().applications or {}
-        for app_name in (model_id, *replica_ids):
-            if app_name in apps:
-                serve.delete(name=app_name)
-
-        if replica_ids:
-            ray.get(registry.clear_replicas.remote(replica_ids))
-        ray.get(registry.release_deployment.remote(model_id))
-        time.sleep(3.0)
+        _shutdown_model(model_id)
         return {"model_id": model_id, "status": "shutdown"}
 
 
     def shutdown_all(self) -> dict:
         """Shutdown all Serve apps and clear registry state."""
-        if serve.status().applications:
-            serve.shutdown()
-        registry = get_gpu_registry()
-        ray.get(registry.clear_all.remote())
-        time.sleep(5.0)
+        from ray_hive.core.ray_utils.lifecycle import shutdown_all as _shutdown_all
+
+        _shutdown_all()
         return {"status": "shutdown_all"}
 
 
@@ -211,57 +152,83 @@ class DeployService:
         # Serve-frontend only — not valid on LLM()/EngineArgs; applied by ModelRouter.
         model_vllm_kwargs = dict(model_vllm_kwargs)
         chat_template_kwargs = model_vllm_kwargs.pop("default_chat_template_kwargs", None) or {}
+        model_vllm_kwargs.pop("tensor_parallel_size", None)
+        model_vllm_kwargs.pop("distributed_executor_backend", None)
+        model_vllm_kwargs.pop("kv_offloading_size", None)
+        model_vllm_kwargs.pop("kv_offloading_backend", None)
+        model_vllm_kwargs.pop("cpu_offload_gb", None)
 
         registry = get_gpu_registry()
-        _assert_model_id_free(model_id, registry)
+        assert_model_id_free(model_id, registry)
 
-        hf_params = ray.get(fetch_hf_config_dict.remote(config["name"]))
-        vram_reqs = build_vram_reqs(
-            hf_params,
-            attention_cls=config.get("attention_cls"),
-            **model_vllm_kwargs,
-        )
-
+        hf_params = normalize_hf_config(ray.get(fetch_hf_config_dict.remote(config["name"])))
         gpu_map = ray.get(registry.get_all_gpus.remote())
-        min_vram_gb = vram_reqs.calc_weights_gb()
-        target_gpus = _resolve_target_gpus(
+        cpu_ram_cfg = float(config.get("cpu_ram_per_instance") or 0)
+        tp_size, target_gpus, vram_reqs = resolve_target_gpus(
             gpu_map,
             config.get("replicas", -1),
             config.get("gpu"),
-            min_vram_gb,
             hf_params,
-            model_vllm_kwargs,
             config.get("allocation_cls"),
+            config.get("attention_cls"),
+            model_vllm_kwargs,
+            cpu_ram_cfg=cpu_ram_cfg,
         )
+        assert_cpu_ram_tp_allowed(tp_size, cpu_ram_cfg)
+        gpu_groups = chunk_gpu_groups(target_gpus, tp_size)
+        per_host = replicas_per_host(gpu_groups)
 
         max_model_len = config["max_input_prompt_length"] + config["max_output_prompt_length"]
-        swap_space = float(config.get("swap_space_per_instance") or 0)
         batched_tokens_override = config.get("max_num_batched_tokens")
         max_num_seqs_override = config.get("max_num_seqs")
+        weight_need = fixed_non_kv_gb(vram_reqs)
 
         replica_jobs = []
         gpu_mapping = {}
         replica_metadata = {}
         deployment_id = model_id
 
-        for gpu_info in target_gpus:
-            gpu_key = gpu_info["gpu_key"]
-            # available_gb is already free - pending. Loaded models show up in nvidia-smi
-            # free, so do not also subtract deployment used_vram (that double-counts).
-            vram_budget_gb = gpu_info["available_gb"] * 0.97
+        for group in gpu_groups:
+            gpu_keys = [g["gpu_key"] for g in group]
+            bottleneck = min(group, key=lambda g: g["available_gb"])
+            avail = min(g["available_gb"] for g in group)
+            host = group[0]["gpu_key"].split(":")[0]
+            if tp_size > 1:
+                per_gpu_budget = avail * gpu_budget_frac(tp_size)
+                cpu_ram = cpu_offload = kv_offload = 0.0
+                memory_bytes = 0
+            else:
+                per_gpu_budget, cpu_ram, cpu_offload, kv_offload, memory_bytes = resolve_group_cpu_spill(
+                    weight_need, avail, cpu_ram_cfg, host_memory_available_gb(host), per_host[host]
+                )
             plan = plan_deployment(
                 vram_reqs,
-                vram_budget_gb=vram_budget_gb,
-                live_total_vram_gb=gpu_info["total_gb"],
+                vram_budget_gb=per_gpu_budget,
+                live_total_vram_gb=bottleneck["total_gb"],
                 max_model_len=max_model_len,
                 input_len=config["max_input_prompt_length"],
                 output_len=config["max_output_prompt_length"],
                 max_num_batched_tokens_override=batched_tokens_override,
                 max_num_seqs_override=max_num_seqs_override,
+                cpu_kv_offload_gb=kv_offload,
+                cpu_weight_offload_gb=cpu_offload,
             )
+            plan = dict(plan)
+            plan["tensor_parallel_size"] = tp_size
+            plan["weights_gb"] = vram_reqs.calc_weights_gb() * tp_size
+            plan["weight_need_gb"] = weight_need
+            plan["cpu_ram_budget_gb"] = cpu_ram
 
-            replica_id = _deployment_name(model_id, gpu_key)
-            ray.get(registry.reserve_replica.remote(replica_id, gpu_key, plan["total_vram_gb"]))
+            replica_id = deployment_name(model_id, gpu_keys)
+            for gpu_info in group:
+                if gpu_info["available_gb"] < plan["total_vram_gb"]:
+                    raise ValueError(
+                        f"GPU {gpu_info['gpu_key']} has {gpu_info['available_gb']:.2f}GB available, "
+                        f"need {plan['total_vram_gb']:.2f}GB for TP plan"
+                    )
+                ray.get(registry.reserve_replica.remote(
+                    replica_id, gpu_info["gpu_key"], plan["total_vram_gb"]
+                ))
 
             engine_kwargs = {
                 "model": config["name"],
@@ -269,21 +236,28 @@ class DeployService:
                 "max_num_seqs": plan["max_num_seqs"],
                 "max_num_batched_tokens": plan["max_num_batched_tokens"],
                 "gpu_memory_utilization": plan["gpu_memory_utilization"],
-                "swap_space": swap_space,
                 "enforce_eager": False,
                 **model_vllm_kwargs,
             }
+            if kv_offload > 0:
+                engine_kwargs["kv_offloading_size"] = kv_offload
+                engine_kwargs["kv_offloading_backend"] = "native"
+            if cpu_offload > 0:
+                engine_kwargs["cpu_offload_gb"] = cpu_offload
+            if tp_size > 1:
+                engine_kwargs["tensor_parallel_size"] = tp_size
+                engine_kwargs["distributed_executor_backend"] = "mp"
 
-            gpu_fraction = max(0.01, round(plan["total_vram_gb"] / gpu_info["total_gb"], 2))
+            resource_names = [g["resource_name"] for g in group]
             replica_jobs.append({
                 "replica_id": replica_id,
                 "model_id": model_id,
-                "target_gpu_id": gpu_info["gpu_id"],
+                "target_gpu_id": ",".join(g["gpu_id"] for g in group),
                 "engine_kwargs": engine_kwargs,
-                "gpu_fraction": gpu_fraction,
-                "resource_name": gpu_info["resource_name"],
+                "resource_names": resource_names,
+                "memory_bytes": memory_bytes,
             })
-            gpu_mapping[replica_id] = gpu_key
+            gpu_mapping[replica_id] = gpu_keys
             replica_metadata[replica_id] = plan
 
         if not replica_jobs:
@@ -291,30 +265,46 @@ class DeployService:
 
         deploy_futures = []
         for job in replica_jobs:
-            replica_id = job["replica_id"]
-            future = deploy_single.options(resources={job["resource_name"]: 0.01}).remote(
-                replica_id,
+            resources = {name: 0.01 for name in job["resource_names"]}
+            deploy_futures.append(deploy_single.options(resources=resources).remote(
+                job["replica_id"],
                 job["model_id"],
                 job["target_gpu_id"],
                 job["engine_kwargs"],
-                job["gpu_fraction"],
-                job["resource_name"],
-                f"/{replica_id}",
-            )
-            deploy_futures.append(future)
-        ray.get(deploy_futures)
+                job["resource_names"],
+                f"/{job['replica_id']}",
+                job["memory_bytes"],
+            ))
+        try:
+            ray.get(deploy_futures)
+        except Exception:
+            for f in deploy_futures:
+                ray.cancel(f, force=True)
+            replica_ids = [job["replica_id"] for job in replica_jobs]
+            apps = serve.status().applications or {}
+            for app_name in replica_ids:
+                if app_name in apps:
+                    serve.delete(name=app_name)
+            ray.get(registry.clear_replicas.remote(replica_ids))
+            raise
 
         replica_gpu_vram_gb = {
-            replica_id: {gpu_mapping[replica_id]: replica_metadata[replica_id]["total_vram_gb"]}
+            replica_id: {
+                gpu_key: replica_metadata[replica_id]["total_vram_gb"]
+                for gpu_key in gpu_mapping[replica_id]
+            }
             for replica_id in replica_metadata
         }
-        ray.get(registry.reserve_deployment.remote(deployment_id, replica_gpu_vram_gb, deployment_type="model", model_id=model_id))
+        ray.get(registry.reserve_deployment.remote(
+            deployment_id, replica_gpu_vram_gb, deployment_type="model", model_id=model_id
+        ))
 
-        for replica_id in replica_metadata:
-            ray.get(registry.mark_initialized.remote(replica_id, gpu_mapping[replica_id]))
+        for replica_id, gpu_keys in gpu_mapping.items():
+            for gpu_key in gpu_keys:
+                ray.get(registry.mark_initialized.remote(replica_id, gpu_key))
 
         gpu_deployment_names = [job["replica_id"] for job in replica_jobs]
-        router_resource = replica_jobs[0]["resource_name"]
+        router_resource = replica_jobs[0]["resource_names"][0]
         ray.get(deploy_router.options(resources={router_resource: 0.01}).remote(
             model_id,
             config["name"],
@@ -326,7 +316,11 @@ class DeployService:
         ))
 
         return {
-            replica_id: {"plan": replica_metadata[replica_id], "gpu_key": gpu_mapping[replica_id]}
+            replica_id: {
+                "plan": replica_metadata[replica_id],
+                "gpu_key": gpu_mapping[replica_id][0] if len(gpu_mapping[replica_id]) == 1 else gpu_mapping[replica_id],
+                "gpu_keys": gpu_mapping[replica_id],
+            }
             for replica_id in gpu_deployment_names
         }
 

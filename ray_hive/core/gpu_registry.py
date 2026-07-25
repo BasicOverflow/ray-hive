@@ -28,26 +28,6 @@ class ClusterStateManager(ABC):
         """Return live GPU state for all GPUs."""
 
 
-    def used_vram_gb(self, gpu_key: str) -> float:
-        """Return total deployment-reserved VRAM on a GPU in GiB."""
-        total = 0.0
-        for deployment in self.deployments.values():
-            for replica in deployment["replicas"].values():
-                total += replica["gpu_vram_gb"].get(gpu_key, 0.0)
-        return total
-
-
-    def deployment_vram_gb(self, deployment_id: str, gpu_key: str | None = None) -> float:
-        """Return reserved VRAM for a deployment, optionally filtered to one GPU."""
-        deployment = self.deployments[deployment_id]
-        total = 0.0
-        for replica in deployment["replicas"].values():
-            for key, vram_gb in replica["gpu_vram_gb"].items():
-                if gpu_key is None or key == gpu_key:
-                    total += vram_gb
-        return total
-
-
     def _live_free_vram_gb(self) -> dict[str, float]:
         """Return per-GPU available VRAM from live registry state."""
         return {gpu_key: gpu["available"] for gpu_key, gpu in self.get_all_gpus().items()}
@@ -125,14 +105,6 @@ class ClusterStateManager(ABC):
     def get_deployment(self, deployment_id: str) -> dict | None:
         """Return deployment record or None."""
         return self.deployments.get(deployment_id)
-
-
-    def release_replica(self, deployment_id: str, replica_id: str):
-        """Remove one replica from a deployment; drop deployment if empty."""
-        deployment = self.deployments[deployment_id]
-        deployment["replicas"].pop(replica_id)
-        if not deployment["replicas"]:
-            self.deployments.pop(deployment_id)
 
 
 class VRAMAllocator(ClusterStateManager):
@@ -214,15 +186,6 @@ class VRAMAllocator(ClusterStateManager):
         gpu = self.gpus[gpu_key]
         if replica_id in gpu["pending"]:
             gpu["active"][replica_id] = gpu["pending"].pop(replica_id)
-
-
-    def release_replica_vram(self, replica_id: str, gpu_key: str):
-        """Release pending or active VRAM reservation for a replica."""
-        if gpu_key not in self.gpus:
-            return
-        gpu = self.gpus[gpu_key]
-        gpu["pending"].pop(replica_id, None)
-        gpu["active"].pop(replica_id, None)
 
 
     def get_gpu_vram(self, gpu_key: str) -> dict | None:

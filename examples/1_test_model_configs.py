@@ -1,4 +1,4 @@
-"""Deploy/inference configs — single GPU, all GPUs, and 2 replicas."""
+"""Deploy/inference configs — 2 pinned replicas, CPU RAM spill/KV, and all GPUs."""
 import os
 import sys
 import time
@@ -12,18 +12,20 @@ from ray_hive.inference import inference_batch
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
+scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=False)
+
+PIN_GPUS = ["ergos-06-nv:gpu0", "ergos-02-nv:gpu0"]
 
 deployments = [
     # {
-    #     "model_id": "qwen-single-gpu",
-    #     "description": "Single GPU",
+    #     "model_id": "qwen-two-replicas",
+    #     "description": "replicas=2 (pinned)",
     #     "config": {
-    #         # "gpu": "ergos-06-nv:gpu0", # pin to specific GPU
     #         "model_name": "Qwen/Qwen3-0.6B-FP8",
     #         "max_input_prompt_length": 1024,
     #         "max_output_prompt_length": 2048,
-    #         "replicas": 1,
+    #         "replicas": 2,
+    #         "gpu": PIN_GPUS,
     #         "allocation_cls": RayPerformanceAllocator,
     #         "trust_remote_code": True,
     #         "reasoning_parser": "qwen3",
@@ -31,15 +33,16 @@ deployments = [
     #     },
     # },
     # {
-    #     "model_id": "qwen-two-replicas",
-    #     "description": "replicas=2",
+    #     "model_id": "qwen-cpu-ram",
+    #     "description": "replicas=2 + cpu_ram_per_instance=4",
     #     "config": {
     #         "model_name": "Qwen/Qwen3-0.6B-FP8",
     #         "max_input_prompt_length": 1024,
     #         "max_output_prompt_length": 2048,
-    #         # "replicas": 2,
-    #         "gpu":["ergos-06-nv:gpu0", "ergos-02-nv:gpu0"],
+    #         "replicas": 2,
+    #         "gpu": PIN_GPUS,
     #         "allocation_cls": RayPerformanceAllocator,
+    #         "cpu_ram_per_instance": 4,
     #         "trust_remote_code": True,
     #         "reasoning_parser": "qwen3",
     #         "default_chat_template_kwargs": {"enable_thinking": False},
@@ -50,11 +53,10 @@ deployments = [
         "description": "replicas=-1 (all eligible GPUs)",
         "config": {
             "model_name": "Qwen/Qwen3-0.6B-FP8",
-            "max_input_prompt_length": 1024,
-            "max_output_prompt_length": 2048,
+            "max_input_prompt_length": 24,
+            "max_output_prompt_length": 100,
             "replicas": -1,
-            # RayPerformanceAllocator is the default; shown explicitly here
-            "allocation_cls": RayPerformanceAllocator,
+            "cpu_ram_per_instance": -1,
             # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)
             "trust_remote_code": True,
             "reasoning_parser": "qwen3",
@@ -64,7 +66,7 @@ deployments = [
 ]
 
 prompt = "Write a short poem about beer"
-amount = 1_000
+amount = 10_000
 prompts = [f"{prompt} {i}" for i in range(amount)]
 # Qwen3 non-thinking sampling (model card / deploy docs)
 sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)

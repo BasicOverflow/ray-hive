@@ -4,8 +4,9 @@ Attention specs for KV-cache sizing and finding optimal max concurrent sequences
 These classes read Hugging Face config fields and compute KV bytes per token,
 bytes per sequence, and max sequences for a given KV budget. BaseAttentionSpecs
 covers standard transformer attention; subclasses override KV heads, KV layers,
-sequence length, or tensor-parallel per-GPU sizing. Downstream VRAM calculators
-use them after weights, overhead, and other non-KV memory are accounted for.
+or sequence length. Downstream VRAM calculators use them after weights, overhead,
+and other non-KV memory are accounted for. Tensor-parallel per-GPU sharding is
+applied in VramReqs (tp_size), not in attention classes.
 
 NOTE: Standard KV formula will always be upper bound compared to more efficient attentions,
 so if custom KV calculation not provided for given model, it will default to standard KV formula.
@@ -122,19 +123,3 @@ class BaseAttentionSpecs(ABC):
         bytes_per_seq = self.kv_bytes_per_sequence(max_model_len)
         assert bytes_per_seq > 0, "bytes_per_seq must be positive"
         return max(1, math.floor(kv_budget_bytes / bytes_per_seq))
-
-
-# If later want per-GPU KV calculations for tensor parallel models
-class TensorParallelAttentionSpecs(BaseAttentionSpecs):
-    """KV cache calculator for per-GPU tensor parallel usage."""
-
-    def __init__(self, tp_size: int, **kwargs):
-        """Store tensor parallel size and attention config."""
-        super().__init__(**kwargs)
-        assert tp_size > 0, f"tp_size must be positive, got {tp_size}"
-        self.tp_size = tp_size
-
-
-    def kv_bytes_per_token(self) -> float:
-        """Return per-GPU KV cache bytes needed per token."""
-        return super().kv_bytes_per_token() / self.tp_size

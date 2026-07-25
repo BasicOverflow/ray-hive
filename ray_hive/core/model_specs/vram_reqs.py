@@ -6,7 +6,7 @@ This module separates VRAM into:
 - model weights
 - KV cache (via AttentionSpecs)
 - activations (depends on batched tokens)
-- model-specific runtime overhead (MoE, hybrid models, speculative decoding, etc.)
+- model-specific runtime overhead (MoE, hybrid models, etc.)
 
 Designed to work with vLLM-style inference systems where KV cache is dynamically
 allocated from a pre-reserved memory pool.
@@ -25,14 +25,14 @@ class BaseVramReqs(ABC):
 
     def __init__(
         self,
-        speculative_decoding_enabled: bool = False,
         kv_cache_dtype_bytes: float | None = None,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
+        tensor_parallel_size: int = 1,
         **hf_params: Any,
     ):
         """Store HF config and build the attention specs calculator."""
         self.hf_params = hf_params
-        self.speculative_decoding_enabled = speculative_decoding_enabled
+        self.tp_size = max(1, int(tensor_parallel_size))
 
         if kv_cache_dtype_bytes is None:
             kv_cache_dtype_bytes = 1
@@ -71,13 +71,26 @@ class BaseVramReqs(ABC):
 
     def _param_dtype_bytes(self) -> float:
         """Return model parameter dtype size in bytes."""
-        # Override for mixed precision or selective quantization.
-        return self._dtype_bytes("torch_dtype", "dtype")
-
-
-    def _kv_dtype_bytes(self) -> float:
-        """Return KV cache dtype size in bytes."""
-        return self.attention.kv_bytes_per_element
+        # FP8 HF checkpoints often keep torch_dtype=bfloat16 while weights are fp8.
+        quant = self.hf_params.get("quantization_config")
+        if isinstance(quant, dict):
+            for key in ("quant_method", "fmt", "bits"):
+                val = quant.get(key)
+                if val is not None and ("fp8" in str(val).lower() or "float8" in str(val).lower()):
+                    return 1.0
+        for key in ("quantization",):
+            val = self.hf_params.get(key)
+            if val is not None and ("fp8" in str(val).lower() or "float8" in str(val).lower()):
+                return 1.0
+        # Explicit vLLM dtype= wins over HF torch_dtype.
+        explicit = self.hf_params.get("dtype")
+        if explicit is not None and str(explicit).lower() not in ("auto",):
+            return self._dtype_bytes("dtype", default=2)
+        # HF often labels float32 while vLLM dtype=auto loads fp16/bf16 for inference.
+        torch_dtype = str(self.hf_params.get("torch_dtype", "")).lower().split(".")[-1]
+        if torch_dtype in ("float32", "fp32", "float"):
+            return 2.0
+        return self._dtype_bytes("torch_dtype", "dtype", default=2)
 
 
     def _activation_dtype_bytes(self) -> float:
@@ -92,39 +105,66 @@ class BaseVramReqs(ABC):
     def calc_system_overhead_gb(self) -> float:
         """
         Default runtime overhead (CUDA, driver, NCCL, vLLM runtime).
+
+        When tensor_parallel_size > 1, add a coarse per-GPU NCCL/TP allowance
+        (not an exact NCCL formula — leave headroom in the deploy budget too).
         """
-        return 0.25
+        base = 0.25
+        if self.tp_size > 1:
+            base += 0.5
+        return base
 
     def calc_weights_gb(self) -> float:
         """
-        HF-derived dense transformer weight estimate.
-        Override for MoE, unusual projections, shared weights, or non-SwiGLU MLP blocks.
-        """
+        HF-derived weight estimate (per GPU when TP > 1).
 
+        Dense transformers: every layer is attn + MLP.
+        hybrid_override_pattern (NemotronH): per-char layer type —
+        '*' attention, '-' MLP, 'M' Mamba-2 — so we do not count attn+MLP on every layer.
+        """
         hidden = self._hf("hidden_size")
-        layers = self._hf("num_hidden_layers")
         vocab = self._hf("vocab_size")
         intermediate = self._hf("intermediate_size")
 
-        # Attention projections: Q + K + V + output.
-        # Uses attention specs so GQA/MQA reduce K/V params while MHA stays 4 * hidden^2.
         kv_width = self.attention.kv_heads * self.attention.head_dim
         attn = (2 * hidden * hidden) + (2 * hidden * kv_width)
 
-        # SwiGLU-style MLP (gate + up + down), common in modern decoder LLMs.
-        # Override for GELU MLPs, fused/shared gate/up projections, or MoE blocks.
-        mlp = 3 * hidden * intermediate
+        act = str(
+            self.hf_params.get("mlp_hidden_act")
+            or self.hf_params.get("hidden_act", "silu")
+        ).lower()
+        if act in ("gelu", "gelu_new", "gelu_pytorch_tanh", "gelu_fast", "relu", "relu2", "tanh"):
+            mlp = 2 * hidden * intermediate
+        else:
+            mlp = 3 * hidden * intermediate
 
-        # embeddings + optional untied LM head
-        # Override for partial tying, output projection reuse, or learned positional embeddings.
         embed_factor = 1 if self.hf_params.get("tie_word_embeddings") else 2
         embed = embed_factor * vocab * hidden
 
-        # Norms and biases are omitted here; override if those small systematic terms matter.
-        params = layers * (attn + mlp) + embed
+        pattern = self.hf_params.get("hybrid_override_pattern")
+        if isinstance(pattern, str) and pattern:
+            d_inner = int(self.hf_params.get("mamba_num_heads", 0)) * int(
+                self.hf_params.get("mamba_head_dim", 0)
+            )
+            if d_inner <= 0:
+                d_inner = int(self.hf_params.get("expand", 2)) * hidden
+            d_conv = int(self.hf_params.get("conv_kernel", 4))
+            # in_proj (~2*d_inner) + out_proj + depthwise conv — coarse Mamba-2 block size
+            mamba = 3 * hidden * d_inner + d_inner * d_conv
+            params = embed
+            for ch in pattern:
+                if ch == "*":
+                    params += attn
+                elif ch == "-":
+                    params += mlp
+                elif ch == "M":
+                    params += mamba
+        else:
+            layers = self._hf("num_hidden_layers")
+            params = layers * (attn + mlp) + embed
 
         bytes_per_param = self._param_dtype_bytes()
-        return (params * bytes_per_param) / (1024 ** 3)
+        return (params * bytes_per_param) / (1024 ** 3) / self.tp_size
 
     def calc_misc_vram_gb(self) -> float:
         """
@@ -174,14 +214,14 @@ class BaseVramReqs(ABC):
     # ------------------------------------------------------------
 
     def calc_kv_cache_gb(self, max_model_len: int, max_num_seqs: int) -> float:
-        """Return KV cache VRAM in GiB for max_model_len and max_num_seqs."""
+        """Return per-GPU KV cache VRAM in GiB for max_model_len and max_num_seqs."""
         # Correctness for hybrid, sliding-window, or partial-KV models belongs in AttentionSpecs.
         bytes_total = (
             self.attention.kv_bytes_per_sequence(max_model_len)
             * max_num_seqs
         )
 
-        return bytes_total / (1024 ** 3)
+        return bytes_total / (1024 ** 3) / self.tp_size
 
     # ------------------------------------------------------------
     # TOTAL MEMORY
@@ -195,62 +235,3 @@ class BaseVramReqs(ABC):
             + self.calc_misc_vram_gb()
             + self.calc_activation_gb(max_num_batched_tokens)
         )
-
-    def calc_total_gb(
-        self,
-        max_model_len: int,
-        max_num_seqs: int,
-        max_num_batched_tokens: int
-    ) -> float:
-        """Return total estimated VRAM in GiB for given deployment limits."""
-        return (
-            self.calc_non_kv_vram_gb(max_num_batched_tokens)
-            + self.calc_kv_cache_gb(max_model_len, max_num_seqs)
-        )
-
-
-# ============================================================
-# QWEN 3.5
-# ============================================================
-
-class Qwen35_SmallVarient_VramReqs(BaseVramReqs):
-    """
-    VRAM estimator for the Qwen3.5 Small (~0.8B) model.
-    """
-
-    # Published parameter count
-    PARAM_COUNT = 800_000_000
-
-    def calc_system_overhead_gb(self) -> float:
-        """Return Qwen3.5 system overhead in GiB."""
-        return 0.25
-
-    def calc_weights_gb(self) -> float:
-        """Return Qwen3.5 weight VRAM from published parameter count."""
-        bytes_per_param = self._param_dtype_bytes()
-        return (
-            self.PARAM_COUNT * bytes_per_param
-        ) / (1024 ** 3)
-
-    def calc_misc_vram_gb(self) -> float:
-        """Return Qwen3.5 kernel workspace and speculative decoding overhead."""
-        hidden = self._hf("hidden_size")
-        layers = self._hf("num_hidden_layers")
-
-        # conservative kernel workspace estimate
-        workspace = (
-            hidden * layers * 2
-        ) / (1024 ** 3) * 0.03
-
-        misc = workspace
-
-        # speculative decoding overhead
-        if self.speculative_decoding_enabled:
-            misc += self.calc_weights_gb() * 0.10
-
-        misc += super().calc_misc_vram_gb()
-
-        return misc
-
-
-Qwen35VramReqs = Qwen35_SmallVarient_VramReqs
