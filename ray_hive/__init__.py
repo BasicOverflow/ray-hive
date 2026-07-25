@@ -7,6 +7,7 @@ from .inference import (
     a_inference,
     inference_batch,
     a_inference_batch,
+    inference_stream,
 )
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "a_inference",
     "inference_batch",
     "a_inference_batch",
+    "inference_stream",
     "DeployService",
     "get_deploy_service",
     "VRAMAllocator",

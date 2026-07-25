@@ -1,11 +1,15 @@
 """
-Ray Serve vLLM replica — one LLM engine pinned to one or more GPUs (same-node TP).
+Ray Serve vLLM replica — AsyncLLM engine pinned to one or more GPUs (same-node TP).
 """
 import asyncio
 import os
+import uuid
 
 from ray import serve
-from vllm import LLM
+from vllm import SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.sampling_params import RequestOutputKind
+from vllm.v1.engine.async_llm import AsyncLLM
 
 
 @serve.deployment(
@@ -14,12 +18,12 @@ from vllm import LLM
     num_replicas=1,
     max_ongoing_requests=64,
 )
-class RayLLMActor(LLM):
-    """Ray Serve replica — vLLM LLM engine on one GPU or a same-node TP group."""
+class RayLLMActor:
+    """Ray Serve replica — vLLM AsyncLLM on one GPU or a same-node TP group."""
 
-    def __init__(self, model_id: str, target_gpu_id: str, engine_kwargs: dict):
+    async def __init__(self, model_id: str, target_gpu_id: str, engine_kwargs: dict):
         """
-        Pin to target GPU id(s) and initialize vLLM.
+        Pin to target GPU id(s) and initialize AsyncLLM.
 
         target_gpu_id is a single local id ("0") or comma-separated ids ("0,1")
         for tensor_parallel_size > 1. Serve still exposes one handle per replica.
@@ -29,28 +33,72 @@ class RayLLMActor(LLM):
         if "," in target_gpu_id:
             os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
         self.model_id = model_id
-        self._infer_lock = None
-        super().__init__(**engine_kwargs)
+        # Build on Serve's running loop so AsyncLLM's output_handler attaches correctly.
+        self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_kwargs))
 
 
-    def _lock(self) -> asyncio.Lock:
-        """Lazily bind the infer lock to the replica's running event loop."""
-        if self._infer_lock is None:
-            self._infer_lock = asyncio.Lock()
-        return self._infer_lock
+    def _params(self, sampling_params, kind: RequestOutputKind) -> SamplingParams:
+        """Clone (or default) sampling params with the given output_kind."""
+        if sampling_params is None:
+            return SamplingParams(output_kind=kind)
+        params = sampling_params.clone()
+        params.output_kind = kind
+        return params
+
+
+    async def _generate_one(self, prompt: str, sampling_params: SamplingParams):
+        """Run one prompt to completion; return the final RequestOutput."""
+        final = None
+        async for output in self.engine.generate(
+            prompt,
+            sampling_params,
+            request_id=uuid.uuid4().hex,
+        ):
+            final = output
+            if output.finished:
+                break
+        return final
 
 
     async def generate(self, prompts, sampling_params=None):
-        """Serve-callable generate — offload blocking vLLM onto a worker thread."""
-        async with self._lock():
-            return await asyncio.to_thread(
-                super().generate, prompts, sampling_params=sampling_params
-            )
+        """Full-result generate (FINAL_ONLY) — continuous-batches concurrent prompts."""
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        params = self._params(sampling_params, RequestOutputKind.FINAL_ONLY)
+        return list(await asyncio.gather(*[
+            self._generate_one(prompt, params) for prompt in prompts
+        ]))
 
 
     async def chat(self, messages, sampling_params=None):
-        """Serve-callable chat — offload blocking vLLM onto a worker thread."""
-        async with self._lock():
-            return await asyncio.to_thread(
-                super().chat, messages, sampling_params=sampling_params
+        """Full-result chat via tokenizer chat template + generate."""
+        if messages and isinstance(messages[0], dict):
+            conversations = [messages]
+        else:
+            conversations = list(messages)
+        tokenizer = self.engine.get_tokenizer()
+        prompts = [
+            tokenizer.apply_chat_template(
+                conv,
+                tokenize=False,
+                add_generation_prompt=True,
             )
+            for conv in conversations
+        ]
+        return await self.generate(prompts, sampling_params)
+
+
+    async def generate_stream(self, prompt: str, sampling_params=None):
+        """Yield text deltas (DELTA) for a single prompt until finished."""
+        params = self._params(sampling_params, RequestOutputKind.DELTA)
+        async for output in self.engine.generate(
+            prompt,
+            params,
+            request_id=uuid.uuid4().hex,
+        ):
+            if output.outputs:
+                text = output.outputs[0].text
+                if text:
+                    yield text
+            if output.finished:
+                break

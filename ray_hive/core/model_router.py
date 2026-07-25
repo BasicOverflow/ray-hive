@@ -5,11 +5,13 @@ Exposes /v1/models, /v1/chat/completions, /v1/completions on the router
 deployment. Programmatic inference goes through infer() → replica handle.
 """
 import asyncio
+import json
 import time
 import uuid
-from typing import Literal, Union
+from typing import AsyncIterator, Literal, Union
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from ray import serve
 from transformers import AutoTokenizer
@@ -278,6 +280,35 @@ class ModelRouter:
         )
 
 
+    async def _route_stream(self, prompt: str, sampling_params: SamplingParams) -> AsyncIterator[str]:
+        """Stream text deltas from the least-loaded replica."""
+        replica_name = self._select_replica()
+        self._queue_depth[replica_name] += 1
+        try:
+            handle = self._get_handles()[replica_name].options(stream=True)
+            async for delta in handle.generate_stream.remote(prompt, sampling_params):
+                yield delta
+        finally:
+            self._queue_depth[replica_name] = max(0, self._queue_depth[replica_name] - 1)
+
+
+    def _chat_prompt(self, messages) -> str:
+        """Apply chat template to messages."""
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **self.chat_template_kwargs,
+        )
+
+
+    def _sse(self, payload: dict | str) -> str:
+        """Format one SSE data line (dict → JSON, or raw string like [DONE])."""
+        if isinstance(payload, str):
+            return f"data: {payload}\n\n"
+        return f"data: {json.dumps(payload)}\n\n"
+
+
     def _openai_chat_response(self, text: str, prompt: str) -> dict:
         """Build OpenAI chat completion response dict."""
         prompt_tokens = len(self.tokenizer.encode(prompt, add_special_tokens=False))
@@ -316,14 +347,57 @@ class ModelRouter:
         return {"id": self.model_id, "object": "model", "owned_by": "ray-hive"}
 
 
+    async def _openai_chat_stream(self, prompt: str, sampling_params: SamplingParams):
+        """Yield OpenAI chat.completion.chunk SSE frames then [DONE]."""
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        async for delta in self._route_stream(prompt, sampling_params):
+            yield self._sse({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "model": self.model_id,
+                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            })
+        yield self._sse({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "model": self.model_id,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        })
+        yield self._sse("[DONE]")
+
+
+    async def _openai_completion_stream(self, prompt: str, sampling_params: SamplingParams):
+        """Yield OpenAI text_completion SSE frames then [DONE]."""
+        chunk_id = f"cmpl-{uuid.uuid4().hex}"
+        async for delta in self._route_stream(prompt, sampling_params):
+            yield self._sse({
+                "id": chunk_id,
+                "object": "text_completion",
+                "model": self.model_id,
+                "choices": [{"index": 0, "text": delta, "finish_reason": None}],
+            })
+        yield self._sse({
+            "id": chunk_id,
+            "object": "text_completion",
+            "model": self.model_id,
+            "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+        })
+        yield self._sse("[DONE]")
+
+
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: ChatCompletionRequest):
         """OpenAI-compatible chat completions endpoint (text-only)."""
         self._touch()
-        if request.stream:
-            raise HTTPException(status_code=400, detail="stream=true not supported yet")
         messages = self._to_chat_messages(request.messages)
         extra = request.model_dump(exclude={"model", "messages", "max_tokens", "temperature", "stream"})
+        params = self._sampling_params(request.max_tokens, request.temperature, extra)
+        if request.stream:
+            prompt = self._chat_prompt(messages)
+            return StreamingResponse(
+                self._openai_chat_stream(prompt, params),
+                media_type="text/event-stream",
+            )
         outputs = await self._route_chat(messages, request.max_tokens, request.temperature, extra)
         text = self._extract_texts(outputs)[0] if outputs else ""
         prompt = outputs[0].prompt if outputs else ""
@@ -334,10 +408,14 @@ class ModelRouter:
     async def completions(self, request: CompletionRequest):
         """OpenAI-compatible text completions endpoint."""
         self._touch()
-        if request.stream:
-            raise HTTPException(status_code=400, detail="stream=true not supported yet")
         prompt = request.prompt if isinstance(request.prompt, str) else "\n".join(request.prompt)
         extra = request.model_dump(exclude={"model", "prompt", "max_tokens", "temperature", "stream"})
+        params = self._sampling_params(request.max_tokens, request.temperature, extra)
+        if request.stream:
+            return StreamingResponse(
+                self._openai_completion_stream(prompt, params),
+                media_type="text/event-stream",
+            )
         results = await self._route_text(prompt, request.max_tokens, request.temperature, extra)
         text = results[0] if results else ""
         return self._openai_completion_response(text, prompt)
