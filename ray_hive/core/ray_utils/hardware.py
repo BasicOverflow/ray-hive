@@ -97,12 +97,13 @@ def is_node_alive(hostname: str) -> bool:
 
 
 def host_memory_available_gb(hostname: str) -> float:
-    """Ray logical memory capacity (GiB) for a registry hostname."""
+    """Ray logical memory still free (GiB) for a registry hostname."""
     for node in ray.nodes():
         if not node.get("Alive") or not _node_matches_hostname(node, hostname):
             continue
-        # Ray advertises memory in bytes on the node resource map.
-        return float((node.get("Resources") or {}).get("memory", 0)) / (1024 ** 3)
+        # Prefer currently free memory; fall back to capacity.
+        resources = node.get("AvailableResources") or node.get("Resources") or {}
+        return float(resources.get("memory", 0)) / (1024 ** 3)
     return 0.0
 
 

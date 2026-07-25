@@ -12,13 +12,12 @@ Designed to work with vLLM-style inference systems where KV cache is dynamically
 allocated from a pre-reserved memory pool.
 """
 
-from abc import ABC
 from typing import Any, Optional, Type
 
 from .attention import BaseAttentionSpecs
 
 
-class BaseVramReqs(ABC):
+class BaseVramReqs:
     """
     Base calculator for model VRAM requirements.
     """
@@ -32,7 +31,7 @@ class BaseVramReqs(ABC):
     ):
         """Store HF config and build the attention specs calculator."""
         self.hf_params = hf_params
-        self.tp_size = max(1, int(tensor_parallel_size))
+        self.tp_size = int(tensor_parallel_size)
 
         if kv_cache_dtype_bytes is None:
             kv_cache_dtype_bytes = 1
@@ -91,12 +90,6 @@ class BaseVramReqs(ABC):
         if torch_dtype in ("float32", "fp32", "float"):
             return 2.0
         return self._dtype_bytes("torch_dtype", "dtype", default=2)
-
-
-    def _activation_dtype_bytes(self) -> float:
-        """Return activation dtype size in bytes."""
-        # Override if runtime kernels use activation precision different from model weights.
-        return self._param_dtype_bytes()
 
     # ------------------------------------------------------------
     # CORE VRAM COMPONENTS
@@ -195,7 +188,7 @@ class BaseVramReqs(ABC):
         """
 
         hidden_size = self._hf("hidden_size")
-        bytes_per_element = self._activation_dtype_bytes()
+        bytes_per_element = self._param_dtype_bytes()
 
         # Represents fused QKV + MLP + residual buffers in vLLM-style kernels.
         activation_peak_multiplier = 1.5

@@ -13,12 +13,13 @@ from ray_hive.core.ray_gpu_alloc import (
     RayPerformanceAllocator,
 )
 from ray_hive.inference import inference_batch
-from ray_hive.core.ray_utils import approx_tdp, compute_cap, sm_count
+from ray_hive.core.ray_utils import approx_tdp, compute_cap, info, sm_count, success
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 MODEL_NAME = "Qwen/Qwen3-0.6B-FP8"
 REPLICAS = 2
+MAX_IN, MAX_OUT = 1024, 2048
 PROMPTS = [f"Write a short poem about beer {i}" for i in range(50)]
 
 policies = [
@@ -42,9 +43,16 @@ policies = [
 scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 gpu_map = scheduler.get_vram_state()
 
-print("Cluster GPUs (allocation inputs):")
+scheduler.estimate_vram(
+    MODEL_NAME,
+    max_num_seqs=32,
+    max_input_prompt_length=MAX_IN,
+    max_output_prompt_length=MAX_OUT,
+)
+
+info("Cluster GPUs (allocation inputs):")
 for gpu_key, gpu in sorted(gpu_map.items()):
-    print(
+    info(
         f"  {gpu_key}: avail={gpu.get('available', 0):.1f}GB  "
         f"sm={sm_count(gpu)}  cap={compute_cap(gpu)}  "
         f"tdp~{approx_tdp(gpu):.0f}W  name={gpu.get('specs', {}).get('name', '?')}"
@@ -52,23 +60,23 @@ for gpu_key, gpu in sorted(gpu_map.items()):
 
 # HF FP8 checkpoints set quantization_config.quant_method=fp8 — same signal deploy uses.
 fp8_hf = {"quantization_config": {"quant_method": "fp8"}}
-print(f"\nSelect preview (replicas={REPLICAS}):")
+info(f"Select preview (replicas={REPLICAS}):")
 for policy in policies:
     allocator = policy["allocation_cls"]()
     hf = fp8_hf if policy["allocation_cls"] is RayFp8Allocator else {}
     chosen = allocator.select(gpu_map, REPLICAS, 0.5, hf, {})
-    print(f"  {policy['allocation_cls'].__name__}: {[k for k, _ in chosen]}")
+    info(f"  {policy['allocation_cls'].__name__}: {[k for k, _ in chosen]}")
 
-print("\nNote: RayTensorParallelAllocator is covered in examples/5_tensor_parallel.py.")
+info("Note: RayTensorParallelAllocator is covered in examples/5_tensor_parallel.py.")
 
 for idx, policy in enumerate(policies):
     model_id = policy["model_id"]
-    print(f"\n=== {policy['description']} ({model_id}) ===")
+    info(f"{policy['description']} ({model_id})")
     scheduler.deploy_model(
         model_id=model_id,
         model_name=MODEL_NAME,
-        max_input_prompt_length=1024,
-        max_output_prompt_length=2048,
+        max_input_prompt_length=MAX_IN,
+        max_output_prompt_length=MAX_OUT,
         replicas=REPLICAS,
         allocation_cls=policy["allocation_cls"],
         # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)
@@ -86,7 +94,7 @@ for idx, policy in enumerate(policies):
     start = time.time()
     results = inference_batch(PROMPTS, model_id=model_id, **sample_kwargs)
     elapsed = time.time() - start
-    print(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results) / elapsed:.2f} req/s)")
+    success(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results) / elapsed:.2f} req/s)")
 
     scheduler.shutdown(model_id)
     if idx < len(policies) - 1:

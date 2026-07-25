@@ -4,3 +4,4 @@ ray[serve]==2.56.0
 vllm
 pydantic>=2.0.0
 transformers
+rich

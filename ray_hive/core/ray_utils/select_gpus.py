@@ -1,5 +1,5 @@
 """Resolve target GPUs + TP size for a deploy (pins and auto allocation)."""
-from ray_hive.core.gpu_alloc import assert_cpu_ram_tp_allowed, on_gpu_weight_need_gb
+from ray_hive.core.gpu_alloc import on_gpu_weight_need_gb
 from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator, RayTensorParallelAllocator
 
 from .hardware import count_by_host, gpu_inventory_lines, host_memory_available_gb, max_gpus_on_any_host
@@ -77,10 +77,8 @@ def _pin_single(gpu_map, gpu_key, hf_params, attention_cls, model_vllm_kwargs, c
     tp_size = 1
     vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
     weight_need = fixed_non_kv_gb(vram_reqs)
-    if gpu_key not in gpu_map:
-        raise ValueError(f"GPU {gpu_key} not in registry. Known: {sorted(gpu_map)}")
-    avail = float(gpu_map[gpu_key]["available"])
     host = gpu_key.split(":")[0]
+    avail = _resolve_pinned_gpu(gpu_map, gpu_key, 0)["available_gb"]
     need = on_gpu_weight_need_gb(
         weight_need, avail, cpu_ram_cfg, host_memory_available_gb(host), 1
     )
@@ -94,10 +92,8 @@ def _pin_multi_tp1(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwarg
     host_counts = count_by_host(gpu_keys)
     resolved = []
     for g in gpu_keys:
-        if g not in gpu_map:
-            raise ValueError(f"GPU {g} not in registry. Known: {sorted(gpu_map)}")
-        avail = float(gpu_map[g]["available"])
         host = g.split(":")[0]
+        avail = _resolve_pinned_gpu(gpu_map, g, 0)["available_gb"]
         need = on_gpu_weight_need_gb(
             weight_need, avail, cpu_ram_cfg, host_memory_available_gb(host), host_counts[host]
         )
@@ -107,16 +103,12 @@ def _pin_multi_tp1(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwarg
 
 def _pin_tp_group(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg):
     tp_size = len(gpu_keys)
-    assert_cpu_ram_tp_allowed(tp_size, cpu_ram_cfg)
     hosts = {g.split(":")[0] for g in gpu_keys}
     if len(hosts) != 1:
         raise ValueError(f"Same-node TP only — pinned GPUs span hosts {sorted(hosts)}")
     assert_tp_shardable(hf_params, tp_size)
     vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
     weight_need = fixed_non_kv_gb(vram_reqs)
-    for g in gpu_keys:
-        if g not in gpu_map:
-            raise ValueError(f"GPU {g} not in registry. Known: {sorted(gpu_map)}")
     return tp_size, [_resolve_pinned_gpu(gpu_map, g, weight_need) for g in gpu_keys], vram_reqs
 
 

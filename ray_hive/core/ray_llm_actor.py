@@ -13,7 +13,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 
 
 @serve.deployment(
-    ray_actor_options={"num_gpus": 0, "memory": 2 * 1024 * 1024 * 1024},
+    ray_actor_options={"num_gpus": 0},
     autoscaling_config=None,
     num_replicas=1,
     max_ongoing_requests=64,
@@ -32,6 +32,13 @@ class RayLLMActor:
         os.environ["CUDA_VISIBLE_DEVICES"] = target_gpu_id
         if "," in target_gpu_id:
             os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+        engine_kwargs = dict(engine_kwargs)
+        ktc = engine_kwargs.get("kv_transfer_config")
+        if ktc is not None or engine_kwargs.get("kv_offloading_size"):
+            os.environ["VLLM_USE_SIMPLE_KV_OFFLOAD"] = "1"
+        if isinstance(ktc, dict):
+            from vllm.config import KVTransferConfig
+            engine_kwargs["kv_transfer_config"] = KVTransferConfig(**ktc)
         self.model_id = model_id
         # Build on Serve's running loop so AsyncLLM's output_handler attaches correctly.
         self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_kwargs))

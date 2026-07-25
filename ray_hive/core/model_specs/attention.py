@@ -11,12 +11,11 @@ applied in VramReqs (tp_size), not in attention classes.
 NOTE: Standard KV formula will always be upper bound compared to more efficient attentions,
 so if custom KV calculation not provided for given model, it will default to standard KV formula.
 """
-from abc import ABC
 from typing import Any
 import math
 
 
-class BaseAttentionSpecs(ABC):
+class BaseAttentionSpecs:
     """
     Base KV-cache calculator for transformer-style attention.
 
@@ -38,11 +37,6 @@ class BaseAttentionSpecs(ABC):
         """Store Hugging Face config params used by cache formulas."""
         self.hf_params = hf_params
         self.kv_bytes_per_element = kv_bytes_per_element
-
-
-    def _hf(self, name: str):
-        """Return a Hugging Face config value by name."""
-        return self.hf_params[name]
 
 
     def _hf_any(self, *names: str):
@@ -105,9 +99,7 @@ class BaseAttentionSpecs(ABC):
 
     def kv_bytes_per_token(self) -> float:
         """Return KV cache bytes needed per token."""
-        bpt = 2 * self.kv_bytes_per_element * self.kv_layers * self.kv_heads * self.head_dim
-        assert bpt > 0, "kv_bytes_per_token must be positive"
-        return bpt
+        return 2 * self.kv_bytes_per_element * self.kv_layers * self.kv_heads * self.head_dim
 
 
     def kv_bytes_per_sequence(self, max_model_len: int) -> float:
@@ -121,5 +113,4 @@ class BaseAttentionSpecs(ABC):
         assert kv_cache_gib > 0, f"kv_cache_gib must be positive, got {kv_cache_gib}"
         kv_budget_bytes = kv_cache_gib * (1024 ** 3)
         bytes_per_seq = self.kv_bytes_per_sequence(max_model_len)
-        assert bytes_per_seq > 0, "bytes_per_seq must be positive"
         return max(1, math.floor(kv_budget_bytes / bytes_per_seq))

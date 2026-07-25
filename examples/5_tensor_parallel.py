@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 from ray_hive import RayHive
+from ray_hive.core.ray_utils import info, success
 from ray_hive.inference import inference_batch
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -43,9 +44,11 @@ sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)
 
 for idx, deployment in enumerate(deployments):
     model_id = deployment["model_id"]
-    print(f"\n=== {deployment['description']} ({model_id}) ===")
+    cfg = deployment["config"]
+    info(f"{deployment['description']} ({model_id})")
 
-    scheduler.deploy_model(model_id=model_id, **deployment["config"])
+    scheduler.estimate_vram(**cfg)
+    scheduler.deploy_model(model_id=model_id, **cfg)
     time.sleep(2)
 
     _ = inference_batch(prompts[:10], model_id=model_id, **sample_kwargs)
@@ -54,7 +57,7 @@ for idx, deployment in enumerate(deployments):
     start = time.time()
     results = inference_batch(prompts, model_id=model_id, **sample_kwargs)
     elapsed = time.time() - start
-    print(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
+    success(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
 
     scheduler.shutdown(model_id)
     if idx < len(deployments) - 1:

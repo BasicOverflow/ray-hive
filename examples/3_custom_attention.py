@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from ray_hive import RayHive
 from ray_hive.core.model_specs import BaseAttentionSpecs
 from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
+from ray_hive.core.ray_utils import success
 from ray_hive.inference import inference_batch
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -101,13 +102,24 @@ class Qwen3AttentionSpecs(BaseAttentionSpecs):
 
 scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 model_id = "qwen-custom-attention"
+model_name = "Qwen/Qwen3-0.6B-FP8"
+max_in, max_out = 24, 100
 
+scheduler.estimate_vram(
+    model_name,
+    max_num_seqs=32,
+    max_input_prompt_length=max_in,
+    max_output_prompt_length=max_out,
+    replicas=-1,
+    attention_cls=Qwen3AttentionSpecs,
+)
 scheduler.deploy_model(
     model_id=model_id,
-    model_name="Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length=24,
-    max_output_prompt_length=100,
-    replicas=-11,
+    model_name=model_name,
+    max_input_prompt_length=max_in,
+    max_output_prompt_length=max_out,
+    max_num_seqs=32,
+    replicas=-1,
     attention_cls=Qwen3AttentionSpecs,
     allocation_cls=RayPerformanceAllocator,
     # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)
@@ -117,7 +129,7 @@ scheduler.deploy_model(
 )
 
 prompt = "Write a short poem about beer"
-amount = 10_000
+amount = 500
 prompts = [f"{prompt} {i}" for i in range(amount)]
 # Qwen3 non-thinking sampling (model card / deploy docs)
 sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)
@@ -130,6 +142,6 @@ time.sleep(2)
 start = time.time()
 results = inference_batch(prompts, model_id=model_id, **sample_kwargs)
 elapsed = time.time() - start
-print(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
+success(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
 
 scheduler.shutdown(model_id)

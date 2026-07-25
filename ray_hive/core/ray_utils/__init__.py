@@ -28,11 +28,21 @@ from .placement import (
     chunk_gpu_groups,
     fixed_non_kv_gb,
     gpu_budget_frac,
+    plan_replica_groups,
     replicas_per_host,
 )
 from .select_gpus import resolve_target_gpus
 from .session import StderrFilter, init_ray, suppress_ray_warnings
 from .tensor_parallel import assert_tp_shardable, tp_shardable
+from .display import (
+    error,
+    info,
+    print_banner,
+    print_deployment_plan,
+    print_panel,
+    success,
+    warn,
+)
 
 __all__ = [
     "StderrFilter",
@@ -44,6 +54,7 @@ __all__ = [
     "compute_cap",
     "count_by_host",
     "deployment_name",
+    "error",
     "filter_alive",
     "fixed_non_kv_gb",
     "gpu_budget_frac",
@@ -51,16 +62,23 @@ __all__ = [
     "gpu_inventory_lines",
     "gpu_resource_name",
     "host_memory_available_gb",
+    "info",
     "init_ray",
     "is_node_alive",
     "kill_gpu_registry",
     "max_gpus_on_any_host",
     "mem_bandwidth",
+    "plan_replica_groups",
+    "print_banner",
+    "print_deployment_plan",
+    "print_panel",
     "resolve_target_gpus",
     "replicas_per_host",
     "shutdown_all",
     "shutdown_model",
     "sm_count",
+    "success",
     "suppress_ray_warnings",
     "tp_shardable",
+    "warn",
 ]

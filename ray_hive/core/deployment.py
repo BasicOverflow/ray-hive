@@ -1,5 +1,5 @@
 """
-Deployment service — singleton Ray actor that serializes deploy/shutdown.
+Deployment service — singleton Ray actor that serializes model deploys.
 
 DeployService runs the full per-model pipeline: HF config → planner → GPU
 selection → replica reservation → parallel RayLLMActor deploy → ModelRouter.
@@ -7,34 +7,18 @@ selection → replica reservation → parallel RayLLMActor deploy → ModelRoute
 import ray
 from ray import serve
 
+from .gpu_alloc import reject_unsupported_host_ram_kwargs
 from .gpu_registry import get_gpu_registry
-from .gpu_alloc import assert_cpu_ram_tp_allowed, resolve_group_cpu_spill
-from .model_specs.planner import normalize_hf_config, plan_deployment
-from .ray_utils import (
-    assert_model_id_free,
-    chunk_gpu_groups,
-    deployment_name,
-    fixed_non_kv_gb,
-    gpu_budget_frac,
-    host_memory_available_gb,
-    replicas_per_host,
-    resolve_target_gpus,
-)
+from .model_specs.estimate import load_hf_config_dict
+from .model_specs.planner import normalize_hf_config
+from .ray_utils import assert_model_id_free
+from .ray_utils.placement import plan_replica_groups
 
 
 @ray.remote(num_gpus=0.01)
 def fetch_hf_config_dict(model_name: str) -> dict:
-    """Load HF config.json on a GPU worker (no AutoConfig — works for new model_types)."""
-    import json
-    from pathlib import Path
-
-    local = Path(model_name) / "config.json"
-    if local.is_file():
-        return json.loads(local.read_text())
-
-    from huggingface_hub import hf_hub_download
-    path = hf_hub_download(repo_id=model_name, filename="config.json")
-    return json.loads(Path(path).read_text())
+    """Load HF config.json on a GPU worker (delegates to shared loader)."""
+    return load_hf_config_dict(model_name)
 
 
 @ray.remote
@@ -45,7 +29,6 @@ def deploy_single(
     engine_kwargs: dict,
     resource_names: list[str],
     route_prefix: str,
-    memory_bytes: int,
 ):
     """Deploy one RayLLMActor replica on a GPU worker (imports vllm here only)."""
     from ray_hive.core.ray_llm_actor import RayLLMActor
@@ -53,6 +36,8 @@ def deploy_single(
     resources = {name: 0.01 for name in resource_names}
     # num_gpus>0 makes Ray remap CUDA_VISIBLE_DEVICES and breaks custom-resource pinning
     # on multi-GPU nodes (wrong card → OOM / Serve "Failed to update"). Pin via CVD only.
+    # Do not set ray_actor_options memory — that is a Ray scheduling reservation and
+    # pending-fails on GPU workers with little advertised heap; vLLM owns host KV/spill.
     env_vars = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
         "CUDA_VISIBLE_DEVICES": target_gpu_id,
@@ -60,12 +45,16 @@ def deploy_single(
     }
     if len(resource_names) > 1:
         env_vars["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+    # Default "native" OffloadingConnector mmaps CPU KV under /dev/shm (often 64MB in
+    # K8s). Hive always uses SimpleCPUOffload (process RAM) via kv_transfer_config;
+    # keep the env bit for any residual kv_offloading_size path.
+    if engine_kwargs.get("kv_transfer_config") or engine_kwargs.get("kv_offloading_size"):
+        env_vars["VLLM_USE_SIMPLE_KV_OFFLOAD"] = "1"
     deployment = RayLLMActor.options(
         name=replica_id,
         graceful_shutdown_timeout_s=0,
         ray_actor_options={
             "num_gpus": 0,
-            "memory": memory_bytes,
             "resources": resources,
             "runtime_env": {"env_vars": env_vars},
         },
@@ -109,7 +98,7 @@ def deploy_router(
 
 @ray.remote(num_cpus=0)
 class DeployService:
-    """Singleton actor — serializes deploy/shutdown across apps."""
+    """Singleton actor — serializes model deploys across apps."""
 
     def deploy_models(self, model_configs: dict, vllm_kwargs: dict | None = None) -> dict:
         """Deploy one or more models; returns per-replica plan dicts."""
@@ -119,29 +108,9 @@ class DeployService:
         )
         vllm_kwargs = vllm_kwargs or {}
         results = {}
-        seen = set()
         for model_id, config in model_configs.items():
-            if model_id in seen:
-                raise ValueError(f"duplicate model_id {model_id!r} in deploy_models batch")
-            seen.add(model_id)
             results[model_id] = self._deploy_model(model_id, config, vllm_kwargs.get(model_id, {}))
         return results
-
-
-    def shutdown_model(self, model_id: str) -> dict:
-        """Delete this model's router + replica apps and registry state (exact ids only)."""
-        from ray_hive.core.ray_utils.lifecycle import shutdown_model as _shutdown_model
-
-        _shutdown_model(model_id)
-        return {"model_id": model_id, "status": "shutdown"}
-
-
-    def shutdown_all(self) -> dict:
-        """Shutdown all Serve apps and clear registry state."""
-        from ray_hive.core.ray_utils.lifecycle import shutdown_all as _shutdown_all
-
-        _shutdown_all()
-        return {"status": "shutdown_all"}
 
 
     def _deploy_model(self, model_id: str, config: dict, model_vllm_kwargs: dict) -> dict:
@@ -151,75 +120,31 @@ class DeployService:
 
         # Serve-frontend only — not valid on LLM()/EngineArgs; applied by ModelRouter.
         model_vllm_kwargs = dict(model_vllm_kwargs)
+        reject_unsupported_host_ram_kwargs(model_vllm_kwargs)
         chat_template_kwargs = model_vllm_kwargs.pop("default_chat_template_kwargs", None) or {}
         model_vllm_kwargs.pop("tensor_parallel_size", None)
         model_vllm_kwargs.pop("distributed_executor_backend", None)
-        model_vllm_kwargs.pop("kv_offloading_size", None)
-        model_vllm_kwargs.pop("kv_offloading_backend", None)
-        model_vllm_kwargs.pop("cpu_offload_gb", None)
 
         registry = get_gpu_registry()
         assert_model_id_free(model_id, registry)
 
         hf_params = normalize_hf_config(ray.get(fetch_hf_config_dict.remote(config["name"])))
         gpu_map = ray.get(registry.get_all_gpus.remote())
-        cpu_ram_cfg = float(config.get("cpu_ram_per_instance") or 0)
-        tp_size, target_gpus, vram_reqs = resolve_target_gpus(
-            gpu_map,
-            config.get("replicas", -1),
-            config.get("gpu"),
-            hf_params,
-            config.get("allocation_cls"),
-            config.get("attention_cls"),
-            model_vllm_kwargs,
-            cpu_ram_cfg=cpu_ram_cfg,
-        )
-        assert_cpu_ram_tp_allowed(tp_size, cpu_ram_cfg)
-        gpu_groups = chunk_gpu_groups(target_gpus, tp_size)
-        per_host = replicas_per_host(gpu_groups)
-
-        max_model_len = config["max_input_prompt_length"] + config["max_output_prompt_length"]
-        batched_tokens_override = config.get("max_num_batched_tokens")
-        max_num_seqs_override = config.get("max_num_seqs")
-        weight_need = fixed_non_kv_gb(vram_reqs)
+        planned = plan_replica_groups(gpu_map, config, hf_params, model_vllm_kwargs, model_id)
 
         replica_jobs = []
         gpu_mapping = {}
         replica_metadata = {}
-        deployment_id = model_id
 
-        for group in gpu_groups:
-            gpu_keys = [g["gpu_key"] for g in group]
-            bottleneck = min(group, key=lambda g: g["available_gb"])
-            avail = min(g["available_gb"] for g in group)
-            host = group[0]["gpu_key"].split(":")[0]
-            if tp_size > 1:
-                per_gpu_budget = avail * gpu_budget_frac(tp_size)
-                cpu_ram = cpu_offload = kv_offload = 0.0
-                memory_bytes = 0
-            else:
-                per_gpu_budget, cpu_ram, cpu_offload, kv_offload, memory_bytes = resolve_group_cpu_spill(
-                    weight_need, avail, cpu_ram_cfg, host_memory_available_gb(host), per_host[host]
-                )
-            plan = plan_deployment(
-                vram_reqs,
-                vram_budget_gb=per_gpu_budget,
-                live_total_vram_gb=bottleneck["total_gb"],
-                max_model_len=max_model_len,
-                input_len=config["max_input_prompt_length"],
-                output_len=config["max_output_prompt_length"],
-                max_num_batched_tokens_override=batched_tokens_override,
-                max_num_seqs_override=max_num_seqs_override,
-                cpu_kv_offload_gb=kv_offload,
-                cpu_weight_offload_gb=cpu_offload,
-            )
-            plan = dict(plan)
-            plan["tensor_parallel_size"] = tp_size
-            plan["weights_gb"] = vram_reqs.calc_weights_gb() * tp_size
-            plan["weight_need_gb"] = weight_need
-            plan["cpu_ram_budget_gb"] = cpu_ram
+        for replica_id, entry in planned.items():
+            plan = entry["plan"]
+            group = entry["group"]
+            gpu_keys = entry["gpu_keys"]
+            kv_offload = entry["kv_offload"]
+            cpu_offload = entry["cpu_offload"]
+            tp_size = entry["tp_size"]
+            max_model_len = entry["max_model_len"]
 
-            replica_id = deployment_name(model_id, gpu_keys)
             for gpu_info in group:
                 if gpu_info["available_gb"] < plan["total_vram_gb"]:
                     raise ValueError(
@@ -240,8 +165,16 @@ class DeployService:
                 **model_vllm_kwargs,
             }
             if kv_offload > 0:
-                engine_kwargs["kv_offloading_size"] = kv_offload
-                engine_kwargs["kv_offloading_backend"] = "native"
+                # Avoid kv_offloading_size → OffloadingConnector (/dev/shm mmap). Use
+                # SimpleCPUOffloadConnector (pinned process RAM) explicitly instead.
+                engine_kwargs["enable_prefix_caching"] = True
+                engine_kwargs["kv_transfer_config"] = {
+                    "kv_connector": "SimpleCPUOffloadConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": {
+                        "cpu_bytes_to_use": int(kv_offload * (1 << 30)),
+                    },
+                }
             if cpu_offload > 0:
                 engine_kwargs["cpu_offload_gb"] = cpu_offload
             if tp_size > 1:
@@ -255,13 +188,9 @@ class DeployService:
                 "target_gpu_id": ",".join(g["gpu_id"] for g in group),
                 "engine_kwargs": engine_kwargs,
                 "resource_names": resource_names,
-                "memory_bytes": memory_bytes,
             })
             gpu_mapping[replica_id] = gpu_keys
             replica_metadata[replica_id] = plan
-
-        if not replica_jobs:
-            raise ValueError(f"No eligible GPUs for model {model_id}")
 
         deploy_futures = []
         for job in replica_jobs:
@@ -273,19 +202,25 @@ class DeployService:
                 job["engine_kwargs"],
                 job["resource_names"],
                 f"/{job['replica_id']}",
-                job["memory_bytes"],
             ))
         try:
             ray.get(deploy_futures)
-        except Exception:
+        except Exception as e:
             for f in deploy_futures:
                 ray.cancel(f, force=True)
             replica_ids = [job["replica_id"] for job in replica_jobs]
             apps = serve.status().applications or {}
+            details = []
             for app_name in replica_ids:
-                if app_name in apps:
-                    serve.delete(name=app_name)
+                app = apps.get(app_name)
+                if app is None:
+                    continue
+                for dep_name, dep in (app.deployments or {}).items():
+                    details.append(f"{dep_name}: {dep.status} — {dep.message}")
+                serve.delete(name=app_name)
             ray.get(registry.clear_replicas.remote(replica_ids))
+            if details:
+                raise RuntimeError("; ".join(details)) from e
             raise
 
         replica_gpu_vram_gb = {
@@ -296,7 +231,7 @@ class DeployService:
             for replica_id in replica_metadata
         }
         ray.get(registry.reserve_deployment.remote(
-            deployment_id, replica_gpu_vram_gb, deployment_type="model", model_id=model_id
+            model_id, replica_gpu_vram_gb, deployment_type="model", model_id=model_id
         ))
 
         for replica_id, gpu_keys in gpu_mapping.items():
