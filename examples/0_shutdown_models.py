@@ -6,10 +6,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 from ray_hive import RayHive, kill_gpu_registry
+from ray_hive.core.ray_utils import success
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
+scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True, show_banner=False)
 scheduler.shutdown()
 kill_gpu_registry()
-RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
+success("All models shut down; gpu_registry killed.")

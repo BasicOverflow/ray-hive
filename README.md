@@ -32,14 +32,14 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 
 ## Capabilities
 
-- **Throughput-first planning:** By default, the planner uses the available VRAM budget to find the highest practical `max_num_seqs` and batched-token limit, maximizing concurrency while retaining runtime headroom (`gpu_budget_frac`: 0.97 single-GPU, 0.80 TP) to avoid OOM crashes.
+- **Throughput-first planning:** By default, the planner uses the available VRAM budget to find the highest practical `max_num_seqs` and batched-token limit, maximizing concurrency while retaining runtime headroom (`gpu_budget_frac`: 0.90 single-GPU, 0.80 TP) for CUDA-graph capture and sampler scratch outside the util pool.
 - **Heterogeneous deployment:** One model can be replicated across GPUs with different capacities. Each replica receives its own memory and concurrency plan so every GPU contributes as much throughput as it can.
 - **Unified routing:** A model-level router ties those replicas together and sends work to the least-loaded GPU relative to its planned capacity.
 - **Live VRAM scheduling:** Placement uses current GPU memory rather than static card specifications and reserves memory during deployment.
 - **GPU sharing:** Multiple models can share a GPU when the registry and planner determine that enough VRAM remains.
 - **Flexible placement:** Models can target specific GPUs, a requested replica count, or every eligible GPU.
 - **Same-node tensor parallelism:** If a model does not fit on any one GPU, auto placement escalates to same-node TP; or pin an explicit `gpu=[...]` set. Each TP group is one Serve replica with vLLM’s multiprocessing backend.
-- **Host RAM extension (`cpu_ram_per_instance`):** Sole hive arg for extending beyond GPU VRAM on **TP=1** replicas. Weights stay on GPU if they fit; overflow spills to host (`cpu_offload_gb`); leftover host RAM becomes CPU KV and raises `max_num_seqs`. Not supported when TP>1 — use `cpu_ram_per_instance=0` and fit on GPU VRAM only.
+- **Host RAM extension (`cpu_ram_per_instance`):** Sole hive arg for extending beyond GPU VRAM on **TP=1** replicas (weight spill only). If weights do not fit the GPU budget, overflow spills to host (`cpu_offload_gb`). KV offloading is not supported yet — passing `kv_offloading_size`, `kv_offloading_backend`, or `kv_transfer_config` raises. Do not pass `cpu_offload_gb` as a vLLM kwarg; use `cpu_ram_per_instance`. Not supported when TP>1 — use `cpu_ram_per_instance=0` and fit on GPU VRAM only.
 - **General compute:** The same cluster continues to run normal distributed Ray tasks on its CPU workers (and GPU workers if not busy serving models).
 
 ## Model Planning
@@ -49,7 +49,7 @@ Before loading a model, Ray Hive reads its Hugging Face configuration and builds
 - **Weights** are estimated from the architecture, parameter dimensions, and model dtype (divided by TP size for per-GPU planning).
 - **Attention/KV cache** is estimated from attention layers, KV heads, head size, context length, cache dtype, and concurrent sequences. Specialized attention layouts can provide their own calculation; TP sharding is applied in the planner, not in attention classes.
 - **Runtime memory** includes a small system allowance (plus a coarse NCCL/TP term when TP>1), model-specific overhead, and activation memory based on batched tokens.
-- **Host RAM (`cpu_ram_per_instance`, TP=1 only):** If weights fit in the GPU budget, they stay on GPU and the full host budget goes to CPU KV. If not, overflow spills to host first; remaining host GiB becomes CPU KV. Concurrency (`max_num_seqs`) uses GPU KV plus that CPU KV. Activations, batched tokens, VRAM reservation, and `gpu_memory_utilization` stay GPU-only. TP>1 groups must fit on GPU VRAM with `cpu_ram_per_instance=0`.
+- **Host RAM (`cpu_ram_per_instance`, TP=1 only):** Weight spill only. If weights fit in the GPU budget, they stay on GPU and host budget is unused (`-1` resolves to 0). If not, overflow spills to host (auto `-1` sizes to that need, capped at 70% of Ray free host memory / replicas on host; `>0` is a hard ceiling). Concurrency (`max_num_seqs`) is planned from **GPU KV only**. Weight spill can free GPU VRAM and thereby raise concurrency. Activations, batched tokens, VRAM reservation, and `gpu_memory_utilization` stay GPU-only. TP>1 groups must fit on GPU VRAM with `cpu_ram_per_instance=0`. KV offload vLLM kwargs are rejected (not supported yet).
 
 Each GPU (or TP group bottleneck) is planned independently, allowing different cards and existing deployments to have different concurrency limits.
 
@@ -159,15 +159,16 @@ Ray Hive-specific `deploy_model` arguments:
 - `gpu` — optional pin: a string for one GPU; a list with `replicas=1` for one same-node TP group; a list with `replicas=len(list)` for N single-GPU pins. Overrides `allocation_cls`. Omit to auto-place (single GPU, else same-node TP).
 - `max_num_seqs` / `max_num_batched_tokens` — optional overrides for the planner's estimates.
 - `cpu_ram_per_instance` — sole host-RAM extension arg (default `0`; **TP=1 only**):
-  - `0` — off (GPU-only; no weight spill, no CPU KV)
-  - `-1` — host budget = `0.50 × Ray node memory / replicas on host` for spill/KV
-  - `>0` — hard host budget in GiB
-  Policy: keep weights on GPU if they fit; else spill overflow to host; leftover host RAM → CPU KV → higher `max_num_seqs`. With TP>1, must be `0` (GPU VRAM only).
+  - `0` — off (GPU-only; no weight spill)
+  - `-1` — auto: budget exactly the weight spill this replica needs (0 if weights fit), capped at 70% of Ray free host memory / replicas on host
+  - `>0` — hard host ceiling in GiB for weight spill (unused if weights fit on GPU)
+  Policy: keep weights on GPU if they fit; else spill overflow to host. KV offloading is not supported yet. With TP>1, must be `0` (GPU VRAM only).
+  Do not pass as vLLM kwargs: `kv_offloading_size`, `kv_offloading_backend`, `kv_transfer_config` (raises — KV offload unsupported), or `cpu_offload_gb` (raises — use `cpu_ram_per_instance`).
 - `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention (no TP awareness required).
 - `allocation_cls` — optional single-GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set; auto TP always uses `RayTensorParallelAllocator`).
 - `idle_timeout` — seconds of inference inactivity before the model self-shutdowns; `-1` (default) means never, must be `-1` or a positive integer. Survives client script exit; uses the same cleanup as `hive.shutdown(model_id)`.
 
-Any additional keyword arguments are forwarded to vLLM's `LLM(...)` constructor.
+Any additional keyword arguments (except the rejected host-RAM / KV-offload keys above) are forwarded to vLLM's `LLM(...)` constructor.
 
 
 Structured output accepts a Pydantic model:

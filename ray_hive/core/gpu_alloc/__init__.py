@@ -4,6 +4,7 @@ from .conserve_tdp import ConserveTdpAllocator
 from .cpu_spill import (
     assert_cpu_ram_tp_allowed,
     on_gpu_weight_need_gb,
+    reject_unsupported_host_ram_kwargs,
     resolve_cpu_ram_budget,
     resolve_cpu_spill,
     resolve_group_cpu_spill,
@@ -20,6 +21,7 @@ __all__ = [
     "TensorParallelAllocator",
     "assert_cpu_ram_tp_allowed",
     "on_gpu_weight_need_gb",
+    "reject_unsupported_host_ram_kwargs",
     "resolve_cpu_ram_budget",
     "resolve_cpu_spill",
     "resolve_group_cpu_spill",
