@@ -19,6 +19,12 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=False)
 
+VLLM_KWARGS = dict(
+    trust_remote_code=True,
+    reasoning_parser="qwen3",
+    default_chat_template_kwargs={"enable_thinking": False},
+)
+
 deployments = [
     {
         "model_id": "qwen3-8b-tp",
@@ -30,9 +36,7 @@ deployments = [
             "replicas": 1,
             "gpu": ["ergos-02-nv:gpu1", "ergos-02-nv:gpu2"],
             "cpu_ram_per_instance": 0,
-            "trust_remote_code": True,
-            "reasoning_parser": "qwen3",
-            "default_chat_template_kwargs": {"enable_thinking": False},
+            "vllm_kwargs": VLLM_KWARGS,
         },
     },
 ]
@@ -48,11 +52,10 @@ for idx, deployment in enumerate(deployments):
     info(f"{deployment['description']} ({model_id})")
 
     scheduler.estimate_vram(**cfg)
-    scheduler.deploy_model(model_id=model_id, **cfg)
-    time.sleep(2)
+    status = scheduler.deploy_model(model_id=model_id, **cfg)
+    info(status)
 
     _ = inference_batch(prompts[:10], model_id=model_id, **sample_kwargs)
-    time.sleep(2)
 
     start = time.time()
     results = inference_batch(prompts, model_id=model_id, **sample_kwargs)

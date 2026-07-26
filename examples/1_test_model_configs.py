@@ -13,9 +13,14 @@ from ray_hive.inference import inference_batch
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=False)
+scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 
 PIN_GPUS = ["ergos-06-nv:gpu0", "ergos-04-nv:gpu0"]
+VLLM_KWARGS = dict(
+    trust_remote_code=True,
+    reasoning_parser="qwen3",
+    default_chat_template_kwargs={"enable_thinking": False},
+)
 
 deployments = [
     # {
@@ -28,46 +33,37 @@ deployments = [
     #         "replicas": 2,
     #         "gpu": PIN_GPUS,
     #         "allocation_cls": RayPerformanceAllocator,
-    #         "trust_remote_code": True,
-    #         "reasoning_parser": "qwen3",
-    #         "default_chat_template_kwargs": {"enable_thinking": False},
-    #     },
-    # },
-    # {
-    #     "model_id": "qwen-cpu-ram",
-    #     "description": "replicas=2 + cpu_ram_per_instance=4",
-    #     "config": {
-    #         "model_name": "Qwen/Qwen3-0.6B-FP8",
-    #         "max_input_prompt_length": 512,
-    #         "max_output_prompt_length": 512,
-    #         "replicas": 2,
-    #         "gpu": PIN_GPUS,
-    #         "allocation_cls": RayPerformanceAllocator,
-    #         "cpu_ram_per_instance": 4,
-    #         "trust_remote_code": True,
-    #         "reasoning_parser": "qwen3",
-    #         "default_chat_template_kwargs": {"enable_thinking": False},
+    #         "vllm_kwargs": VLLM_KWARGS,
     #     },
     # },
     {
-        "model_id": "qwen-all-gpus",
-        "description": "replicas=-1 (all eligible GPUs)",
+        "model_id": "qwen-cpu-ram",
+        "description": "replicas=2 + cpu_ram_per_instance=4",
         "config": {
             "model_name": "Qwen/Qwen3-0.6B-FP8",
             "max_input_prompt_length": 512,
             "max_output_prompt_length": 512,
             "replicas": -1,
-            "cpu_ram_per_instance": 2,
-            # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)
-            "trust_remote_code": True,
-            "reasoning_parser": "qwen3",
-            "default_chat_template_kwargs": {"enable_thinking": False},
+            "cpu_ram_per_instance": 0,
+            "vllm_kwargs": VLLM_KWARGS,
         },
     },
+    # {
+    #     "model_id": "qwen-all-gpus",
+    #     "description": "replicas=-1 (all eligible GPUs)",
+    #     "config": {
+    #         "model_name": "Qwen/Qwen3-0.6B-FP8",
+    #         "max_input_prompt_length": 512,
+    #         "max_output_prompt_length": 512,
+    #         "replicas": -1,
+    #         "cpu_ram_per_instance": 2,
+    #         "vllm_kwargs": VLLM_KWARGS,
+    #     },
+    # },
 ]
 
 prompt = "Write a short poem about beer"
-amount = 500
+amount = 10_000
 prompts = [f"{prompt} {i}" for i in range(amount)]
 # Qwen3 non-thinking sampling (model card / deploy docs)
 sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)
@@ -78,11 +74,10 @@ for idx, deployment in enumerate(deployments):
     info(f"{deployment['description']} ({model_id})")
 
     scheduler.estimate_vram(**cfg)
-    scheduler.deploy_model(model_id=model_id, **cfg)
-    time.sleep(2)
+    status = scheduler.deploy_model(model_id=model_id, **cfg)
+    info(status)
 
     _ = inference_batch(prompts[:10], model_id=model_id, **sample_kwargs)
-    time.sleep(2)
 
     start = time.time()
     results = inference_batch(prompts, model_id=model_id, **sample_kwargs)

@@ -5,3 +5,4 @@ vllm
 pydantic>=2.0.0
 transformers
 rich
+langchain-openai

@@ -105,9 +105,11 @@ hive.deploy_model(
     max_output_prompt_length=2048,
     replicas=1,
     gpu=["ergos-02-nv:gpu0", "ergos-02-nv:gpu1"],
-    trust_remote_code=True,
-    reasoning_parser="qwen3",
-    default_chat_template_kwargs={"enable_thinking": False},
+    vllm_kwargs={
+        "trust_remote_code": True,
+        "reasoning_parser": "qwen3",
+        "default_chat_template_kwargs": {"enable_thinking": False},
+    },
 )
 
 # Or omit gpu= — single GPU if it fits, else same-node TP
@@ -117,9 +119,11 @@ hive.deploy_model(
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
     replicas=1,
-    trust_remote_code=True,
-    reasoning_parser="qwen3",
-    default_chat_template_kwargs={"enable_thinking": False},
+    vllm_kwargs={
+        "trust_remote_code": True,
+        "reasoning_parser": "qwen3",
+        "default_chat_template_kwargs": {"enable_thinking": False},
+    },
 )
 ```
 
@@ -132,7 +136,7 @@ from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
 # from ray_hive.core.model_specs import BaseAttentionSpecs  # subclass for custom KV sizing
 
 hive = RayHive(address="ray://YOUR_RAY_HEAD_IP:10001")
-hive.deploy_model(
+status = hive.deploy_model(
     model_id="qwen",
     model_name="Qwen/Qwen3-0.6B-FP8",
     max_input_prompt_length=1024,
@@ -140,11 +144,17 @@ hive.deploy_model(
     replicas=-1,
     allocation_cls=RayPerformanceAllocator,  # default; can omit
     # attention_cls=MyAttentionSpecs,  # omit to default to BaseAttentionSpecs (standard attention)
-    # Qwen3-0.6B-FP8 suggested vLLM args (HF model card / Qwen deploy docs)
-    trust_remote_code=True,
-    reasoning_parser="qwen3",  # model card also lists deepseek_r1 + deprecated enable-reasoning
-    default_chat_template_kwargs={"enable_thinking": False},
+    vllm_kwargs={
+        # planner overrides are lifted automatically from this dict
+        # "max_num_seqs": 32,
+        # "max_num_batched_tokens": 1024,
+        # Qwen3-0.6B-FP8 suggested vLLM args (HF model card / Qwen deploy docs)
+        "trust_remote_code": True,
+        "reasoning_parser": "qwen3",  # model card also lists deepseek_r1 + deprecated enable-reasoning
+        "default_chat_template_kwargs": {"enable_thinking": False},
+    },
 )
+# status == {"model_id": "qwen", "status": "ready", "route": "/qwen", "replicas": {...}}
 
 answer = inference("Explain Ray in one sentence.", model_id="qwen")
 answers = inference_batch(["Prompt one", "Prompt two"], model_id="qwen")
@@ -157,8 +167,7 @@ Ray Hive-specific `deploy_model` arguments:
 - `max_input_prompt_length` / `max_output_prompt_length` — expected limits used to plan context memory and concurrency.
 - `replicas` — number of GPUs when TP=1 (including multi-pin); number of TP *groups* when auto TP>1; must be `1` for a pinned TP group; `-1` uses every eligible GPU/group.
 - `gpu` — optional pin: a string for one GPU; a list with `replicas=1` for one same-node TP group; a list with `replicas=len(list)` for N single-GPU pins. Overrides `allocation_cls`. Omit to auto-place (single GPU, else same-node TP).
-- `max_num_seqs` / `max_num_batched_tokens` — optional overrides for the planner's estimates.
-- `cpu_ram_per_instance` — sole host-RAM extension arg (default `0`; **TP=1 only**):
+- `cpu_ram_per_instance` — hive host-RAM extension arg (not a vLLM kwarg; default `0`; **TP=1 only**):
   - `0` — off (GPU-only; no weight spill)
   - `-1` — auto: budget exactly the weight spill this replica needs (0 if weights fit), capped at 70% of Ray free host memory / replicas on host
   - `>0` — hard host ceiling in GiB for weight spill (unused if weights fit on GPU)
@@ -167,8 +176,13 @@ Ray Hive-specific `deploy_model` arguments:
 - `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention (no TP awareness required).
 - `allocation_cls` — optional single-GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set; auto TP always uses `RayTensorParallelAllocator`).
 - `idle_timeout` — seconds of inference inactivity before the model self-shutdowns; `-1` (default) means never, must be `-1` or a positive integer. Survives client script exit; uses the same cleanup as `hive.shutdown(model_id)`.
+- `vllm_kwargs` — dict forwarded to vLLM's `LLM(...)` constructor. Planner keys inside it (`max_num_seqs`, `max_num_batched_tokens`) are lifted into the deploy plan automatically and not double-applied to the engine. Serve-only keys like `default_chat_template_kwargs` are handled by the router.
 
-Any additional keyword arguments (except the rejected host-RAM / KV-offload keys above) are forwarded to vLLM's `LLM(...)` constructor.
+`deploy_model` returns when the model is ready (router deployed and warmed):
+
+```python
+{"model_id": "...", "status": "ready", "route": "/...", "replicas": {...}}
+```
 
 
 Structured output accepts a Pydantic model:

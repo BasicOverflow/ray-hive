@@ -22,6 +22,19 @@ from .core.ray_utils.display import (
 )
 from .core.ray_utils.placement import plan_replica_groups
 
+# Lifted out of vllm_kwargs into planner config (must not also reach engine_kwargs).
+_PLANNER_VLLM_KEYS = ("max_num_seqs", "max_num_batched_tokens")
+
+
+def _split_vllm_kwargs(vllm_kwargs: dict | None) -> tuple[dict, dict]:
+    """Pop planner overrides from vllm_kwargs; return (overrides, remaining)."""
+    remaining = dict(vllm_kwargs or {})
+    overrides = {}
+    for key in _PLANNER_VLLM_KEYS:
+        if key in remaining:
+            overrides[key] = remaining.pop(key)
+    return overrides, remaining
+
 
 def _retry_if_registry_empty(fn):
     """DaemonSet needs a beat after kill_gpu_registry; one retry like re-running the script."""
@@ -59,19 +72,21 @@ class RayHive:
         max_output_prompt_length: int,
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
-        max_num_seqs: Optional[int] = None,
-        max_num_batched_tokens: Optional[int] = None,
         cpu_ram_per_instance: float = 0,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         idle_timeout: int = -1,
-        **vllm_kwargs
-    ) -> None:
+        vllm_kwargs: Optional[dict] = None,
+    ) -> dict:
         """
         Deploy a model with VRAM-aware scheduling.
 
+        Returns when the model is ready (router up + warmed). Status dict includes
+        model_id, status="ready", route, and per-replica plan/GPU info.
+
         max_input_prompt_length and max_output_prompt_length are required.
-        max_num_seqs and max_num_batched_tokens are estimated from VRAM unless overridden.
+        Pass planner overrides (max_num_seqs, max_num_batched_tokens) inside
+        vllm_kwargs — they are lifted automatically.
         replicas=-1 deploys to all eligible GPUs (or all eligible TP groups when auto TP>1).
         attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
         allocation_cls defaults to RayPerformanceAllocator for single-GPU auto placement;
@@ -79,13 +94,14 @@ class RayHive:
         gpu=None: place on one GPU if any fits; otherwise same-node TP (2, 3, ...).
         gpu=[a,b,...] + replicas=1: one same-node TP group.
         gpu=[a,b,...] + replicas=len(list): N single-GPU pins (one replica per GPU).
-        cpu_ram_per_instance: sole host-RAM extension arg — TP=1 only. 0 off;
+        cpu_ram_per_instance: hive host-RAM extension (not a vLLM arg) — TP=1 only. 0 off;
           -1 = auto weight-spill need (capped at 70% of Ray free host memory / replicas
           on host); >0 hard GiB ceiling per replica. Weights stay on GPU if they fit;
           overflow spills to host. Leftover host RAM is unused (no CPU KV connector).
         """
         if idle_timeout != -1 and idle_timeout <= 0:
             raise ValueError("idle_timeout must be -1 (never) or a positive number of seconds")
+        planner_overrides, vllm_kwargs = _split_vllm_kwargs(vllm_kwargs)
         reject_unsupported_host_ram_kwargs(vllm_kwargs)
 
         config = {
@@ -98,11 +114,8 @@ class RayHive:
             "attention_cls": attention_cls,
             "allocation_cls": allocation_cls,
             "idle_timeout": idle_timeout,
+            **planner_overrides,
         }
-        if max_num_seqs is not None:
-            config["max_num_seqs"] = max_num_seqs
-        if max_num_batched_tokens is not None:
-            config["max_num_batched_tokens"] = max_num_batched_tokens
 
         deploy_svc = get_deploy_service()
 
@@ -112,7 +125,13 @@ class RayHive:
                 vllm_kwargs={model_id: vllm_kwargs},
             ))
 
-        _retry_if_registry_empty(_deploy)
+        replicas_info = _retry_if_registry_empty(_deploy)[model_id]
+        return {
+            "model_id": model_id,
+            "status": "ready",
+            "route": f"/{model_id}",
+            "replicas": replicas_info,
+        }
 
 
     def estimate_vram(
@@ -122,15 +141,13 @@ class RayHive:
         max_output_prompt_length: int,
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
-        max_num_seqs: Optional[int] = None,
-        max_num_batched_tokens: Optional[int] = None,
         cpu_ram_per_instance: float = 0,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
-        **vllm_kwargs,
+        vllm_kwargs: Optional[dict] = None,
     ) -> dict:
         """Dry-run packing against live GPUs; print the same plan deploy would use."""
-        vllm_kwargs = dict(vllm_kwargs)
+        planner_overrides, vllm_kwargs = _split_vllm_kwargs(vllm_kwargs)
         reject_unsupported_host_ram_kwargs(vllm_kwargs)
         vllm_kwargs.pop("default_chat_template_kwargs", None)
         vllm_kwargs.pop("tensor_parallel_size", None)
@@ -146,11 +163,8 @@ class RayHive:
             "cpu_ram_per_instance": cpu_ram_per_instance,
             "attention_cls": attention_cls,
             "allocation_cls": allocation_cls,
+            **planner_overrides,
         }
-        if max_num_seqs is not None:
-            config["max_num_seqs"] = max_num_seqs
-        if max_num_batched_tokens is not None:
-            config["max_num_batched_tokens"] = max_num_batched_tokens
 
         hf_params = normalize_hf_config(load_hf_config_dict(model_name))
 

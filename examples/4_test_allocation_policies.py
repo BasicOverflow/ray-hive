@@ -43,11 +43,18 @@ policies = [
 scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 gpu_map = scheduler.get_vram_state()
 
+VLLM_KWARGS = dict(
+    max_num_seqs=32,
+    trust_remote_code=True,
+    reasoning_parser="qwen3",
+    default_chat_template_kwargs={"enable_thinking": False},
+)
+
 scheduler.estimate_vram(
     MODEL_NAME,
-    max_num_seqs=32,
     max_input_prompt_length=MAX_IN,
     max_output_prompt_length=MAX_OUT,
+    vllm_kwargs=VLLM_KWARGS,
 )
 
 info("Cluster GPUs (allocation inputs):")
@@ -72,24 +79,20 @@ info("Note: RayTensorParallelAllocator is covered in examples/5_tensor_parallel.
 for idx, policy in enumerate(policies):
     model_id = policy["model_id"]
     info(f"{policy['description']} ({model_id})")
-    scheduler.deploy_model(
+    status = scheduler.deploy_model(
         model_id=model_id,
         model_name=MODEL_NAME,
         max_input_prompt_length=MAX_IN,
         max_output_prompt_length=MAX_OUT,
         replicas=REPLICAS,
         allocation_cls=policy["allocation_cls"],
-        # HF model card / Qwen vLLM docs (enable-reasoning is deprecated; qwen3 since 0.9)
-        trust_remote_code=True,
-        reasoning_parser="qwen3",
-        default_chat_template_kwargs={"enable_thinking": False},
+        vllm_kwargs=VLLM_KWARGS,
     )
-    time.sleep(2)
+    info(status)
 
     # Qwen3 non-thinking sampling (model card / deploy docs)
     sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)
     _ = inference_batch(PROMPTS[:10], model_id=model_id, **sample_kwargs)
-    time.sleep(2)
 
     start = time.time()
     results = inference_batch(PROMPTS, model_id=model_id, **sample_kwargs)

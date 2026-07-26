@@ -1,4 +1,4 @@
-"""Test OpenAI-compatible HTTP API (sync + streaming) against a deployed model."""
+"""Test OpenAI-compatible HTTP API (sync + streaming) and LangChain against a deployed model."""
 import json
 import os
 import sys
@@ -7,6 +7,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 from ray_hive import RayHive
 from ray_hive.core.ray_utils import info
 from ray_hive.inference import inference_stream
@@ -18,6 +20,11 @@ MODEL_NAME = "Qwen/Qwen3-0.6B-FP8"
 PROMPT = "Write a one-line joke about GPUs."
 SAMPLE = dict(max_tokens=64, temperature=0.7, top_p=0.8, top_k=20)
 MAX_IN, MAX_OUT, MAX_SEQS = 512, 256, 5
+
+
+class Joke(BaseModel):
+    setup: str = Field(description="The setup of the joke")
+    punchline: str = Field(description="The punchline of the joke")
 
 
 def serve_base_url() -> str:
@@ -66,24 +73,29 @@ def stream_openai(path: str, body: dict, text_key: str):
     print()
 
 
-scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=False)
-scheduler.estimate_vram(
-    MODEL_NAME,
+VLLM_KWARGS = dict(
     max_num_seqs=MAX_SEQS,
-    max_input_prompt_length=MAX_IN,
-    max_output_prompt_length=MAX_OUT,
-)
-scheduler.deploy_model(
-    model_id=MODEL_ID,
-    model_name=MODEL_NAME,
-    max_input_prompt_length=MAX_IN,
-    max_output_prompt_length=MAX_OUT,
-    max_num_seqs=MAX_SEQS,
-    replicas=1,
     trust_remote_code=True,
     reasoning_parser="qwen3",
     default_chat_template_kwargs={"enable_thinking": False},
 )
+
+scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
+scheduler.estimate_vram(
+    MODEL_NAME,
+    max_input_prompt_length=MAX_IN,
+    max_output_prompt_length=MAX_OUT,
+    vllm_kwargs=VLLM_KWARGS,
+)
+status = scheduler.deploy_model(
+    model_id=MODEL_ID,
+    model_name=MODEL_NAME,
+    max_input_prompt_length=MAX_IN,
+    max_output_prompt_length=MAX_OUT,
+    replicas=1,
+    vllm_kwargs=VLLM_KWARGS,
+)
+info(status)
 
 base = f"/{MODEL_ID}"
 
@@ -131,5 +143,20 @@ stream_openai(
     {"model": MODEL_ID, "prompt": PROMPT, "stream": True, **SAMPLE},
     text_key="text",
 )
+
+llm = ChatOpenAI(
+    base_url=f"{serve_base_url()}{base}/v1",
+    api_key="EMPTY",
+    model=MODEL_ID,
+    max_tokens=SAMPLE["max_tokens"],
+    temperature=SAMPLE["temperature"],
+    extra_body={"top_p": SAMPLE["top_p"], "top_k": SAMPLE["top_k"]},
+)
+
+info("LangChain ChatOpenAI")
+info(llm.invoke(PROMPT).content)
+
+info("LangChain with_structured_output")
+info(llm.with_structured_output(Joke).invoke("Tell a short joke about GPUs"))
 
 scheduler.shutdown(MODEL_ID)
