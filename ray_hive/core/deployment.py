@@ -74,6 +74,7 @@ def deploy_router(
     resource_name: str,
     chat_template_kwargs: dict | None = None,
     idle_timeout: int = -1,
+    sleep_timeout: int = -1,
 ):
     """Bind/run ModelRouter on a GPU worker (needs transformers/vllm)."""
     from ray_hive.core.model_router import ModelRouter
@@ -91,6 +92,7 @@ def deploy_router(
         replica_metadata=replica_metadata,
         chat_template_kwargs=chat_template_kwargs or {},
         idle_timeout=idle_timeout,
+        sleep_timeout=sleep_timeout,
     )
     serve.run(router, name=model_id, route_prefix=f"/{model_id}")
     return True
@@ -164,6 +166,8 @@ class DeployService:
                 "enforce_eager": False,
                 **model_vllm_kwargs,
             }
+            if config.get("sleep_timeout", -1) > 0:
+                engine_kwargs["enable_sleep_mode"] = True
             if kv_offload > 0:
                 # Avoid kv_offloading_size → OffloadingConnector (/dev/shm mmap). Use
                 # SimpleCPUOffloadConnector (pinned process RAM) explicitly instead.
@@ -248,6 +252,7 @@ class DeployService:
             router_resource,
             chat_template_kwargs,
             config.get("idle_timeout", -1),
+            config.get("sleep_timeout", -1),
         ))
 
         return {

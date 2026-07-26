@@ -29,6 +29,7 @@ def resolve_target_gpus(
     attention_cls,
     model_vllm_kwargs: dict,
     cpu_ram_cfg: float = 0,
+    sleep_mode: bool = False,
 ) -> tuple[int, list[dict], object]:
     """
     Resolve placement and TP size.
@@ -42,18 +43,20 @@ def resolve_target_gpus(
     """
     if gpu is not None:
         if isinstance(gpu, str):
-            return _pin_single(gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg)
+            return _pin_single(
+                gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode
+            )
 
         if isinstance(gpu, list):
             if not gpu:
                 raise ValueError("gpu=[] is empty")
             if len(gpu) == 1:
                 return _pin_single(
-                    gpu_map, gpu[0], hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg
+                    gpu_map, gpu[0], hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode
                 )
             if replicas == len(gpu) and replicas > 1:
                 return _pin_multi_tp1(
-                    gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg
+                    gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode
                 )
             if replicas != 1:
                 raise ValueError(
@@ -63,20 +66,20 @@ def resolve_target_gpus(
                     f"different model_id / pin. Got replicas={replicas}, len(gpu)={len(gpu)}."
                 )
             return _pin_tp_group(
-                gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg
+                gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode
             )
 
         assert False, "gpu must be a string, list of strings, or None"
 
     return _auto_place(
-        gpu_map, replicas, hf_params, allocation_cls, attention_cls, model_vllm_kwargs, cpu_ram_cfg
+        gpu_map, replicas, hf_params, allocation_cls, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode
     )
 
 
-def _pin_single(gpu_map, gpu_key, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg):
+def _pin_single(gpu_map, gpu_key, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode=False):
     tp_size = 1
     vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-    weight_need = fixed_non_kv_gb(vram_reqs)
+    weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
     host = gpu_key.split(":")[0]
     avail = _resolve_pinned_gpu(gpu_map, gpu_key, 0)["available_gb"]
     need = on_gpu_weight_need_gb(
@@ -85,10 +88,10 @@ def _pin_single(gpu_map, gpu_key, hf_params, attention_cls, model_vllm_kwargs, c
     return tp_size, [_resolve_pinned_gpu(gpu_map, gpu_key, need)], vram_reqs
 
 
-def _pin_multi_tp1(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg):
+def _pin_multi_tp1(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode=False):
     tp_size = 1
     vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-    weight_need = fixed_non_kv_gb(vram_reqs)
+    weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
     host_counts = count_by_host(gpu_keys)
     resolved = []
     for g in gpu_keys:
@@ -101,23 +104,23 @@ def _pin_multi_tp1(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwarg
     return tp_size, resolved, vram_reqs
 
 
-def _pin_tp_group(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg):
+def _pin_tp_group(gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode=False):
     tp_size = len(gpu_keys)
     hosts = {g.split(":")[0] for g in gpu_keys}
     if len(hosts) != 1:
         raise ValueError(f"Same-node TP only — pinned GPUs span hosts {sorted(hosts)}")
     assert_tp_shardable(hf_params, tp_size)
     vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-    weight_need = fixed_non_kv_gb(vram_reqs)
+    weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
     return tp_size, [_resolve_pinned_gpu(gpu_map, g, weight_need) for g in gpu_keys], vram_reqs
 
 
-def _auto_place(gpu_map, replicas, hf_params, allocation_cls, attention_cls, model_vllm_kwargs, cpu_ram_cfg):
+def _auto_place(gpu_map, replicas, hf_params, allocation_cls, attention_cls, model_vllm_kwargs, cpu_ram_cfg, sleep_mode=False):
     if not gpu_map:
         raise ValueError("No GPUs in registry — cannot place model")
 
     vram_reqs_1 = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, 1)
-    weight_need_1 = fixed_non_kv_gb(vram_reqs_1)
+    weight_need_1 = fixed_non_kv_gb(vram_reqs_1, sleep_mode=sleep_mode)
     alloc_kwargs_1 = dict(model_vllm_kwargs)
     alloc_kwargs_1["cpu_ram_per_instance"] = cpu_ram_cfg
     single_cls = allocation_cls or RayPerformanceAllocator
@@ -146,7 +149,7 @@ def _auto_place(gpu_map, replicas, hf_params, allocation_cls, attention_cls, mod
         if not tp_shardable(hf_params, tp_size):
             continue
         vram_reqs = build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size)
-        weight_need = fixed_non_kv_gb(vram_reqs)
+        weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
         alloc_kwargs = dict(model_vllm_kwargs)
         alloc_kwargs["tensor_parallel_size"] = tp_size
         chosen = RayTensorParallelAllocator().select(

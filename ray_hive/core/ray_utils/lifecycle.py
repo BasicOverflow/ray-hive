@@ -25,13 +25,18 @@ def shutdown_model(model_id: str):
     replica_ids = list(deployment["replicas"].keys()) if deployment else []
 
     apps = serve.status().applications or {}
-    for app_name in (model_id, *replica_ids):
+    # Replicas + registry first — if this runs inside the router (idle_timeout),
+    # deleting the router app last so cleanup is not cut off mid-flight.
+    for app_name in replica_ids:
         if app_name in apps:
             serve.delete(name=app_name)
 
     if replica_ids:
         ray.get(registry.clear_replicas.remote(replica_ids))
     ray.get(registry.release_deployment.remote(model_id))
+
+    if model_id in (serve.status().applications or {}):
+        serve.delete(name=model_id)
 
 
 def kill_gpu_registry():

@@ -90,6 +90,7 @@ class ModelRouter:
         replica_metadata: dict,
         chat_template_kwargs: dict | None = None,
         idle_timeout: int = -1,
+        sleep_timeout: int = -1,
     ):
         """Wire replica handles, queue tracking, and tokenizer for token counting."""
         self.model_id = model_id
@@ -98,34 +99,69 @@ class ModelRouter:
         self.replica_metadata = replica_metadata
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.idle_timeout = idle_timeout
+        self.sleep_timeout = sleep_timeout
         self._handles = None
         self._queue_depth = {name: 0 for name in gpu_deployment_names}
         self._shutting_down = False
-        self._last_activity = time.time()
+        self._sleeping = False
+        self._sleep_lock = asyncio.Lock()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         await self._warmup()
         self._last_activity = time.time()
-        if self.idle_timeout > 0:
-            asyncio.create_task(self._idle_watch())
+        if self.idle_timeout > 0 or self.sleep_timeout > 0:
+            asyncio.create_task(self._timeout_watch())
 
 
     def _touch(self):
-        """Record inference activity for idle shutdown."""
+        """Record inference activity for sleep/idle timeouts."""
         self._last_activity = time.time()
 
 
-    async def _idle_watch(self):
-        """Shutdown model after idle_timeout seconds with no inference."""
+    async def _timeout_watch(self):
+        """Sleep replicas after sleep_timeout; destroy model after idle_timeout."""
         from ray_hive.core.ray_utils.lifecycle import shutdown_model
 
-        interval = min(5, self.idle_timeout)
+        active = [t for t in (self.sleep_timeout, self.idle_timeout) if t > 0]
+        interval = min(5, *active)
         while not self._shutting_down:
             await asyncio.sleep(interval)
-            if time.time() - self._last_activity < self.idle_timeout:
-                continue
-            self._shutting_down = True
-            await asyncio.to_thread(shutdown_model, self.model_id)
+            quiet = time.time() - self._last_activity
+            if self.idle_timeout > 0 and quiet >= self.idle_timeout:
+                self._shutting_down = True
+                await asyncio.to_thread(shutdown_model, self.model_id)
+                return
+            if (
+                self.sleep_timeout > 0
+                and not self._sleeping
+                and quiet >= self.sleep_timeout
+            ):
+                async with self._sleep_lock:
+                    if self._sleeping or self._shutting_down:
+                        continue
+                    quiet = time.time() - self._last_activity
+                    if quiet < self.sleep_timeout:
+                        continue
+                    self._sleeping = True
+                    handles = self._get_handles()
+                    await asyncio.gather(*[
+                        handles[name].sleep.remote(1)
+                        for name in self.gpu_deployment_names
+                    ])
+
+
+    async def _ensure_awake(self):
+        """Wake all replicas if sleeping (call after _touch on real inference)."""
+        if self.sleep_timeout <= 0:
             return
+        async with self._sleep_lock:
+            if not self._sleeping:
+                return
+            handles = self._get_handles()
+            await asyncio.gather(*[
+                handles[name].wake_up.remote()
+                for name in self.gpu_deployment_names
+            ])
+            self._sleeping = False
 
 
     async def _warmup(self):
@@ -408,6 +444,7 @@ class ModelRouter:
     async def chat_completions(self, request: ChatCompletionRequest):
         """OpenAI-compatible chat completions endpoint (text-only)."""
         self._touch()
+        await self._ensure_awake()
         messages = self._to_chat_messages(request.messages)
         extra = request.model_dump(exclude={"model", "messages", "max_tokens", "temperature", "stream"})
         params = self._sampling_params(request.max_tokens, request.temperature, extra)
@@ -427,6 +464,7 @@ class ModelRouter:
     async def completions(self, request: CompletionRequest):
         """OpenAI-compatible text completions endpoint."""
         self._touch()
+        await self._ensure_awake()
         prompt = request.prompt if isinstance(request.prompt, str) else "\n".join(request.prompt)
         extra = request.model_dump(exclude={"model", "prompt", "max_tokens", "temperature", "stream"})
         params = self._sampling_params(request.max_tokens, request.temperature, extra)
@@ -443,6 +481,7 @@ class ModelRouter:
     async def infer(self, request):
         """Programmatic inference entrypoint — shards batches by measured replica tokens/sec."""
         self._touch()
+        await self._ensure_awake()
         if isinstance(request, dict):
             prompt = request.get("prompts") or request.get("prompt")
             kwargs = {k: v for k, v in request.items() if k not in ("prompt", "prompts")}

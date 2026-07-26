@@ -65,6 +65,7 @@ def plan_deployment(
     cpu_kv_offload_gb: float = 0,
     cpu_weight_offload_gb: float = 0,
     live_available_vram_gb: float | None = None,
+    sleep_mode: bool = False,
 ) -> dict:
     """
     Solve inverse VRAM problem → vLLM deployment settings dict.
@@ -74,9 +75,11 @@ def plan_deployment(
     unused (kept for plan display); live concurrency is GPU KV only.
     Decode sampling (flashinfer) peaks at logits + masked + softmax outside the
     util pool (~max_num_seqs × vocab × 10 bytes). CUDA graph capture also needs
-    ~0.6 GiB outside the pool. util = planned_pool / live_total (vLLM multiplies
+    ~0.6 GiB outside the util pool. util = planned_pool / live_total (vLLM multiplies
     by total card memory); planned pool is capped so util×total fits in live
     available after those reservations, and max_num_seqs is recomputed to match.
+    sleep_mode: vLLM CuMemAllocator (enable_sleep_mode) keeps an extra ~weights
+    footprint in the profiled peak; inflate non-KV so util×total covers it.
     """
     available_vram_gb = vram_budget_gb
     assert available_vram_gb > 0, f"vram_budget_gb must be positive, got {available_vram_gb}"
@@ -84,16 +87,26 @@ def plan_deployment(
     assert cpu_kv_offload_gb >= 0, f"cpu_kv_offload_gb must be >= 0, got {cpu_kv_offload_gb}"
     assert cpu_weight_offload_gb >= 0, f"cpu_weight_offload_gb must be >= 0, got {cpu_weight_offload_gb}"
     live_avail = live_total_vram_gb if live_available_vram_gb is None else live_available_vram_gb
+    # CuMemAllocator (sleep mode) profiles a higher peak than plain weight load.
+    sleep_overhead_gb = vram_reqs.calc_weights_gb() if sleep_mode else 0.0
 
     if max_num_seqs_override is not None and max_num_batched_tokens_override is not None:
         max_num_seqs = max_num_seqs_override
         max_num_batched_tokens = max_num_batched_tokens_override
-        non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
+        non_kv_vram_gb = (
+            vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens)
+            - cpu_weight_offload_gb
+            + sleep_overhead_gb
+        )
         kv_cache_gb = vram_reqs.calc_kv_cache_gb(max_model_len, max_num_seqs)
         total_vram_gb = non_kv_vram_gb + kv_cache_gb
     elif max_num_batched_tokens_override is not None:
         max_num_batched_tokens = max_num_batched_tokens_override
-        non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
+        non_kv_vram_gb = (
+            vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens)
+            - cpu_weight_offload_gb
+            + sleep_overhead_gb
+        )
         kv_cache_gb = available_vram_gb - non_kv_vram_gb
         if kv_cache_gb <= 0:
             raise ValueError(
@@ -111,7 +124,11 @@ def plan_deployment(
         max_num_batched_tokens = estimate_max_num_batched_tokens(
             vram_reqs, input_len, output_len, kv_cache_gb
         )
-        non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
+        non_kv_vram_gb = (
+            vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens)
+            - cpu_weight_offload_gb
+            + sleep_overhead_gb
+        )
         total_vram_gb = non_kv_vram_gb + kv_cache_gb
     else:
         fixed_on_gpu = (
@@ -119,6 +136,7 @@ def plan_deployment(
             + vram_reqs.calc_weights_gb()
             + vram_reqs.calc_misc_vram_gb()
             - cpu_weight_offload_gb
+            + sleep_overhead_gb
         )
         kv_cache_gb_est = available_vram_gb - fixed_on_gpu
         if kv_cache_gb_est <= 0:
@@ -134,7 +152,11 @@ def plan_deployment(
         max_num_batched_tokens = estimate_max_num_batched_tokens(
             vram_reqs, input_len, output_len, kv_cache_gb_est
         )
-        non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
+        non_kv_vram_gb = (
+            vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens)
+            - cpu_weight_offload_gb
+            + sleep_overhead_gb
+        )
         kv_cache_gb = available_vram_gb - non_kv_vram_gb
         if kv_cache_gb <= 0:
             raise ValueError(
@@ -149,7 +171,11 @@ def plan_deployment(
 
     if max_num_batched_tokens < max_num_seqs:
         max_num_batched_tokens = max_num_seqs
-        non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
+        non_kv_vram_gb = (
+            vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens)
+            - cpu_weight_offload_gb
+            + sleep_overhead_gb
+        )
         kv_cache_gb = available_vram_gb - non_kv_vram_gb
         if kv_cache_gb <= 0:
             raise ValueError(
@@ -181,7 +207,11 @@ def plan_deployment(
             max_num_seqs = max(1, int(room_gb / per_seq)) if room_gb > 0 and per_seq > 0 else 1
             if max_num_batched_tokens < max_num_seqs:
                 max_num_batched_tokens = max_num_seqs
-            non_kv_vram_gb = vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens) - cpu_weight_offload_gb
+            non_kv_vram_gb = (
+                vram_reqs.calc_non_kv_vram_gb(max_num_batched_tokens)
+                - cpu_weight_offload_gb
+                + sleep_overhead_gb
+            )
             continue
         if total_vram_gb > max_pool_gb:
             total_vram_gb = max_pool_gb

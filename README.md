@@ -178,6 +178,8 @@ Ray Hive-specific `deploy_model` arguments:
 - `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention (no TP awareness required).
 - `allocation_cls` — optional single-GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set; auto TP always uses `RayTensorParallelAllocator`).
 - `idle_timeout` — seconds of inference inactivity before the model self-shutdowns; `-1` (default) means never, must be `-1` or a positive integer. Survives client script exit; uses the same cleanup as `hive.shutdown(model_id)`.
+- `sleep_timeout` — seconds of inference inactivity before all replicas enter vLLM sleep (level 1: weights offloaded to CPU, KV discarded); `-1` (default) means never. Holds hive VRAM reservations while sleeping; next inference wakes replicas. When set, hive injects `enable_sleep_mode=True` into the engine and plans ~one extra weight copy of CuMemAllocator peak so KV still fits. Survives client script exit.
+- When both `sleep_timeout` and `idle_timeout` are set, `idle_timeout` must be greater than `sleep_timeout` (sleep first, then full destroy after longer quiet).
 - `vllm_kwargs` — dict forwarded to vLLM's `LLM(...)` constructor. Planner keys inside it (`max_num_seqs`, `max_num_batched_tokens`) are lifted into the deploy plan automatically and not double-applied to the engine. Serve-only keys like `default_chat_template_kwargs` are handled by the router.
 
 `deploy_model` returns when the model is ready (router deployed and warmed):
@@ -234,7 +236,7 @@ results = ray.get([square.remote(value) for value in range(10)])
 
 - `ray_hive/` — planner, registry, deployment service, router, and client API
 - `manifests/` — KubeRay cluster, worker image, and VRAM monitor definitions
-- `examples/` — model deployment and inference experiments (use `.env` / `.env.example` for cluster URLs)
+- `examples/` — model deployment and inference experiments (`.env` / `.env.example` for cluster URLs; also used by `basic_ray_tests/`)
 - `basic_ray_tests/` — general cluster and resource checks
 
 Related: [rayify](https://github.com/BasicOverflow/rayify), a tool for converting scripts into Ray jobs.

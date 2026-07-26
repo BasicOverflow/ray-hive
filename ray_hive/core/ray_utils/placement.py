@@ -7,13 +7,15 @@ from .hardware import count_by_host, host_memory_available_gb
 from .naming import deployment_name
 
 
-def fixed_non_kv_gb(vram_reqs) -> float:
+def fixed_non_kv_gb(vram_reqs, sleep_mode: bool = False) -> float:
     """Minimum per-GPU VRAM to load weights + overhead (before KV)."""
+    sleep_overhead = vram_reqs.calc_weights_gb() if sleep_mode else 0.0
     return (
         vram_reqs.calc_system_overhead_gb()
         + vram_reqs.calc_weights_gb()
         + vram_reqs.calc_misc_vram_gb()
         + 0.25
+        + sleep_overhead
     )
 
 
@@ -63,6 +65,7 @@ def plan_replica_groups(
     from .select_gpus import resolve_target_gpus
 
     cpu_ram_cfg = float(config.get("cpu_ram_per_instance") or 0)
+    sleep_mode = float(config.get("sleep_timeout", -1) or -1) > 0
     tp_size, target_gpus, vram_reqs = resolve_target_gpus(
         gpu_map,
         config.get("replicas", -1),
@@ -72,13 +75,14 @@ def plan_replica_groups(
         config.get("attention_cls"),
         model_vllm_kwargs,
         cpu_ram_cfg=cpu_ram_cfg,
+        sleep_mode=sleep_mode,
     )
     assert_cpu_ram_tp_allowed(tp_size, cpu_ram_cfg)
     gpu_groups = chunk_gpu_groups(target_gpus, tp_size)
     per_host = replicas_per_host(gpu_groups)
 
     max_model_len = config["max_input_prompt_length"] + config["max_output_prompt_length"]
-    weight_need = fixed_non_kv_gb(vram_reqs)
+    weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
     results = {}
 
     for group in gpu_groups:
@@ -105,6 +109,7 @@ def plan_replica_groups(
             cpu_kv_offload_gb=kv_offload,
             cpu_weight_offload_gb=cpu_offload,
             live_available_vram_gb=avail,
+            sleep_mode=sleep_mode,
         )
         plan["tensor_parallel_size"] = tp_size
         plan["weights_gb"] = vram_reqs.calc_weights_gb() * tp_size

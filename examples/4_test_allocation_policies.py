@@ -15,7 +15,7 @@ from ray_hive.core.ray_gpu_alloc import (
 from ray_hive.inference import inference_batch
 from ray_hive.core.ray_utils import approx_tdp, compute_cap, info, sm_count, success
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 MODEL_NAME = "Qwen/Qwen3-0.6B-FP8"
 REPLICAS = 2

@@ -11,7 +11,7 @@ from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
 from ray_hive.core.ray_utils import info, success
 from ray_hive.inference import inference_batch
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True)
 

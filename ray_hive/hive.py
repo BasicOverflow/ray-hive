@@ -76,6 +76,7 @@ class RayHive:
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         idle_timeout: int = -1,
+        sleep_timeout: int = -1,
         vllm_kwargs: Optional[dict] = None,
     ) -> dict:
         """
@@ -98,9 +99,16 @@ class RayHive:
           -1 = auto weight-spill need (capped at 70% of Ray free host memory / replicas
           on host); >0 hard GiB ceiling per replica. Weights stay on GPU if they fit;
           overflow spills to host. Leftover host RAM is unused (no CPU KV connector).
+        sleep_timeout: seconds of inactivity before all replicas sleep (level 1); -1 never.
+        idle_timeout: seconds of inactivity before full self-shutdown; -1 never.
+        When both are set, idle_timeout must be greater than sleep_timeout.
         """
         if idle_timeout != -1 and idle_timeout <= 0:
             raise ValueError("idle_timeout must be -1 (never) or a positive number of seconds")
+        if sleep_timeout != -1 and sleep_timeout <= 0:
+            raise ValueError("sleep_timeout must be -1 (never) or a positive number of seconds")
+        if idle_timeout > 0 and sleep_timeout > 0 and idle_timeout <= sleep_timeout:
+            raise ValueError("idle_timeout must be greater than sleep_timeout when both are set")
         planner_overrides, vllm_kwargs = _split_vllm_kwargs(vllm_kwargs)
         reject_unsupported_host_ram_kwargs(vllm_kwargs)
 
@@ -114,6 +122,7 @@ class RayHive:
             "attention_cls": attention_cls,
             "allocation_cls": allocation_cls,
             "idle_timeout": idle_timeout,
+            "sleep_timeout": sleep_timeout,
             **planner_overrides,
         }
 
@@ -153,6 +162,7 @@ class RayHive:
         vllm_kwargs.pop("tensor_parallel_size", None)
         vllm_kwargs.pop("distributed_executor_backend", None)
         vllm_kwargs.pop("idle_timeout", None)
+        vllm_kwargs.pop("sleep_timeout", None)
 
         config = {
             "name": model_name,

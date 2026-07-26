@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from ray_hive import RayHive, kill_gpu_registry
 from ray_hive.core.ray_utils import success
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 scheduler = RayHive(address=os.environ["RAY_ADDRESS"], suppress_logging=True, show_banner=False)
 scheduler.shutdown()

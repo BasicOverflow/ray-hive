@@ -44,6 +44,16 @@ class RayLLMActor:
         self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_kwargs))
 
 
+    async def sleep(self, level: int = 1):
+        """Hibernate engine (level 1: weights → CPU, discard KV)."""
+        await self.engine.sleep(level=level)
+
+
+    async def wake_up(self):
+        """Restore engine from sleep."""
+        await self.engine.wake_up()
+
+
     def _params(self, sampling_params, kind: RequestOutputKind) -> SamplingParams:
         """Clone (or default) sampling params with the given output_kind."""
         if sampling_params is None:

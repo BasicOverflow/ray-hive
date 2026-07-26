@@ -15,7 +15,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / "examples" / ".env")
 
 BASE = os.environ["RAY_DASHBOARD_URL"].rstrip("/")
 

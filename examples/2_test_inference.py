@@ -13,7 +13,7 @@ from ray_hive import RayHive
 from ray_hive.core.ray_utils import info
 from ray_hive.inference import inference_stream
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 MODEL_ID = "stream-demo"
 MODEL_NAME = "Qwen/Qwen3-0.6B-FP8"
