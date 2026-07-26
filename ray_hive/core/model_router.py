@@ -22,6 +22,7 @@ app = FastAPI()
 
 _WARMUP_PROMPTS = 32
 _WARMUP_MAX_TOKENS = 32
+_SHARD_BIAS_ALPHA = 1.05
 
 
 class TextContentPart(BaseModel):
@@ -205,11 +206,19 @@ class ModelRouter:
     def _sampling_params(self, max_tokens=None, temperature=None, extra=None) -> SamplingParams:
         """Build vLLM SamplingParams from request fields."""
         kwargs = dict(extra or {})
+        # OpenAI/LangChain send max_completion_tokens; SamplingParams wants max_tokens
+        mct = kwargs.pop("max_completion_tokens", None)
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        elif mct is not None:
+            kwargs["max_tokens"] = mct
         if temperature is not None:
             kwargs["temperature"] = temperature
         guided_json = kwargs.pop("guided_json", None)
+        response_format = kwargs.pop("response_format", None)
+        if guided_json is None and isinstance(response_format, dict):
+            if response_format.get("type") == "json_schema":
+                guided_json = (response_format.get("json_schema") or {}).get("schema")
         if guided_json is not None:
             kwargs["structured_outputs"] = StructuredOutputsParams(json=guided_json)
         return SamplingParams(**kwargs)
@@ -221,19 +230,29 @@ class ModelRouter:
 
 
     def _shard_prompts(self, prompts: list[str]) -> list[tuple[str, list[str], list[int]]]:
-        """Split prompts across replicas in proportion to measured tokens/sec."""
+        """Split prompts by throughput**alpha; largest-remainder for leftovers."""
         names = self.gpu_deployment_names
-        weights = [max(self.replica_metadata[n]["throughput"], 1e-6) for n in names]
+        weights = [
+            max(self.replica_metadata[n]["throughput"], 1e-6) ** _SHARD_BIAS_ALPHA
+            for n in names
+        ]
         total_w = sum(weights)
         n = len(prompts)
 
+        quotas = [n * w / total_w for w in weights]
+        counts = [int(q) for q in quotas]
+        leftover = n - sum(counts)
+        order = sorted(
+            range(len(names)),
+            key=lambda i: (quotas[i] - counts[i], weights[i]),
+            reverse=True,
+        )
+        for i in order[:leftover]:
+            counts[i] += 1
+
         shards = []
         start = 0
-        for i, (name, weight) in enumerate(zip(names, weights)):
-            if i == len(names) - 1:
-                count = n - start
-            else:
-                count = int(n * weight / total_w)
+        for name, count in zip(names, counts):
             end = start + count
             if count > 0:
                 shards.append((name, prompts[start:end], list(range(start, end))))
