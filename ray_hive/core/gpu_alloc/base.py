@@ -57,6 +57,12 @@ class BaseGpuAllocator(ABC):
         raise NotImplementedError
 
 
+    @staticmethod
+    def _is_unshared(gpu: dict) -> bool:
+        """True when the GPU has no hive pending/active reservations."""
+        return not gpu.get("pending") and not gpu.get("active")
+
+
     def select(
         self,
         gpu_map: dict[str, dict],
@@ -65,13 +71,19 @@ class BaseGpuAllocator(ABC):
         hf_params: dict,
         vllm_kwargs: dict,
     ) -> list[tuple[str, dict]]:
-        """Filter, rank by score descending, take top replicas (-1 = all)."""
+        """Filter, prefer unshared GPUs, then pack; rank each tier by score."""
         eligible = self.filter_eligible(gpu_map, min_vram_gb, hf_params, vllm_kwargs)
-        ranked = sorted(
-            eligible,
-            key=lambda item: self.score(item[0], item[1], hf_params, vllm_kwargs),
-            reverse=True,
-        )
+
+        def _rank(items: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+            return sorted(
+                items,
+                key=lambda item: self.score(item[0], item[1], hf_params, vllm_kwargs),
+                reverse=True,
+            )
+
+        unshared = _rank([(k, g) for k, g in eligible if self._is_unshared(g)])
+        shared = _rank([(k, g) for k, g in eligible if not self._is_unshared(g)])
+        ranked = unshared + shared
         if replicas == -1:
             return ranked
         return ranked[:replicas]

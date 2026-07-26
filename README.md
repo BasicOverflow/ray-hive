@@ -36,7 +36,7 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 - **Heterogeneous deployment:** One model can be replicated across GPUs with different capacities. Each replica receives its own memory and concurrency plan so every GPU contributes as much throughput as it can.
 - **Unified routing:** A model-level router ties those replicas together and sends work to the least-loaded GPU relative to its planned capacity.
 - **Live VRAM scheduling:** Placement uses current GPU memory rather than static card specifications and reserves memory during deployment.
-- **GPU sharing:** Multiple models can share a GPU when the registry and planner determine that enough VRAM remains.
+- **GPU sharing:** Multiple models can share a GPU when the registry and planner determine that enough VRAM remains. Auto-placement prefers GPUs with no hive reservations and only co-locates when no unshared eligible GPU remains; intentional sharing uses the same `gpu=` pin on two deploys with constrained `max_num_seqs` (see `examples/6_shared_gpu.py`).
 - **Flexible placement:** Models can target specific GPUs, a requested replica count, or every eligible GPU.
 - **Same-node tensor parallelism:** If a model does not fit on any one GPU, auto placement escalates to same-node TP; or pin an explicit `gpu=[...]` set. Each TP group is one Serve replica with vLLM’s multiprocessing backend.
 - **Host RAM extension (`cpu_ram_per_instance`):** Sole hive arg for extending beyond GPU VRAM on **TP=1** replicas (weight spill only). If weights do not fit the GPU budget, overflow spills to host (`cpu_offload_gb`). KV offloading is not supported yet — passing `kv_offloading_size`, `kv_offloading_backend`, or `kv_transfer_config` raises. Do not pass `cpu_offload_gb` as a vLLM kwarg; use `cpu_ram_per_instance`. Not supported when TP>1 — use `cpu_ram_per_instance=0` and fit on GPU VRAM only.
@@ -79,6 +79,8 @@ Policies implemented so far:
 - **Conserve TDP** (`RayConserveTdpAllocator`) — rank eligible GPUs toward lower approximate TDP; SM count as tie-break.
 - **FP8** (`RayFp8Allocator`) — same ranking as PerformanceAllocator; prefer Ada GPUs when FP8 is used.
 - **Tensor parallel** (`RayTensorParallelAllocator`) — pack same-node GPU sets (usable ≈ N × min available); used automatically when single-GPU placement fails and `gpu=` is unset.
+
+TP=1 policies (Performance / Conserve TDP / FP8) use a two-tier select: unshared GPUs (no pending/active hive reservations) first, ranked by policy score; only then partially occupied GPUs. Co-location is a last resort when unshared capacity is exhausted. Tensor-parallel select is unchanged (multi-GPU groups for one model).
 
 Ray-wired allocators also drop GPUs whose host is not an Alive Ray node.
 
