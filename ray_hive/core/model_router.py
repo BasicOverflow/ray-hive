@@ -1,5 +1,5 @@
 """
-Model router — least-queue load balancing with OpenAI-compatible HTTP ingress.
+Model router — engine-queue load balancing with OpenAI-compatible HTTP ingress.
 
 Exposes /v1/models, /v1/chat/completions, /v1/completions on the router
 deployment. Programmatic inference goes through infer() → replica handle.
@@ -22,7 +22,8 @@ app = FastAPI()
 
 _WARMUP_PROMPTS = 32
 _WARMUP_MAX_TOKENS = 32
-_SHARD_BIAS_ALPHA = 1.05
+_LOAD_REFRESH_S = 0.1
+_WAITING_WEIGHT = 4
 
 
 class TextContentPart(BaseModel):
@@ -80,7 +81,7 @@ class CompletionRequest(BaseModel):
 )
 @serve.ingress(app)
 class ModelRouter:
-    """Router with least-queue balancing and OpenAI-compatible HTTP ingress."""
+    """Router with engine-queue balancing and OpenAI-compatible HTTP ingress."""
 
     async def __init__(
         self,
@@ -92,7 +93,7 @@ class ModelRouter:
         idle_timeout: int = -1,
         sleep_timeout: int = -1,
     ):
-        """Wire replica handles, queue tracking, and tokenizer for token counting."""
+        """Wire replica handles, load cache, and tokenizer for token counting."""
         self.model_id = model_id
         self.model_name = model_name
         self.gpu_deployment_names = gpu_deployment_names
@@ -101,13 +102,15 @@ class ModelRouter:
         self.idle_timeout = idle_timeout
         self.sleep_timeout = sleep_timeout
         self._handles = None
-        self._queue_depth = {name: 0 for name in gpu_deployment_names}
+        self._loads = {name: {"waiting": 0, "running": 0} for name in gpu_deployment_names}
+        self._eng_start = 0
         self._shutting_down = False
         self._sleeping = False
         self._sleep_lock = asyncio.Lock()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         await self._warmup()
         self._last_activity = time.time()
+        asyncio.create_task(self._refresh_loads())
         if self.idle_timeout > 0 or self.sleep_timeout > 0:
             asyncio.create_task(self._timeout_watch())
 
@@ -164,20 +167,26 @@ class ModelRouter:
             self._sleeping = False
 
 
+    async def _refresh_loads(self):
+        """Poll replica engine queue depths into the local load cache."""
+        handles = self._get_handles()
+        while not self._shutting_down:
+            results = await asyncio.gather(*[
+                handles[name].get_load.remote()
+                for name in self.gpu_deployment_names
+            ])
+            for name, load in zip(self.gpu_deployment_names, results):
+                self._loads[name] = load
+            await asyncio.sleep(_LOAD_REFRESH_S)
+
+
     async def _warmup(self):
-        """Time a fixed batch on each replica and store tokens/sec as throughput."""
+        """Heat each replica engine with a fixed batch (no tok/s retained)."""
         handles = self._get_handles()
         prompts = [f"warmup {i}" for i in range(_WARMUP_PROMPTS)]
         params = SamplingParams(max_tokens=_WARMUP_MAX_TOKENS, temperature=0.0)
         for name in self.gpu_deployment_names:
-            start = time.perf_counter()
-            outputs = await handles[name].generate.remote(prompts, params)
-            elapsed = max(time.perf_counter() - start, 1e-6)
-            tokens = sum(
-                len(o.prompt_token_ids) + len(o.outputs[0].token_ids)
-                for o in outputs
-            )
-            self.replica_metadata[name]["throughput"] = tokens / elapsed
+            await handles[name].generate.remote(prompts, params)
 
 
     def _get_handles(self):
@@ -215,27 +224,29 @@ class ModelRouter:
             **self.chat_template_kwargs,
         )
         replica_name = self._select_replica()
-        self._queue_depth[replica_name] += 1
-        try:
-            handle = self._get_handles()[replica_name]
-            return await handle.generate.remote(
-                [prompt],
-                self._sampling_params(max_tokens, temperature, extra),
-            )
-        finally:
-            self._queue_depth[replica_name] = max(0, self._queue_depth[replica_name] - 1)
+        handle = self._get_handles()[replica_name]
+        return await handle.generate.remote(
+            [prompt],
+            self._sampling_params(max_tokens, temperature, extra),
+        )
 
 
     def _select_replica(self) -> str:
-        """Pick replica with lowest queue_depth / measured tokens/sec."""
+        """Pick replica with lowest (waiting*4+running) / max_num_seqs."""
+        names = self.gpu_deployment_names
+        n = len(names)
         best_name = None
         best_score = float("inf")
-        for name in self.gpu_deployment_names:
-            throughput = max(self.replica_metadata[name]["throughput"], 1e-6)
-            score = self._queue_depth[name] / throughput
+        for i in range(n):
+            name = names[(self._eng_start + i) % n]
+            load = self._loads[name]
+            cap = max(self.replica_metadata[name]["max_num_seqs"], 1)
+            score = (load["waiting"] * _WAITING_WEIGHT + load["running"]) / cap
             if score < best_score:
                 best_score = score
                 best_name = name
+        self._loads[best_name]["waiting"] += 1
+        self._eng_start = (self._eng_start + 1) % n
         return best_name
 
 
@@ -266,12 +277,9 @@ class ModelRouter:
 
 
     def _shard_prompts(self, prompts: list[str]) -> list[tuple[str, list[str], list[int]]]:
-        """Split prompts by throughput**alpha; largest-remainder for leftovers."""
+        """Split prompts by max_num_seqs; largest-remainder for leftovers."""
         names = self.gpu_deployment_names
-        weights = [
-            max(self.replica_metadata[n]["throughput"], 1e-6) ** _SHARD_BIAS_ALPHA
-            for n in names
-        ]
+        weights = [max(self.replica_metadata[n]["max_num_seqs"], 1) for n in names]
         total_w = sum(weights)
         n = len(prompts)
 
@@ -297,33 +305,25 @@ class ModelRouter:
 
 
     async def _dispatch_prompts(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
-        """Shard a prompt batch by measured tokens/sec and run replicas concurrently."""
+        """Shard a prompt batch by max_num_seqs and run replicas concurrently."""
         handles = self._get_handles()
         if len(prompts) == 1:
             name = self._select_replica()
-            self._queue_depth[name] += 1
-            try:
-                outputs = await handles[name].generate.remote(prompts, sampling_params)
-                return self._extract_texts(outputs)
-            finally:
-                self._queue_depth[name] = max(0, self._queue_depth[name] - 1)
+            outputs = await handles[name].generate.remote(prompts, sampling_params)
+            return self._extract_texts(outputs)
 
         shards = self._shard_prompts(prompts)
         for name, chunk, _ in shards:
-            self._queue_depth[name] += len(chunk)
-        try:
-            outputs = await asyncio.gather(*[
-                handles[name].generate.remote(chunk, sampling_params)
-                for name, chunk, _ in shards
-            ])
-            texts = [None] * len(prompts)
-            for (_, _, idxs), outs in zip(shards, outputs):
-                for local_i, global_i in enumerate(idxs):
-                    texts[global_i] = outs[local_i].outputs[0].text
-            return texts
-        finally:
-            for name, chunk, _ in shards:
-                self._queue_depth[name] = max(0, self._queue_depth[name] - len(chunk))
+            self._loads[name]["waiting"] += len(chunk)
+        outputs = await asyncio.gather(*[
+            handles[name].generate.remote(chunk, sampling_params)
+            for name, chunk, _ in shards
+        ])
+        texts = [None] * len(prompts)
+        for (_, _, idxs), outs in zip(shards, outputs):
+            for local_i, global_i in enumerate(idxs):
+                texts[global_i] = outs[local_i].outputs[0].text
+        return texts
 
 
     async def _route_text(self, prompt, max_tokens=None, temperature=None, extra=None):
@@ -338,13 +338,9 @@ class ModelRouter:
     async def _route_stream(self, prompt: str, sampling_params: SamplingParams) -> AsyncIterator[str]:
         """Stream text deltas from the least-loaded replica."""
         replica_name = self._select_replica()
-        self._queue_depth[replica_name] += 1
-        try:
-            handle = self._get_handles()[replica_name].options(stream=True)
-            async for delta in handle.generate_stream.remote(prompt, sampling_params):
-                yield delta
-        finally:
-            self._queue_depth[replica_name] = max(0, self._queue_depth[replica_name] - 1)
+        handle = self._get_handles()[replica_name].options(stream=True)
+        async for delta in handle.generate_stream.remote(prompt, sampling_params):
+            yield delta
 
 
     def _chat_prompt(self, messages) -> str:
@@ -479,7 +475,7 @@ class ModelRouter:
 
 
     async def infer(self, request):
-        """Programmatic inference entrypoint — shards batches by measured replica tokens/sec."""
+        """Programmatic inference entrypoint — shards batches by planned max_num_seqs."""
         self._touch()
         await self._ensure_awake()
         if isinstance(request, dict):

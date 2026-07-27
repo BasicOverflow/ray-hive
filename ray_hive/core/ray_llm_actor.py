@@ -7,9 +7,34 @@ import uuid
 
 from ray import serve
 from vllm import SamplingParams
+from vllm.config import VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.metrics.loggers import StatLoggerBase
+
+
+class LoadStatLogger(StatLoggerBase):
+    """Caches engine waiting/running counts for hive router LB."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        engine_index: int = 0,
+        load_ref: dict | None = None,
+    ):
+        self._load = load_ref if load_ref is not None else {"waiting": 0, "running": 0}
+
+
+    def record(self, scheduler_stats, iteration_stats, mm_cache_stats=None, engine_idx=0):
+        if scheduler_stats is None:
+            return
+        self._load["waiting"] = scheduler_stats.num_waiting_reqs
+        self._load["running"] = scheduler_stats.num_running_reqs
+
+
+    def log_engine_initialized(self):
+        pass
 
 
 @serve.deployment(
@@ -33,6 +58,7 @@ class RayLLMActor:
         if "," in target_gpu_id:
             os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
         engine_kwargs = dict(engine_kwargs)
+        engine_kwargs.setdefault("disable_log_stats", True)
         ktc = engine_kwargs.get("kv_transfer_config")
         if ktc is not None or engine_kwargs.get("kv_offloading_size"):
             os.environ["VLLM_USE_SIMPLE_KV_OFFLOAD"] = "1"
@@ -40,8 +66,22 @@ class RayLLMActor:
             from vllm.config import KVTransferConfig
             engine_kwargs["kv_transfer_config"] = KVTransferConfig(**ktc)
         self.model_id = model_id
+        self._load = {"waiting": 0, "running": 0}
+        load_ref = self._load
+
+        def load_logger_factory(vllm_config: VllmConfig, engine_index: int = 0):
+            return LoadStatLogger(vllm_config, engine_index, load_ref=load_ref)
+
         # Build on Serve's running loop so AsyncLLM's output_handler attaches correctly.
-        self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_kwargs))
+        self.engine = AsyncLLM.from_engine_args(
+            AsyncEngineArgs(**engine_kwargs),
+            stat_loggers=[load_logger_factory],
+        )
+
+
+    def get_load(self) -> dict:
+        """Return cached engine waiting/running queue depths."""
+        return dict(self._load)
 
 
     async def sleep(self, level: int = 1):

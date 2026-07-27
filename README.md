@@ -65,7 +65,7 @@ Placement supports:
 - With `gpu=None`, try single-GPU placement via `allocation_cls` (default: performance ranking); if nothing fits and `cpu_ram_per_instance=0`, escalate to same-node TP packs.
 - Use `replicas=-1` to deploy on every eligible GPU (or every non-overlapping TP group) under that policy.
 
-After placement, requests go to the replica with the lowest queue depth relative to that replica's measured throughput.
+After placement, requests go to the least-loaded replica relative to its planned capacity.
 
 ## GPU Allocation Policies
 
