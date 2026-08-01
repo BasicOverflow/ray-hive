@@ -34,9 +34,21 @@ __pycache__/
 *.so
 .Python
 *.egg-info/
+.eggs/
+*.egg
+dist/
+build/
+wheels/
+*.whl
+.venv/
 venv/
 env/
 ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Temporary files
 *.tmp
