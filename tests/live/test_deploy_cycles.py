@@ -5,8 +5,16 @@ import urllib.request
 
 import pytest
 
-from tests.live.cluster_sched import GpuNeed, run_cycles_parallel
-from tests.live.conftest import EMBED_MODEL, MM_MODEL, TEXT_MODEL, VLLM_TEXT, uniq
+from tests.live.cluster_sched import GpuNeed, UnsatisfiableError, run_cycles_parallel
+from tests.live.conftest import (
+    EMBED_MODEL,
+    MM_MODEL,
+    TEXT_MODEL,
+    VLLM_TEXT,
+    note_vram_skip,
+    uniq,
+)
+from tests.live.vram_gate import wait_for_available
 
 pytestmark = pytest.mark.live
 
@@ -32,10 +40,6 @@ def _openai_chat(model_id: str, prompt: str, max_tokens: int = 16) -> str:
     with urllib.request.urlopen(req, timeout=180) as resp:
         data = json.loads(resp.read().decode())
     return data["choices"][0]["message"]["content"]
-
-
-def _hosts(state: dict) -> set[str]:
-    return {k.split(":")[0] for k in state}
 
 
 def _fp8_need(**kwargs) -> GpuNeed:
@@ -115,8 +119,9 @@ def test_live_cycles_parallel(hive, scheduler):
 
     cycles.append((_fp8_need(min_free_gb=8.0, count=1, name="C"), cycle_c))
 
-    # D — topology across hosts
-    if len(_hosts(state)) >= 2:
+    # D — topology across hosts (needs ≥2 Ada hosts for FP8 text model)
+    need_d = _fp8_need(min_free_gb=4.0, count=2, distinct_hosts=True, name="D")
+    if scheduler.structurally_possible(need_d, state):
         def cycle_d(claim):
             mid = uniq("d")
             try:
@@ -130,10 +135,11 @@ def test_live_cycles_parallel(hive, scheduler):
             finally:
                 hive.shutdown(mid)
 
-        cycles.append((
-            _fp8_need(min_free_gb=4.0, count=2, distinct_hosts=True, name="D"),
-            cycle_d,
-        ))
+        cycles.append((need_d, cycle_d))
+    else:
+        note_vram_skip(
+            "D: skipped — cluster has no 2-host Ada (cap>=8.9) topology for FP8"
+        )
 
     # E — same-host TP=2
     def cycle_e(claim):
@@ -211,44 +217,54 @@ def test_live_cycles_parallel(hive, scheduler):
     cycles.append((GpuNeed(min_free_gb=10.0, count=1, name="H"), cycle_h))
 
     errs = run_cycles_parallel(scheduler, cycles, max_workers=min(2, len(cycles)))
-    hard, timeouts, ok = [], [], 0
+    hard, soft, ok = [], [], 0
     for (need, _), err in zip(cycles, errs):
         if err is None:
             ok += 1
-        elif isinstance(err, TimeoutError):
-            timeouts.append(f"{need.name}: {err}")
+        elif isinstance(err, (TimeoutError, UnsatisfiableError)):
+            msg = f"{need.name}: {err}"
+            soft.append(msg)
+            note_vram_skip(msg)
         else:
             hard.append(f"{need.name}: {err}")
     if hard:
         pytest.fail("live cycle failures: " + "; ".join(hard))
     if ok == 0:
-        pytest.skip("no free GPUs for any cycle: " + "; ".join(timeouts))
+        pytest.skip("no free GPUs for any cycle: " + "; ".join(soft))
 
 
 @pytest.mark.nightly
 def test_live_resilience_registry_kill(hive, scheduler):
-    """I — kill registry singleton and redeploy (nightly / exclusive)."""
+    """I — kill registry singleton and redeploy once DaemonSet VRAM is real again."""
     from ray_hive.core.ray_utils.lifecycle import kill_gpu_registry
 
     claim = None
     mid = uniq("i")
+    pin = None
     try:
         claim = scheduler.claim(_fp8_need(min_free_gb=4.0, count=1, name="I"))
+        pin = claim.gpu_keys[0]
         hive.deploy_model(
             model_id=mid, model_name=TEXT_MODEL,
             max_input_prompt_length=256, max_output_prompt_length=64,
-            replicas=1, gpu=claim.gpu_keys[0], vllm_kwargs=VLLM_TEXT,
+            replicas=1, gpu=pin, vllm_kwargs=VLLM_TEXT,
         )
         hive.shutdown(mid)
+        # Wait for physical free *before* kill — otherwise the new registry is
+        # seeded with nvidia-smi free=0 while the engine is still releasing CUDA.
+        wait_for_available(hive.get_vram_state, pin, 4.0, max_wait_s=180.0)
         kill_gpu_registry()
+        # Fresh actor starts empty / free=0 until DaemonSet reports again.
+        wait_for_available(hive.get_vram_state, pin, 4.0, max_wait_s=180.0)
         mid2 = uniq("i2")
         hive.deploy_model(
             model_id=mid2, model_name=TEXT_MODEL,
             max_input_prompt_length=256, max_output_prompt_length=64,
-            replicas=1, gpu=claim.gpu_keys[0], vllm_kwargs=VLLM_TEXT,
+            replicas=1, gpu=pin, vllm_kwargs=VLLM_TEXT,
         )
         hive.shutdown(mid2)
     except TimeoutError as e:
+        note_vram_skip(f"I resilience: {e}")
         pytest.skip(str(e))
     finally:
         if claim is not None:

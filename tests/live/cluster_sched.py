@@ -2,6 +2,11 @@
 
 Reads a fresh VRAM snapshot at every claim attempt and only grants
 disjoint GPU keys across in-flight cycles in this pytest process.
+
+Claims wait while sibling cycles still hold GPUs. Timeout only applies when
+nothing in-process is holding capacity (external busy / true shortage).
+Structurally impossible needs (e.g. 2 Ada hosts when the cluster has one)
+fail immediately.
 """
 from __future__ import annotations
 
@@ -31,6 +36,10 @@ class Claim:
     claim_id: int
 
 
+class UnsatisfiableError(TimeoutError):
+    """Cluster inventory can never meet this need (not a transient wait)."""
+
+
 def _gpu_compute_cap(info: dict) -> tuple[int, int]:
     specs = info.get("specs") or {}
     return (
@@ -55,12 +64,18 @@ class ClusterScheduler:
         self._lock = threading.Lock()
         self._held: dict[int, set[str]] = {}
         self._next_id = 1
+        self._release_event = threading.Event()
 
 
-    def _free_keys(self, state: dict) -> dict[str, float]:
+    def _held_keys(self) -> set[str]:
         held = set()
         for keys in self._held.values():
             held |= keys
+        return held
+
+
+    def _free_keys(self, state: dict) -> dict[str, float]:
+        held = self._held_keys()
         out = {}
         for key, info in state.items():
             if key in held:
@@ -68,6 +83,18 @@ class ClusterScheduler:
             avail = float(info.get("available", info.get("free", 0.0)))
             out[key] = avail
         return out
+
+
+    def structurally_possible(self, need: GpuNeed, state: dict | None = None) -> bool:
+        """True if cluster hardware could meet need when all GPUs are free."""
+        state = state if state is not None else self._get()
+        # Pretend every GPU has its full total free (ignore live load + holds).
+        fake_free = {}
+        for key, info in state.items():
+            total = float(info.get("total", 0.0))
+            if total >= need.min_free_gb:
+                fake_free[key] = total
+        return self._pick(state, fake_free, need) is not None
 
 
     def try_claim(self, need: GpuNeed) -> Claim | None:
@@ -81,37 +108,65 @@ class ClusterScheduler:
             cid = self._next_id
             self._next_id += 1
             self._held[cid] = set(keys)
+            self._release_event.clear()
             return Claim(need=need, gpu_keys=keys, claim_id=cid)
 
 
     def claim(self, need: GpuNeed) -> Claim:
-        """Wait/re-snapshot until claim succeeds or raise TimeoutError."""
-        deadline = time.time() + self.max_wait_s
+        """Wait until claim succeeds.
+
+        - Immediate UnsatisfiableError if the cluster can never meet the need.
+        - While sibling cycles hold GPUs, keep waiting past max_wait_s.
+        - Timeout only when max_wait_s elapses with no in-process holds.
+        """
+        state = self._get()
+        if not self.structurally_possible(need, state):
+            raise UnsatisfiableError(
+                f"cluster cannot satisfy {need.name}: count={need.count} "
+                f">={need.min_free_gb}GB same_host={need.same_host} "
+                f"distinct_hosts={need.distinct_hosts} cap>={need.min_compute_cap}"
+            )
+
+        idle_deadline = time.time() + self.max_wait_s
         while True:
             c = self.try_claim(need)
             if c is not None:
                 return c
-            if time.time() >= deadline:
+
+            with self._lock:
+                held = bool(self._held)
+
+            if not held and time.time() >= idle_deadline:
                 state = self._get()
                 free = self._free_keys(state)
                 raise TimeoutError(
                     f"no GPUs for {need.name}: need count={need.count} "
                     f">={need.min_free_gb}GB same_host={need.same_host} "
+                    f"distinct_hosts={need.distinct_hosts} "
                     f"cap>={need.min_compute_cap}; "
                     f"free_now={ {k: round(v, 2) for k, v in free.items()} }"
                 )
-            time.sleep(self.poll_s)
+
+            # Sibling still holding — wait for a release (or poll).
+            self._release_event.wait(timeout=self.poll_s)
+            self._release_event.clear()
+            if held:
+                # Extend idle deadline so external timeout only counts quiet time.
+                idle_deadline = time.time() + self.max_wait_s
 
 
     def release(self, claim: Claim | int) -> None:
         cid = claim.claim_id if isinstance(claim, Claim) else claim
         with self._lock:
             self._held.pop(cid, None)
+        self._release_event.set()
 
 
     def _pick(self, state: dict, free: dict[str, float], need: GpuNeed) -> list[str] | None:
         eligible = []
         for k, gb in free.items():
+            if k not in state:
+                continue
             if gb < need.min_free_gb:
                 continue
             if need.min_compute_cap is not None:

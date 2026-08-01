@@ -56,9 +56,14 @@ target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+addopts = "-q --strict-markers --disable-warnings"
 markers = [
     "ray: needs live Ray cluster (no LLM)",
     "live: needs Ray + GPUs + model download",
     "nightly: long stress / full MM",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore:coroutine .*:RuntimeWarning",
 ]

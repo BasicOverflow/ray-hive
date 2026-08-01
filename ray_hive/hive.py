@@ -38,15 +38,31 @@ def _split_vllm_kwargs(vllm_kwargs: dict | None) -> tuple[dict, dict]:
     return overrides, remaining
 
 
+def _registry_still_settling(exc: Exception) -> bool:
+    """True when registry/DaemonSet has not finished reporting free VRAM yet."""
+    msg = str(exc)
+    return (
+        "not in registry" in msg
+        or "Known: []" in msg
+        # Fresh registry entries start at free=0; nvidia-smi also reads 0 while
+        # a just-killed engine is still releasing CUDA memory.
+        or "0.00GB available" in msg
+        or "0.0GB available" in msg
+    )
+
+
 def _retry_if_registry_empty(fn):
-    """DaemonSet needs a beat after kill_gpu_registry; one retry like re-running the script."""
-    try:
-        return fn()
-    except Exception as e:
-        if "not in registry" not in str(e) and "Known: []" not in str(e):
-            raise
-        time.sleep(5)
-        return fn()
+    """Poll briefly after kill_gpu_registry / teardown until DaemonSet VRAM is real."""
+    last = None
+    for attempt in range(8):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if not _registry_still_settling(e) or attempt == 7:
+                raise
+            time.sleep(5)
+    raise last
 
 
 class RayHive:

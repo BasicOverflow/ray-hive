@@ -16,6 +16,13 @@ VLLM_TEXT = dict(
     default_chat_template_kwargs={"enable_thinking": False},
 )
 
+# Session-scoped notes for capacity skips (printed in terminal summary).
+_VRAM_SKIPS: list[str] = []
+
+
+def note_vram_skip(msg: str) -> None:
+    _VRAM_SKIPS.append(msg)
+
 
 @pytest.fixture(scope="session")
 def hive():
@@ -37,3 +44,11 @@ def scheduler(hive):
 
 def uniq(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if not _VRAM_SKIPS:
+        return
+    terminalreporter.write_sep("=", "VRAM capacity skips")
+    for line in _VRAM_SKIPS:
+        terminalreporter.write_line(f"SKIP/WARN: {line}")
