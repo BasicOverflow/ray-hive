@@ -15,7 +15,6 @@ The cluster remains a normal Ray cluster: CPU workers can run general distribute
 - [Lifecycle](#lifecycle)
 - [OpenAI HTTP](#openai-http)
 - [General Ray CPU Tasks](#general-ray-cpu-tasks)
-- [Appendix](#appendix)
 
 ## Architecture
 
@@ -338,6 +337,36 @@ When `gpu=` is unset, `allocation_cls` picks GPUs (`ray_hive.core.gpu_alloc` / `
 
 TP=1 policies prefer unshared GPUs first, then co-locate. Alive Ray nodes only.
 
+### Running tests
+
+```bash
+pip install -e ".[dev]"   # or: pip install -r requirements-dev.txt
+
+# Parallel unit suite (default; no Ray / no LLM — RAY_ADDRESS not required)
+pytest -n auto -m "not ray and not live"
+```
+
+**`ray` / `live` require `RAY_ADDRESS`.** Without it those tests skip. Set it in the shell before running (same value as `examples/.env`):
+
+```bash
+# Linux / macOS
+export RAY_ADDRESS=ray://YOUR_RAY_HEAD_IP:10001
+
+# PowerShell
+$env:RAY_ADDRESS = "ray://YOUR_RAY_HEAD_IP:10001"
+```
+
+Then (single process — do **not** use `pytest -n` here; live GPU claims must stay process-local):
+
+```bash
+pytest -m ray    # cluster smoke, no LLM
+pytest -m live   # Deploy A–H; needs GPUs + model download
+# or both:
+pytest -m "ray or live"
+```
+
+Markers: `ray` (cluster, no LLM), `live` (small-model cycles), `nightly` (stress / resilience).
+
 ### Repository
 
 - `ray_hive/` — planner, registry, deployment service, router, client API
@@ -345,6 +374,7 @@ TP=1 policies prefer unshared GPUs first, then co-locate. Alive Ray nodes only.
 - `examples/` — deploy/inference experiments (`.env` / `.env.example`)
 - `examples/requirements.txt` — example-only deps
 - `examples/media/` — multimodal fixtures
-- `basic_ray_tests/` — cluster / resource checks
+- `tests/` — pytest unit (`unit/`), Ray smoke (`ray_smoke/`), live cycles (`live/`)
+- `basic_ray_tests/` — manual cluster / resource scripts
 
 Related: [rayify](https://github.com/BasicOverflow/rayify), a tool for converting scripts into Ray jobs.

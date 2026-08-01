@@ -37,7 +37,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-xdist>=3.5.0",
+    "httpx>=0.27.0",
     "black>=23.0.0",
     "flake8>=6.0.0",
 ]
@@ -50,3 +53,12 @@ include = ["ray_hive*"]
 line-length = 100
 target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "ray: needs live Ray cluster (no LLM)",
+    "live: needs Ray + GPUs + model download",
+    "nightly: long stress / full MM",
+]
