@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 
 import ray
 
+from ray_hive.errors import InsufficientVramError
+
 
 class ClusterStateManager(ABC):
     """Tracks router-level deployments and replica GPU reservations."""
@@ -58,9 +60,12 @@ class ClusterStateManager(ABC):
             # available is free - pending; do not subtract used_vram again
             available_gb = live_free.get(gpu_key, 0.0)
             if available_gb < requested_gb:
-                raise ValueError(
+                raise InsufficientVramError(
                     f"Not enough VRAM on {gpu_key} for deployment {deployment_id}: "
-                    f"requested {requested_gb} GiB, available {available_gb} GiB"
+                    f"requested {requested_gb} GiB, available {available_gb} GiB",
+                    gpu=gpu_key,
+                    available_gb=available_gb,
+                    need_gb=requested_gb,
                 )
 
 
@@ -105,6 +110,16 @@ class ClusterStateManager(ABC):
     def get_deployment(self, deployment_id: str) -> dict | None:
         """Return deployment record or None."""
         return self.deployments.get(deployment_id)
+
+
+    def list_model_ids(self) -> list[str]:
+        """Return model_ids for deployments registered as type ``model``."""
+        out = []
+        for deployment_id, dep in self.deployments.items():
+            if dep.get("deployment_type") != "model":
+                continue
+            out.append(dep.get("model_id") or deployment_id)
+        return out
 
 
 class VRAMAllocator(ClusterStateManager):

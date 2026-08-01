@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 from ray_hive import RayHive
-from ray_hive.core.ray_utils import info
+from ray_hive.core.ray_utils import info, serve_base_url
 from ray_hive.inference import inference_stream
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -25,14 +25,6 @@ MAX_IN, MAX_OUT, MAX_SEQS = 512, 256, 5
 class Joke(BaseModel):
     setup: str = Field(description="The setup of the joke")
     punchline: str = Field(description="The punchline of the joke")
-
-
-def serve_base_url() -> str:
-    explicit = os.getenv("RAY_SERVE_URL")
-    if explicit:
-        return explicit.rstrip("/")
-    host = os.environ["RAY_ADDRESS"].removeprefix("ray://").split(":")[0]
-    return f"http://{host}:8000"
 
 
 def request_json(method: str, path: str, body: dict | None = None) -> dict:

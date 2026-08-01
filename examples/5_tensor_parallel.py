@@ -2,7 +2,6 @@
 
 Qwen3-8B-FP8 (~8GB weights total → ~4GB/GPU at TP=2) on ergos-02 gpu1+gpu2.
 7B bf16 (~14GB → ~7GB/GPU + overhead) does not fit the 8GB card here.
-cpu_ram_per_instance=0 (GPU VRAM only).
 """
 import os
 import sys
@@ -35,7 +34,6 @@ deployments = [
             "max_output_prompt_length": 512,
             "replicas": 1,
             "gpu": ["ergos-02-nv:gpu1", "ergos-02-nv:gpu2"],
-            "cpu_ram_per_instance": 0,
             "vllm_kwargs": VLLM_KWARGS,
         },
     },

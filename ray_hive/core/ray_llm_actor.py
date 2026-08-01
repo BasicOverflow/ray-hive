@@ -4,7 +4,6 @@ Ray Serve vLLM replica — AsyncLLM engine pinned to one or more GPUs (same-node
 import asyncio
 import os
 import uuid
-
 from ray import serve
 from vllm import SamplingParams
 from vllm.config import VllmConfig
@@ -37,6 +36,15 @@ class LoadStatLogger(StatLoggerBase):
         pass
 
 
+def _normalize_engine_kwargs(engine_kwargs: dict) -> dict:
+    """Map hive/user kwargs onto current AsyncEngineArgs (task → runner)."""
+    kw = dict(engine_kwargs)
+    if kw.get("task") == "embed":
+        kw.setdefault("runner", "pooling")
+        kw.pop("task", None)
+    return kw
+
+
 @serve.deployment(
     ray_actor_options={"num_gpus": 0},
     autoscaling_config=None,
@@ -46,26 +54,31 @@ class LoadStatLogger(StatLoggerBase):
 class RayLLMActor:
     """Ray Serve replica — vLLM AsyncLLM on one GPU or a same-node TP group."""
 
-    async def __init__(self, model_id: str, target_gpu_id: str, engine_kwargs: dict):
+    async def __init__(
+        self,
+        model_id: str,
+        target_gpu_id: str,
+        engine_kwargs: dict,
+        pooling: bool = False,
+        multimodal: bool = False,
+    ):
         """
         Pin to target GPU id(s) and initialize AsyncLLM.
 
         target_gpu_id is a single local id ("0") or comma-separated ids ("0,1")
         for tensor_parallel_size > 1. Serve still exposes one handle per replica.
         """
+        from ray_hive.core.model_specs.factory import is_pooling_kwargs
+
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = target_gpu_id
         if "," in target_gpu_id:
             os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-        engine_kwargs = dict(engine_kwargs)
+        engine_kwargs = _normalize_engine_kwargs(engine_kwargs)
         engine_kwargs.setdefault("disable_log_stats", True)
-        ktc = engine_kwargs.get("kv_transfer_config")
-        if ktc is not None or engine_kwargs.get("kv_offloading_size"):
-            os.environ["VLLM_USE_SIMPLE_KV_OFFLOAD"] = "1"
-        if isinstance(ktc, dict):
-            from vllm.config import KVTransferConfig
-            engine_kwargs["kv_transfer_config"] = KVTransferConfig(**ktc)
         self.model_id = model_id
+        self.pooling = pooling or is_pooling_kwargs(engine_kwargs)
+        self.multimodal = multimodal
         self._load = {"waiting": 0, "running": 0}
         load_ref = self._load
 
@@ -103,8 +116,8 @@ class RayLLMActor:
         return params
 
 
-    async def _generate_one(self, prompt: str, sampling_params: SamplingParams):
-        """Run one prompt to completion; return the final RequestOutput."""
+    async def _generate_one(self, prompt, sampling_params: SamplingParams):
+        """Run one prompt (str or PromptType dict) to completion."""
         final = None
         async for output in self.engine.generate(
             prompt,
@@ -119,7 +132,7 @@ class RayLLMActor:
 
     async def generate(self, prompts, sampling_params=None):
         """Full-result generate (FINAL_ONLY) — continuous-batches concurrent prompts."""
-        if isinstance(prompts, str):
+        if isinstance(prompts, (str, dict)):
             prompts = [prompts]
         params = self._params(sampling_params, RequestOutputKind.FINAL_ONLY)
         return list(await asyncio.gather(*[
@@ -145,7 +158,7 @@ class RayLLMActor:
         return await self.generate(prompts, sampling_params)
 
 
-    async def generate_stream(self, prompt: str, sampling_params=None):
+    async def generate_stream(self, prompt, sampling_params=None):
         """Yield text deltas (DELTA) for a single prompt until finished."""
         params = self._params(sampling_params, RequestOutputKind.DELTA)
         async for output in self.engine.generate(
@@ -159,3 +172,41 @@ class RayLLMActor:
                     yield text
             if output.finished:
                 break
+
+
+    async def _embed_one(self, prompt):
+        """Run one embed/encode request; return embedding vector."""
+        from vllm import PoolingParams
+
+        pooling_params = PoolingParams(task="embed", use_activation=True)
+        final = None
+        async for output in self.engine.encode(
+            prompt,
+            pooling_params,
+            request_id=uuid.uuid4().hex,
+        ):
+            final = output
+            if getattr(output, "finished", True):
+                break
+        if final is None:
+            return []
+        # vLLM pooling outputs: .outputs.data or .outputs.embedding
+        outs = final.outputs
+        if hasattr(outs, "data") and outs.data is not None:
+            data = outs.data
+        elif hasattr(outs, "embedding") and outs.embedding is not None:
+            data = outs.embedding
+        else:
+            data = outs
+        if hasattr(data, "tolist"):
+            return data.tolist()
+        return list(data)
+
+
+    async def embed(self, prompts):
+        """Return embedding vectors for str or PromptType prompts."""
+        if isinstance(prompts, (str, dict)):
+            prompts = [prompts]
+        return list(await asyncio.gather(*[
+            self._embed_one(prompt) for prompt in prompts
+        ]))

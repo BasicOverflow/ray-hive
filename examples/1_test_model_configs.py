@@ -1,4 +1,10 @@
-"""Deploy/inference configs — 2 pinned replicas, CPU RAM spill/KV, and all GPUs."""
+"""Deploy/inference configs — estimate_vram, pin, replicas=-1, auto-place.
+
+Commented templates below (swap into `deployments` to run):
+  - replicas=2 with gpu=[...]  → N single-GPU pins
+  - replicas=-1               → every eligible GPU
+Active entry is auto-placed replicas=1.
+"""
 import os
 import sys
 import time
@@ -23,9 +29,10 @@ VLLM_KWARGS = dict(
 )
 
 deployments = [
+    # Template: N single-GPU pins (replicas == len(gpu))
     # {
     #     "model_id": "qwen-two-replicas",
-    #     "description": "replicas=2 (pinned)",
+    #     "description": "replicas=2 pinned to PIN_GPUS (TP=1 each)",
     #     "config": {
     #         "model_name": "Qwen/Qwen3-0.6B-FP8",
     #         "max_input_prompt_length": 512,
@@ -36,18 +43,7 @@ deployments = [
     #         "vllm_kwargs": VLLM_KWARGS,
     #     },
     # },
-    {
-        "model_id": "qwen-cpu-ram",
-        "description": "replicas=2 + cpu_ram_per_instance=4",
-        "config": {
-            "model_name": "Qwen/Qwen3-0.6B-FP8",
-            "max_input_prompt_length": 512,
-            "max_output_prompt_length": 512,
-            "replicas": -1,
-            "cpu_ram_per_instance": 0,
-            "vllm_kwargs": VLLM_KWARGS,
-        },
-    },
+    # Template: every eligible GPU under default allocation policy
     # {
     #     "model_id": "qwen-all-gpus",
     #     "description": "replicas=-1 (all eligible GPUs)",
@@ -56,17 +52,30 @@ deployments = [
     #         "max_input_prompt_length": 512,
     #         "max_output_prompt_length": 512,
     #         "replicas": -1,
-    #         "cpu_ram_per_instance": 2,
     #         "vllm_kwargs": VLLM_KWARGS,
     #     },
     # },
+    {
+        "model_id": "gemma4-12b-w4a16",
+        "description": "Gemma 4 12B QAT W4A16 auto-placed",
+        "config": {
+            "model_name": "google/gemma-4-12B-it-qat-w4a16-ct",
+            "max_input_prompt_length": 512,
+            "max_output_prompt_length": 512,
+            "replicas": 1,
+            "vllm_kwargs": dict(
+                trust_remote_code=True,
+                reasoning_parser="gemma4",
+                default_chat_template_kwargs={"enable_thinking": False},
+            ),
+        },
+    },
 ]
 
 prompt = "Write a short poem about beer"
-amount = 10_000
+amount = 1_000
 prompts = [f"{prompt} {i}" for i in range(amount)]
-# Qwen3 non-thinking sampling (model card / deploy docs)
-sample_kwargs = dict(max_tokens=100, temperature=0.0, top_p=0.8, top_k=20)
+sample_kwargs = dict(max_tokens=100, temperature=1.0, top_p=0.95, top_k=64)
 
 for idx, deployment in enumerate(deployments):
     model_id = deployment["model_id"]
@@ -77,13 +86,13 @@ for idx, deployment in enumerate(deployments):
     status = scheduler.deploy_model(model_id=model_id, **cfg)
     info(status)
 
-    _ = inference_batch(prompts[:10], model_id=model_id, **sample_kwargs)
+    # _ = inference_batch(prompts[:10], model_id=model_id, **sample_kwargs)
 
-    start = time.time()
-    results = inference_batch(prompts, model_id=model_id, **sample_kwargs)
-    elapsed = time.time() - start
-    success(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
+    # start = time.time()
+    # results = inference_batch(prompts, model_id=model_id, **sample_kwargs)
+    # elapsed = time.time() - start
+    # success(f"Processed {len(results)} prompts in {elapsed:.3f}s ({len(results)/elapsed:.2f} req/s)")
 
-    scheduler.shutdown(model_id)
-    if idx < len(deployments) - 1:
-        time.sleep(3)
+    # scheduler.shutdown(model_id)
+    # if idx < len(deployments) - 1:
+    #     time.sleep(3)

@@ -1,22 +1,20 @@
 """GPU placement helpers used by deploy planning."""
-from ray_hive.core.gpu_alloc import assert_cpu_ram_tp_allowed, resolve_group_cpu_spill
-from ray_hive.core.gpu_alloc.cpu_spill import TP1_BUDGET_FRAC
-from ray_hive.core.model_specs.planner import build_vram_reqs, plan_deployment
+from ray_hive.core.gpu_alloc import TP1_BUDGET_FRAC
+from ray_hive.core.model_specs.factory import is_multimodal_hf, resolve_limit_mm_per_prompt
+from ray_hive.core.model_specs.planner import (
+    build_vram_reqs,
+    effective_input_len,
+    is_pooling_vram,
+    plan_deployment,
+)
+from ray_hive.errors import InsufficientVramError, NoPlacementError, PlacementError
 
-from .hardware import count_by_host, host_memory_available_gb
 from .naming import deployment_name
 
 
 def fixed_non_kv_gb(vram_reqs, sleep_mode: bool = False) -> float:
     """Minimum per-GPU VRAM to load weights + overhead (before KV)."""
-    sleep_overhead = vram_reqs.calc_weights_gb() if sleep_mode else 0.0
-    return (
-        vram_reqs.calc_system_overhead_gb()
-        + vram_reqs.calc_weights_gb()
-        + vram_reqs.calc_misc_vram_gb()
-        + 0.25
-        + sleep_overhead
-    )
+    return vram_reqs.calc_fixed_non_kv_gb(sleep_mode)
 
 
 def build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size: int):
@@ -34,21 +32,22 @@ def chunk_gpu_groups(gpus: list[dict], tp_size: int) -> list[list[dict]]:
     if tp_size == 1:
         return [[g] for g in gpus]
     if len(gpus) % tp_size != 0:
-        raise ValueError(
+        raise PlacementError(
             f"Got {len(gpus)} GPUs but tensor_parallel_size={tp_size} "
             f"(need a multiple of {tp_size})"
         )
     return [gpus[i : i + tp_size] for i in range(0, len(gpus), tp_size)]
 
 
-def gpu_budget_frac(tp_size: int) -> float:
-    """TP needs more headroom for NCCL / cudagraph peaks than TP=1."""
-    return 0.80 if tp_size > 1 else TP1_BUDGET_FRAC
-
-
-def replicas_per_host(gpu_groups: list[list[dict]]) -> dict[str, int]:
-    """Count replica/TP groups landing on each host."""
-    return count_by_host(group[0]["gpu_key"] for group in gpu_groups)
+def plan_lengths(vram_reqs, config: dict) -> tuple[int, int, int, bool]:
+    """Return (input_len, output_len, max_model_len, pooling) from deploy config."""
+    pooling = is_pooling_vram(vram_reqs)
+    text_in = config["max_input_prompt_length"]
+    text_out = config["max_output_prompt_length"]
+    input_len = effective_input_len(vram_reqs, text_in)
+    if pooling:
+        return input_len, 0, input_len, True
+    return input_len, text_out, input_len + text_out, False
 
 
 def plan_replica_groups(
@@ -60,12 +59,18 @@ def plan_replica_groups(
 ) -> dict:
     """
     Dry-run the same packing deploy uses. Returns
-    {replica_id: {plan, gpu_keys, group, cpu_offload, kv_offload, tp_size, max_model_len}}.
+    {replica_id: {plan, gpu_keys, group, tp_size, max_model_len}}.
     """
     from .select_gpus import resolve_target_gpus
 
-    cpu_ram_cfg = float(config.get("cpu_ram_per_instance") or 0)
     sleep_mode = float(config.get("sleep_timeout", -1) or -1) > 0
+    enforce_eager = bool(model_vllm_kwargs.get("enforce_eager", False))
+    if is_multimodal_hf(hf_params):
+        model_vllm_kwargs.setdefault(
+            "limit_mm_per_prompt",
+            resolve_limit_mm_per_prompt(hf_params, model_vllm_kwargs),
+        )
+
     tp_size, target_gpus, vram_reqs = resolve_target_gpus(
         gpu_map,
         config.get("replicas", -1),
@@ -74,56 +79,66 @@ def plan_replica_groups(
         config.get("allocation_cls"),
         config.get("attention_cls"),
         model_vllm_kwargs,
-        cpu_ram_cfg=cpu_ram_cfg,
         sleep_mode=sleep_mode,
     )
-    assert_cpu_ram_tp_allowed(tp_size, cpu_ram_cfg)
     gpu_groups = chunk_gpu_groups(target_gpus, tp_size)
-    per_host = replicas_per_host(gpu_groups)
 
-    max_model_len = config["max_input_prompt_length"] + config["max_output_prompt_length"]
+    input_len, output_len, max_model_len, pooling = plan_lengths(vram_reqs, config)
     weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
+    replicas = config.get("replicas", -1)
     results = {}
 
     for group in gpu_groups:
         gpu_keys = [g["gpu_key"] for g in group]
         bottleneck = min(group, key=lambda g: g["available_gb"])
         avail = min(g["available_gb"] for g in group)
-        host = group[0]["gpu_key"].split(":")[0]
-        if tp_size > 1:
-            per_gpu_budget = avail * gpu_budget_frac(tp_size)
-            cpu_ram = cpu_offload = kv_offload = 0.0
-        else:
-            per_gpu_budget, cpu_ram, cpu_offload, kv_offload, _ = resolve_group_cpu_spill(
-                weight_need, avail, cpu_ram_cfg, host_memory_available_gb(host), per_host[host]
+        device = min(g["total_gb"] for g in group)
+        if weight_need > device * TP1_BUDGET_FRAC:
+            if replicas != -1:
+                raise InsufficientVramError(
+                    f"GPU(s) {gpu_keys} util capacity {device * TP1_BUDGET_FRAC:.2f}GB "
+                    f"(total {device:.2f}GB × {TP1_BUDGET_FRAC}) < weight need "
+                    f"{weight_need:.2f}GB",
+                    need_gb=weight_need,
+                )
+            continue
+        per_gpu_budget = avail * TP1_BUDGET_FRAC
+        try:
+            plan = plan_deployment(
+                vram_reqs,
+                vram_budget_gb=per_gpu_budget,
+                live_total_vram_gb=bottleneck["total_gb"],
+                max_model_len=max_model_len,
+                input_len=input_len,
+                output_len=max(1, output_len) if not pooling else 0,
+                max_num_batched_tokens_override=config.get("max_num_batched_tokens"),
+                max_num_seqs_override=config.get("max_num_seqs"),
+                live_available_vram_gb=avail,
+                sleep_mode=sleep_mode,
+                pooling=pooling,
+                enforce_eager=enforce_eager,
             )
-        plan = plan_deployment(
-            vram_reqs,
-            vram_budget_gb=per_gpu_budget,
-            live_total_vram_gb=bottleneck["total_gb"],
-            max_model_len=max_model_len,
-            input_len=config["max_input_prompt_length"],
-            output_len=config["max_output_prompt_length"],
-            max_num_batched_tokens_override=config.get("max_num_batched_tokens"),
-            max_num_seqs_override=config.get("max_num_seqs"),
-            cpu_kv_offload_gb=kv_offload,
-            cpu_weight_offload_gb=cpu_offload,
-            live_available_vram_gb=avail,
-            sleep_mode=sleep_mode,
-        )
+        except ValueError:
+            # replicas=-1: pack every GPU that fits; skip cards too small for the plan.
+            if replicas != -1:
+                raise
+            continue
         plan["tensor_parallel_size"] = tp_size
         plan["weights_gb"] = vram_reqs.calc_weights_gb() * tp_size
         plan["weight_need_gb"] = weight_need
-        plan["cpu_ram_budget_gb"] = cpu_ram
 
         replica_id = deployment_name(model_id, gpu_keys)
         results[replica_id] = {
             "plan": plan,
             "gpu_keys": gpu_keys,
             "group": group,
-            "cpu_offload": cpu_offload,
-            "kv_offload": kv_offload,
             "tp_size": tp_size,
             "max_model_len": max_model_len,
         }
+
+    if not results:
+        raise NoPlacementError(
+            f"No GPU group can fit this model after packing "
+            f"(need >={weight_need:.2f}GB fixed non-KV per GPU in the util budget)."
+        )
     return results

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
 from ray_hive import RayHive
-from ray_hive.core.ray_utils import info, success
+from ray_hive.core.ray_utils import info, serve_base_url, success
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -29,14 +29,6 @@ VLLM_KWARGS = dict(
     reasoning_parser="qwen3",
     default_chat_template_kwargs={"enable_thinking": False},
 )
-
-
-def serve_base_url() -> str:
-    explicit = os.getenv("RAY_SERVE_URL")
-    if explicit:
-        return explicit.rstrip("/")
-    host = os.environ["RAY_ADDRESS"].removeprefix("ray://").split(":")[0]
-    return f"http://{host}:8000"
 
 
 def openai_chat(prompt: str) -> str:

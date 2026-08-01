@@ -114,10 +114,18 @@ def filter_alive(eligible: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
 
 def gpu_inventory_lines(gpu_map: dict) -> str:
     """One-line-per-GPU inventory string for placement errors."""
-    return "\n".join(
-        f"  {k}: avail={g.get('available', 0):.2f}GB / total={g.get('total', 0):.2f}GB"
-        for k, g in sorted(gpu_map.items())
-    )
+    lines = []
+    for k, g in sorted(gpu_map.items()):
+        try:
+            cap = compute_cap(g)
+            cap_s = f"sm{cap[0]}{cap[1]}"
+        except (KeyError, TypeError, ValueError):
+            cap_s = "sm?"
+        lines.append(
+            f"  {k}: avail={g.get('available', 0):.2f}GB / total={g.get('total', 0):.2f}GB "
+            f"({cap_s})"
+        )
+    return "\n".join(lines)
 
 
 def count_by_host(gpu_keys) -> dict[str, int]:

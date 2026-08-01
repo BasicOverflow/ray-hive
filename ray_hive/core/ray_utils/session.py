@@ -7,6 +7,7 @@ import warnings
 
 import ray
 import ray_hive
+from ray_hive.errors import InferenceError
 
 
 # Parent of the installed/editable `ray_hive` package — Ray Client working_dir.
@@ -105,3 +106,16 @@ def init_ray(address: str, suppress_logging: bool = True, **kwargs):
         configure_logging=not suppress_logging,
         **kwargs
     )
+
+
+def serve_base_url() -> str:
+    """HTTP base for Ray Serve (``RAY_SERVE_URL`` or host from ``RAY_ADDRESS``)."""
+    explicit = os.environ.get("RAY_SERVE_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    addr = os.environ.get("RAY_ADDRESS", "")
+    if addr.startswith("ray://"):
+        return f"http://{addr.removeprefix('ray://').split(':')[0]}:8000"
+    if ray.is_initialized():
+        return "http://127.0.0.1:8000"
+    raise InferenceError("Set RAY_SERVE_URL or RAY_ADDRESS=ray://host:port for Serve HTTP")

@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 from ray_hive import RayHive
 from ray_hive.core.ray_gpu_alloc import (
     RayConserveTdpAllocator,
-    RayFp8Allocator,
     RayPerformanceAllocator,
 )
 from ray_hive.inference import inference_batch
@@ -32,11 +31,6 @@ policies = [
         "model_id": "alloc-conserve-tdp",
         "description": "RayConserveTdpAllocator (prefer lower TDP)",
         "allocation_cls": RayConserveTdpAllocator,
-    },
-    {
-        "model_id": "alloc-fp8",
-        "description": "RayFp8Allocator (prefer Ada for FP8 checkpoint)",
-        "allocation_cls": RayFp8Allocator,
     },
 ]
 
@@ -65,13 +59,12 @@ for gpu_key, gpu in sorted(gpu_map.items()):
         f"tdp~{approx_tdp(gpu):.0f}W  name={gpu.get('specs', {}).get('name', '?')}"
     )
 
-# HF FP8 checkpoints set quantization_config.quant_method=fp8 — same signal deploy uses.
+# FP8 SM89+ taint applies to every policy when HF/vLLM signals FP8.
 fp8_hf = {"quantization_config": {"quant_method": "fp8"}}
-info(f"Select preview (replicas={REPLICAS}):")
+info(f"Select preview (replicas={REPLICAS}, FP8 HF signal):")
 for policy in policies:
     allocator = policy["allocation_cls"]()
-    hf = fp8_hf if policy["allocation_cls"] is RayFp8Allocator else {}
-    chosen = allocator.select(gpu_map, REPLICAS, 0.5, hf, {})
+    chosen = allocator.select(gpu_map, REPLICAS, 0.5, fp8_hf, {})
     info(f"  {policy['allocation_cls'].__name__}: {[k for k, _ in chosen]}")
 
 info("Note: RayTensorParallelAllocator is covered in examples/5_tensor_parallel.py.")

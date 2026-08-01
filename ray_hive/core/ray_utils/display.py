@@ -84,6 +84,7 @@ def _vram_breakdown_table(plan: dict) -> Table:
 
 def print_deployment_plan(model_id: str, results: dict):
     """Print packed plan summary for all replicas of one model."""
+    panels = []
     for replica_id, summary in results.items():
         plan = summary["plan"]
         gpu_keys = summary["gpu_keys"]
@@ -98,8 +99,13 @@ def print_deployment_plan(model_id: str, results: dict):
         meta.add_row("max_num_seqs", str(plan["max_num_seqs"]))
         meta.add_row("max_num_batched_tokens", str(plan["max_num_batched_tokens"]))
         meta.add_row("gpu_memory_utilization", f"{plan['gpu_memory_utilization']:.3f}")
-        meta.add_row("cpu_ram_budget_gb", f"{plan['cpu_ram_budget_gb']:.2f}")
-        meta.add_row("cpu_offload_gb (weights)", f"{plan['cpu_offload_gb']:.2f}")
+        if plan.get("pooling"):
+            meta.add_row("mode", "pooling/embed")
+        if plan.get("mm_tokens_per_prompt"):
+            meta.add_row("mm_tokens_per_prompt", str(plan["mm_tokens_per_prompt"]))
 
         body = Group(meta, Text(""), _vram_breakdown_table(plan))
-        print_panel(f"Deployment Plan: {model_id}", body, style="green")
+        panels.append(
+            Panel(body, title=f"Deployment Plan: {model_id}", border_style="green", expand=False)
+        )
+    console.print(Group(*panels))

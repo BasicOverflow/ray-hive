@@ -9,19 +9,23 @@ use a_inference / a_inference_batch (Ray Serve 2.56+).
 """
 import asyncio
 import json
-import os
-from typing import Iterator, Optional, Type, List, Union
+from typing import Iterator, List, Optional, Type, Union
 
 import ray
 import requests
 from pydantic import BaseModel
 from ray import serve
 
+from ray_hive.core.ray_utils import serve_base_url
+from ray_hive.errors import InferenceError, ModelNotFoundError, UnsupportedModeError
+
+PromptLike = Union[str, list, dict]
+
 
 def _ensure_connected():
     """Require an existing Ray connection (e.g. via RayHive(address=...))."""
     if not ray.is_initialized():
-        raise RuntimeError("Ray is not connected. Call RayHive(address=...) first.")
+        raise InferenceError("Ray is not connected. Call RayHive(address=...) first.")
 
 
 def _get_handle(model_id: str):
@@ -29,24 +33,11 @@ def _get_handle(model_id: str):
     _ensure_connected()
     status = serve.status()
     if model_id not in status.applications:
-        raise RuntimeError(f"Model '{model_id}' not found")
+        raise ModelNotFoundError(f"Model '{model_id}' not found", model_id=model_id)
     app = status.applications[model_id]
     deployments = app.deployments if hasattr(app, 'deployments') else {}
     deployment_name = list(deployments.keys())[0]
     return serve.get_deployment_handle(deployment_name, app_name=model_id)
-
-
-def _serve_base_url() -> str:
-    """HTTP base for Serve (RAY_SERVE_URL or host from RAY_ADDRESS)."""
-    explicit = os.environ.get("RAY_SERVE_URL")
-    if explicit:
-        return explicit.rstrip("/")
-    addr = os.environ.get("RAY_ADDRESS", "")
-    if addr.startswith("ray://"):
-        return f"http://{addr.removeprefix('ray://').split(':')[0]}:8000"
-    if ray.is_initialized():
-        return "http://127.0.0.1:8000"
-    raise RuntimeError("Set RAY_SERVE_URL or RAY_ADDRESS=ray://host:port for streaming")
 
 
 def _assert_not_in_asyncio_loop():
@@ -69,8 +60,11 @@ def _sync_result(response):
 
 
 def _extract_text(result):
-    """Extract text from vLLM result."""
+    """Extract text from vLLM / router result."""
     if isinstance(result, list):
+        if result and isinstance(result[0], list) and result and not isinstance(result[0], str):
+            # embedding vector(s)
+            return result[0] if len(result) == 1 else result
         return result[0] if result else ""
     return str(result)
 
@@ -95,70 +89,114 @@ def _build_request(prompt=None, prompts=None, structured_output=None, max_tokens
     return request
 
 
-def inference(prompt: str, model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> Union[str, BaseModel]:
-    """Run inference on a deployed model. Ray Serve handles load balancing automatically."""
+def inference(
+    prompt: PromptLike,
+    model_id: str,
+    structured_output: Optional[Type[BaseModel]] = None,
+    max_tokens: Optional[int] = None,
+    **kwargs,
+) -> Union[str, BaseModel, list]:
+    """Run inference on a deployed model (text, multimodal, or embeddings)."""
     handle = _get_handle(model_id)
     request = _build_request(prompt=prompt, structured_output=structured_output, max_tokens=max_tokens, **kwargs)
     result = _sync_result(handle.infer.remote(request))
-    text = _extract_text(result)
     if structured_output:
-        return _parse_structured_output(text, structured_output)
-    return text
+        text = _extract_text(result)
+        return _parse_structured_output(text if isinstance(text, str) else str(text), structured_output)
+    if isinstance(result, list) and result and isinstance(result[0], list) and not isinstance(result[0], str):
+        return result[0] if len(result) == 1 else result
+    return _extract_text(result)
 
 
-async def a_inference(prompt: str, model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> Union[str, BaseModel]:
-    """Run async inference on a deployed model. Ray Serve handles load balancing automatically."""
+async def a_inference(
+    prompt: PromptLike,
+    model_id: str,
+    structured_output: Optional[Type[BaseModel]] = None,
+    max_tokens: Optional[int] = None,
+    **kwargs,
+) -> Union[str, BaseModel, list]:
+    """Run async inference on a deployed model."""
     handle = _get_handle(model_id)
     request = _build_request(prompt=prompt, structured_output=structured_output, max_tokens=max_tokens, **kwargs)
     result = await handle.infer.remote(request)
-    text = _extract_text(result)
     if structured_output:
-        return _parse_structured_output(text, structured_output)
-    return text
+        text = _extract_text(result)
+        return _parse_structured_output(text if isinstance(text, str) else str(text), structured_output)
+    if isinstance(result, list) and result and isinstance(result[0], list) and not isinstance(result[0], str):
+        return result[0] if len(result) == 1 else result
+    return _extract_text(result)
 
 
-def inference_batch(prompts: List[str], model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> List[Union[str, BaseModel]]:
-    """Run batch inference — one client request; router shards by measured replica tokens/sec."""
+def inference_batch(
+    prompts: List[PromptLike],
+    model_id: str,
+    structured_output: Optional[Type[BaseModel]] = None,
+    max_tokens: Optional[int] = None,
+    **kwargs,
+) -> List[Union[str, BaseModel, list]]:
+    """Run batch inference — one client request; router shards by planned max_num_seqs."""
     handle = _get_handle(model_id)
     request = _build_request(prompts=prompts, structured_output=structured_output, max_tokens=max_tokens, **kwargs)
     result = _sync_result(handle.infer.remote(request))
     results = result if isinstance(result, list) else [result]
-    return [
-        _parse_structured_output(_extract_text(item), structured_output) if structured_output else _extract_text(item)
-        for item in results
-    ]
+    out = []
+    for item in results:
+        if structured_output:
+            text = item if isinstance(item, str) else (item[0] if isinstance(item, list) and item and isinstance(item[0], str) else str(item))
+            if isinstance(item, list) and item and isinstance(item[0], (int, float)):
+                raise UnsupportedModeError("structured_output not supported for embeddings")
+            out.append(_parse_structured_output(text if isinstance(text, str) else _extract_text(item), structured_output))
+        else:
+            out.append(item if isinstance(item, list) and item and isinstance(item[0], (int, float)) else _extract_text(item))
+    return out
 
 
-async def a_inference_batch(prompts: List[str], model_id: str, structured_output: Optional[Type[BaseModel]] = None, max_tokens: Optional[int] = None, **kwargs) -> List[Union[str, BaseModel]]:
-    """Async batch inference — one client request; router shards by measured replica tokens/sec."""
+async def a_inference_batch(
+    prompts: List[PromptLike],
+    model_id: str,
+    structured_output: Optional[Type[BaseModel]] = None,
+    max_tokens: Optional[int] = None,
+    **kwargs,
+) -> List[Union[str, BaseModel, list]]:
+    """Async batch inference — one client request; router shards by planned max_num_seqs."""
     handle = _get_handle(model_id)
     request = _build_request(prompts=prompts, structured_output=structured_output, max_tokens=max_tokens, **kwargs)
     result = await handle.infer.remote(request)
     results = result if isinstance(result, list) else [result]
-    return [
-        _parse_structured_output(_extract_text(item), structured_output) if structured_output else _extract_text(item)
-        for item in results
-    ]
+    out = []
+    for item in results:
+        if structured_output:
+            out.append(_parse_structured_output(_extract_text(item) if not isinstance(item, str) else item, structured_output))
+        else:
+            out.append(item if isinstance(item, list) and item and isinstance(item[0], (int, float)) else _extract_text(item))
+    return out
 
 
-def inference_stream(prompt: str, model_id: str, max_tokens: Optional[int] = None, **kwargs) -> Iterator[str]:
+def inference_stream(prompt: PromptLike, model_id: str, max_tokens: Optional[int] = None, **kwargs) -> Iterator[str]:
     """Stream assistant deltas via HTTP SSE to /{model_id}/v1/chat/completions."""
     if kwargs.get("structured_output") is not None:
-        raise ValueError("structured_output is not supported with inference_stream")
+        raise UnsupportedModeError("structured_output is not supported with inference_stream")
     _ensure_connected()
     if model_id not in serve.status().applications:
-        raise RuntimeError(f"Model '{model_id}' not found")
+        raise ModelNotFoundError(f"Model '{model_id}' not found", model_id=model_id)
+
+    if isinstance(prompt, str):
+        messages = [{"role": "user", "content": prompt}]
+    elif isinstance(prompt, list):
+        messages = prompt
+    else:
+        raise InferenceError("inference_stream prompt must be str or OpenAI messages list")
 
     body = {
         "model": model_id,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": True,
         **kwargs,
     }
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
 
-    url = f"{_serve_base_url()}/{model_id}/v1/chat/completions"
+    url = f"{serve_base_url()}/{model_id}/v1/chat/completions"
     with requests.post(url, json=body, stream=True, timeout=600) as resp:
         resp.raise_for_status()
         for raw in resp.iter_lines(decode_unicode=True):

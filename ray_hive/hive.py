@@ -9,7 +9,7 @@ import ray
 from typing import Dict, List, Optional, Type, Union
 
 from .core.deployment import get_deploy_service
-from .core.gpu_alloc import BaseGpuAllocator, reject_unsupported_host_ram_kwargs
+from .core.gpu_alloc import BaseGpuAllocator
 from .core.gpu_registry import get_gpu_registry
 from .core.model_specs.attention import BaseAttentionSpecs
 from .core.model_specs.estimate import load_hf_config_dict
@@ -21,6 +21,8 @@ from .core.ray_utils.display import (
     warn,
 )
 from .core.ray_utils.placement import plan_replica_groups
+from .core.openai_gateway import ensure_openai_gateway
+from .errors import ConfigError
 
 # Lifted out of vllm_kwargs into planner config (must not also reach engine_kwargs).
 _PLANNER_VLLM_KEYS = ("max_num_seqs", "max_num_batched_tokens")
@@ -72,7 +74,6 @@ class RayHive:
         max_output_prompt_length: int,
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
-        cpu_ram_per_instance: float = 0,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         idle_timeout: int = -1,
@@ -95,22 +96,17 @@ class RayHive:
         gpu=None: place on one GPU if any fits; otherwise same-node TP (2, 3, ...).
         gpu=[a,b,...] + replicas=1: one same-node TP group.
         gpu=[a,b,...] + replicas=len(list): N single-GPU pins (one replica per GPU).
-        cpu_ram_per_instance: hive host-RAM extension (not a vLLM arg) — TP=1 only. 0 off;
-          -1 = auto weight-spill need (capped at 70% of Ray free host memory / replicas
-          on host); >0 hard GiB ceiling per replica. Weights stay on GPU if they fit;
-          overflow spills to host. Leftover host RAM is unused (no CPU KV connector).
         sleep_timeout: seconds of inactivity before all replicas sleep (level 1); -1 never.
         idle_timeout: seconds of inactivity before full self-shutdown; -1 never.
         When both are set, idle_timeout must be greater than sleep_timeout.
         """
         if idle_timeout != -1 and idle_timeout <= 0:
-            raise ValueError("idle_timeout must be -1 (never) or a positive number of seconds")
+            raise ConfigError("idle_timeout must be -1 (never) or a positive number of seconds")
         if sleep_timeout != -1 and sleep_timeout <= 0:
-            raise ValueError("sleep_timeout must be -1 (never) or a positive number of seconds")
+            raise ConfigError("sleep_timeout must be -1 (never) or a positive number of seconds")
         if idle_timeout > 0 and sleep_timeout > 0 and idle_timeout <= sleep_timeout:
-            raise ValueError("idle_timeout must be greater than sleep_timeout when both are set")
+            raise ConfigError("idle_timeout must be greater than sleep_timeout when both are set")
         planner_overrides, vllm_kwargs = _split_vllm_kwargs(vllm_kwargs)
-        reject_unsupported_host_ram_kwargs(vllm_kwargs)
 
         config = {
             "name": model_name,
@@ -118,7 +114,6 @@ class RayHive:
             "gpu": gpu,
             "max_input_prompt_length": max_input_prompt_length,
             "max_output_prompt_length": max_output_prompt_length,
-            "cpu_ram_per_instance": cpu_ram_per_instance,
             "attention_cls": attention_cls,
             "allocation_cls": allocation_cls,
             "idle_timeout": idle_timeout,
@@ -135,12 +130,26 @@ class RayHive:
             ))
 
         replicas_info = _retry_if_registry_empty(_deploy)[model_id]
+        ensure_openai_gateway()
         return {
             "model_id": model_id,
             "status": "ready",
             "route": f"/{model_id}",
+            "openai_v1": "/v1",
             "replicas": replicas_info,
         }
+
+
+    def ensure_openai_api(self, force: bool = False) -> str:
+        """Start the cluster-wide OpenAI ``/v1`` gateway (idempotent). Returns route prefix."""
+        from ray import serve
+
+        serve.start(
+            proxy_location="HeadOnly",
+            http_options={"host": "0.0.0.0", "port": 8000},
+        )
+        ensure_openai_gateway(force=force)
+        return "/v1"
 
 
     def estimate_vram(
@@ -150,15 +159,14 @@ class RayHive:
         max_output_prompt_length: int,
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
-        cpu_ram_per_instance: float = 0,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         vllm_kwargs: Optional[dict] = None,
     ) -> dict:
         """Dry-run packing against live GPUs; print the same plan deploy would use."""
         planner_overrides, vllm_kwargs = _split_vllm_kwargs(vllm_kwargs)
-        reject_unsupported_host_ram_kwargs(vllm_kwargs)
         vllm_kwargs.pop("default_chat_template_kwargs", None)
+        vllm_kwargs.pop("chat_template", None)
         vllm_kwargs.pop("tensor_parallel_size", None)
         vllm_kwargs.pop("distributed_executor_backend", None)
         vllm_kwargs.pop("idle_timeout", None)
@@ -170,7 +178,6 @@ class RayHive:
             "gpu": gpu,
             "max_input_prompt_length": max_input_prompt_length,
             "max_output_prompt_length": max_output_prompt_length,
-            "cpu_ram_per_instance": cpu_ram_per_instance,
             "attention_cls": attention_cls,
             "allocation_cls": allocation_cls,
             **planner_overrides,

@@ -1,8 +1,10 @@
-python-dotenv>=1.0.0
 requests>=2.28.0
 ray[serve]==2.56.0
 vllm
 pydantic>=2.0.0
 transformers
 rich
-langchain-openai
+Pillow>=10.0.0
+python-dotenv>=1.0.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0

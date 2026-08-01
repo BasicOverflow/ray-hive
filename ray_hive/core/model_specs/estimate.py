@@ -1,27 +1,28 @@
 """Cluster-agnostic HF config load + VRAM estimate (no Ray)."""
-import json
-from pathlib import Path
 from typing import Optional, Type
 
 from .attention import BaseAttentionSpecs
-from .planner import build_vram_reqs, normalize_hf_config
+from .planner import build_vram_reqs, effective_input_len, is_pooling_vram, normalize_hf_config
 
 
 def load_hf_config_dict(model_name: str) -> dict:
-    """Load HF config.json from a local path or the Hub (no AutoConfig)."""
-    local = Path(model_name) / "config.json"
-    if local.is_file():
-        return json.loads(local.read_text())
+    """
+    Load HF model config with nested defaults applied.
 
-    from huggingface_hub import hf_hub_download
-    path = hf_hub_download(repo_id=model_name, filename="config.json")
-    return json.loads(Path(path).read_text())
+    Raw config.json often stores only text_config / audio_config overrides
+    (e.g. Qwen2-Audio); AutoConfig merges architecture defaults so planners
+    see hidden_size, num_hidden_layers, etc.
+    """
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    return cfg.to_dict()
 
 
 def estimate_vram(
     model_name: str,
     max_input_prompt_length: int,
-    max_output_prompt_length: int,
+    max_output_prompt_length: int = 0,
     max_num_seqs: int = 32,
     max_num_batched_tokens: Optional[int] = None,
     tensor_parallel_size: int = 1,
@@ -31,13 +32,10 @@ def estimate_vram(
     """
     Estimate per-GPU VRAM for a model without a Ray cluster.
 
-    max_model_len = max_input_prompt_length + max_output_prompt_length.
+    max_model_len = effective_input + output (output ignored for pooling).
     max_num_batched_tokens defaults to max_num_seqs.
+    Pass runner="pooling" (or legacy task="embed") in kwargs for embedding models.
     """
-    max_model_len = max_input_prompt_length + max_output_prompt_length
-    if max_num_batched_tokens is None:
-        max_num_batched_tokens = max_num_seqs
-
     hf_params = normalize_hf_config(load_hf_config_dict(model_name))
     vram_reqs = build_vram_reqs(
         hf_params,
@@ -45,6 +43,14 @@ def estimate_vram(
         tensor_parallel_size=tensor_parallel_size,
         **kwargs,
     )
+    pooling = is_pooling_vram(vram_reqs)
+    input_len = effective_input_len(vram_reqs, max_input_prompt_length)
+    if pooling:
+        max_model_len = input_len
+    else:
+        max_model_len = input_len + max_output_prompt_length
+    if max_num_batched_tokens is None:
+        max_num_batched_tokens = max_num_seqs
 
     weights_gb = vram_reqs.calc_weights_gb()
     overhead_gb = vram_reqs.calc_system_overhead_gb()
@@ -59,6 +65,7 @@ def estimate_vram(
         "max_model_len": max_model_len,
         "max_num_batched_tokens": max_num_batched_tokens,
         "tensor_parallel_size": tensor_parallel_size,
+        "pooling": pooling,
         "weights_gb": weights_gb,
         "kv_cache_gb": kv_cache_gb,
         "activation_gb": activation_gb,

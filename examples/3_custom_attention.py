@@ -16,6 +16,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 # Example inheritance to calculate non-traditional attention.
+# BaseAttentionSpecs now takes tensor_parallel_size (per-GPU KV); subclasses inherit it.
 class MQAAttentionSpecs(BaseAttentionSpecs):
     """KV cache calculator for multi-query attention models."""
 

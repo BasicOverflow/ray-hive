@@ -1,4 +1,5 @@
 """Tensor-parallel shardability checks."""
+from ray_hive.errors import TpShardError
 
 
 def assert_tp_shardable(hf_params: dict, tp_size: int) -> None:
@@ -9,23 +10,23 @@ def assert_tp_shardable(hf_params: dict, tp_size: int) -> None:
     kv = hf_params.get("num_key_value_heads", heads)
     vocab = hf_params.get("vocab_size")
     if heads is not None and int(heads) % tp_size != 0:
-        raise ValueError(
+        raise TpShardError(
             f"num_attention_heads={heads} not divisible by tensor_parallel_size={tp_size}"
         )
     if kv is not None:
         kv = int(kv)
         if kv >= tp_size and kv % tp_size != 0:
-            raise ValueError(
+            raise TpShardError(
                 f"num_key_value_heads={kv} not divisible by tensor_parallel_size={tp_size}"
             )
         if kv < tp_size and tp_size % kv != 0:
-            raise ValueError(
+            raise TpShardError(
                 f"tensor_parallel_size={tp_size} not divisible by num_key_value_heads={kv}"
             )
     if vocab is not None:
         padded = ((int(vocab) + 63) // 64) * 64
         if padded % tp_size != 0:
-            raise ValueError(
+            raise TpShardError(
                 f"vocab_size={vocab} (vLLM-padded {padded}) not divisible by "
                 f"tensor_parallel_size={tp_size}"
             )

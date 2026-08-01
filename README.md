@@ -8,13 +8,14 @@ The cluster remains a normal Ray cluster: CPU workers can run general distribute
 
 - [Architecture](#architecture)
 - [Capabilities](#capabilities)
-- [Model Planning](#model-planning)
-- [GPU Monitoring and Placement](#gpu-monitoring-and-placement)
-- [GPU Allocation Policies](#gpu-allocation-policies)
-- [Tensor Parallelism](#tensor-parallelism)
-- [Basic Model Usage](#basic-model-usage)
+- [Quick start](#quick-start)
+- [Placement](#placement)
+- [Multimodal and context](#multimodal-and-context)
+- [Embeddings](#embeddings)
+- [Lifecycle](#lifecycle)
+- [OpenAI HTTP](#openai-http)
 - [General Ray CPU Tasks](#general-ray-cpu-tasks)
-- [Repository](#repository)
+- [Appendix](#appendix)
 
 ## Architecture
 
@@ -32,92 +33,32 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 
 ## Capabilities
 
-- **Throughput-first planning:** By default, the planner uses the available VRAM budget to find the highest practical `max_num_seqs` and batched-token limit, maximizing concurrency while retaining runtime headroom (`gpu_budget_frac`: 0.90 single-GPU, 0.80 TP) for CUDA-graph capture and sampler scratch outside the util pool.
-- **Heterogeneous deployment:** One model can be replicated across GPUs with different capacities. Each replica receives its own memory and concurrency plan so every GPU contributes as much throughput as it can.
-- **Unified routing:** A model-level router ties those replicas together and sends work to the least-loaded GPU relative to its planned capacity.
-- **Live VRAM scheduling:** Placement uses current GPU memory rather than static card specifications and reserves memory during deployment.
-- **GPU sharing:** Multiple models can share a GPU when the registry and planner determine that enough VRAM remains. Auto-placement prefers GPUs with no hive reservations and only co-locates when no unshared eligible GPU remains; intentional sharing uses the same `gpu=` pin on two deploys with constrained `max_num_seqs` (see `examples/6_shared_gpu.py`).
-- **Flexible placement:** Models can target specific GPUs, a requested replica count, or every eligible GPU.
-- **Same-node tensor parallelism:** If a model does not fit on any one GPU, auto placement escalates to same-node TP; or pin an explicit `gpu=[...]` set. Each TP group is one Serve replica with vLLM’s multiprocessing backend.
-- **Host RAM extension (`cpu_ram_per_instance`):** Sole hive arg for extending beyond GPU VRAM on **TP=1** replicas (weight spill only). If weights do not fit the GPU budget, overflow spills to host (`cpu_offload_gb`). KV offloading is not supported yet — passing `kv_offloading_size`, `kv_offloading_backend`, or `kv_transfer_config` raises. Do not pass `cpu_offload_gb` as a vLLM kwarg; use `cpu_ram_per_instance`. Not supported when TP>1 — use `cpu_ram_per_instance=0` and fit on GPU VRAM only.
-- **General compute:** The same cluster continues to run normal distributed Ray tasks on its CPU workers (and GPU workers if not busy serving models).
+- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.90).
+- **Heterogeneous replicas** — per-GPU plans so different cards each contribute what they can.
+- **Least-loaded routing** — relative to each replica’s planned capacity.
+- **Live VRAM scheduling** — registry + reservations; see `examples/4_test_allocation_policies.py`.
+- **GPU sharing** — co-locate when needed; intentional share via same `gpu=` pin (`examples/6_shared_gpu.py`).
+- **Flexible placement** — pin, N replicas, or `replicas=-1` (`examples/1_test_model_configs.py`).
+- **Same-node TP** — auto escalate or pin a GPU list (`examples/5_tensor_parallel.py`).
+- **Custom attention** — subclass for KV / MM token math (`examples/3_custom_attention.py`).
+- **Multimodal generate** — image / video / audio (`examples/8`–`9`, `12`–`14`).
+- **Embeddings** — `runner="pooling"` (`examples/10`–`11`).
+- **Sleep / idle** — level-1 sleep then optional self-destroy (`examples/7_sleep_idle_timeout.py`).
+- **OpenAI HTTP** — per-model routes + cluster `/v1` gateway (`examples/2_test_inference.py`).
+- **General Ray tasks** — same cluster for CPU work.
 
-## Model Planning
+**Out of scope:** precomputed multimodal embeds as *input* (`enable_mm_embeds`).
 
-Before loading a model, Ray Hive reads its Hugging Face configuration and builds a per-GPU memory plan:
+## Quick start
 
-- **Weights** are estimated from the architecture, parameter dimensions, and model dtype (divided by TP size for per-GPU planning).
-- **Attention/KV cache** is estimated from attention layers, KV heads, head size, context length, cache dtype, and concurrent sequences. Specialized attention layouts can provide their own calculation; TP sharding is applied in the planner, not in attention classes.
-- **Runtime memory** includes a small system allowance (plus a coarse NCCL/TP term when TP>1), model-specific overhead, and activation memory based on batched tokens.
-- **Host RAM (`cpu_ram_per_instance`, TP=1 only):** Weight spill only. If weights fit in the GPU budget, they stay on GPU and host budget is unused (`-1` resolves to 0). If not, overflow spills to host (auto `-1` sizes to that need, capped at 70% of Ray free host memory / replicas on host; `>0` is a hard ceiling). Concurrency (`max_num_seqs`) is planned from **GPU KV only**. Weight spill can free GPU VRAM and thereby raise concurrency. Activations, batched tokens, VRAM reservation, and `gpu_memory_utilization` stay GPU-only. TP>1 groups must fit on GPU VRAM with `cpu_ram_per_instance=0`. KV offload vLLM kwargs are rejected (not supported yet).
-
-Each GPU (or TP group bottleneck) is planned independently, allowing different cards and existing deployments to have different concurrency limits.
-
-## GPU Monitoring and Placement
-
-A DaemonSet runs on every GPU node and reports live free/total VRAM and device information to a shared Ray actor. The registry combines those readings with pending and active model reservations so simultaneous deployments do not plan against the same memory.
-
-Placement supports:
-
-- `gpu="host:gpu0"` — pin one replica to one GPU.
-- `gpu=[a,b,...]` with `replicas == len(list)` and `replicas > 1` — **N single-GPU pins** (one replica per listed GPU, TP=1 each).
-- `gpu=[a,b,...]` with `replicas == 1` — **one same-node TP group** (`tp_size = len(list)`).
-- With `gpu=None`, try single-GPU placement via `allocation_cls` (default: performance ranking); if nothing fits and `cpu_ram_per_instance=0`, escalate to same-node TP packs.
-- Use `replicas=-1` to deploy on every eligible GPU (or every non-overlapping TP group) under that policy.
-
-After placement, requests go to the least-loaded replica relative to its planned capacity.
-
-## GPU Allocation Policies
-
-When `gpu=` is not set, deploy picks GPUs through an `allocation_cls`. Abstract policy math lives in `ray_hive.core.gpu_alloc`; Ray helpers live in `ray_hive.core.ray_utils` / `ray_gpu_alloc`.
-
-If `gpu=` or `gpu=[...]` is set, allocation policies are skipped and those pins are used (spill-aware VRAM fit via `cpu_ram_per_instance` applies on TP=1 only).
-
-Policies implemented so far:
-
-- **Performance** (`RayPerformanceAllocator`) — rank eligible GPUs by compute proxy; select top-N for replicas.
-- **Conserve TDP** (`RayConserveTdpAllocator`) — rank eligible GPUs toward lower approximate TDP; SM count as tie-break.
-- **FP8** (`RayFp8Allocator`) — same ranking as PerformanceAllocator; prefer Ada GPUs when FP8 is used.
-- **Tensor parallel** (`RayTensorParallelAllocator`) — pack same-node GPU sets (usable ≈ N × min available); used automatically when single-GPU placement fails and `gpu=` is unset.
-
-TP=1 policies (Performance / Conserve TDP / FP8) use a two-tier select: unshared GPUs (no pending/active hive reservations) first, ranked by policy score; only then partially occupied GPUs. Co-location is a last resort when unshared capacity is exhausted. Tensor-parallel select is unchanged (multi-GPU groups for one model).
-
-Ray-wired allocators also drop GPUs whose host is not an Alive Ray node.
-
-## Tensor Parallelism
-
-Same-node only for now. Cross-node TP / pipeline parallel are not wired yet.
-
-- **Auto (`gpu=None`):** try TP=1 (with optional `cpu_ram_per_instance` spill); if no GPU can hold weights+overhead and `cpu_ram_per_instance=0`, escalate TP=2,3,… via `RayTensorParallelAllocator` until a same-node pack fits on GPU VRAM only.
-- **Pin TP (`gpu=[a,b,...]`, `replicas=1`):** that list *is* one TP group (`tp_size = len(list)`); must be same host.
-- **Multi-pin (`gpu=[a,b,...]`, `replicas=len(list)`):** N independent TP=1 replicas, one per listed GPU (hosts may differ).
-- **Pin (`gpu="host:gpu0"`):** single-GPU placement.
-- **One TP replica per deploy:** a TP-sized `gpu=` list with `replicas` other than `1` or `len(gpu)` is rejected. To run a second TP copy, call `deploy_model` again with a different `model_id` / pin.
-- `replicas` — number of independent GPUs when TP=1 (including multi-pin); number of independent TP *groups* when auto TP>1; must be `1` for a pinned TP group.
-- Engine uses `distributed_executor_backend="mp"` (vLLM multiprocessing inside the Serve actor). Do not pass vLLM’s Ray executor for this path.
-- Custom `attention_cls` stays architecture-only; the planner divides weights/KV by TP size.
-- There is no user-facing `tensor_parallel_size` deploy arg — TP size comes from auto escalation or `len(gpu)` when `replicas=1`.
+Dry-run packing against live GPUs (same plan deploy would use):
 
 ```python
-# Force TP across two cards on one host
-hive.deploy_model(
-    model_id="qwen-tp",
-    model_name="Qwen/Qwen3-8B-FP8",
-    max_input_prompt_length=1024,
-    max_output_prompt_length=2048,
-    replicas=1,
-    gpu=["ergos-02-nv:gpu0", "ergos-02-nv:gpu1"],
-    vllm_kwargs={
-        "trust_remote_code": True,
-        "reasoning_parser": "qwen3",
-        "default_chat_template_kwargs": {"enable_thinking": False},
-    },
-)
+from ray_hive import RayHive
 
-# Or omit gpu= — single GPU if it fits, else same-node TP
-hive.deploy_model(
-    model_id="qwen-auto",
-    model_name="Qwen/Qwen3-8B-FP8",
+hive = RayHive(address="ray://YOUR_RAY_HEAD_IP:10001")
+plan = hive.estimate_vram(
+    "Qwen/Qwen3-0.6B-FP8",
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
     replicas=1,
@@ -129,67 +70,58 @@ hive.deploy_model(
 )
 ```
 
-## Basic Model Usage
+```text
+Deployment Plan: Qwen/Qwen3-0.6B-FP8
+  Replica                  replica-0
+  GPU(s)                   host-a:gpu0
+  tensor_parallel_size     1
+  max_num_seqs             48
+  max_num_batched_tokens   8192
+  gpu_memory_utilization   0.850
+  Weights                  0.60 GiB
+  KV cache                 4.20 GiB
+  Activations              0.40 GiB
+  Overhead                 0.30 GiB
+  Total (per GPU)          5.50 GiB
+```
+
+Deploy until ready (router up + warmed):
 
 ```python
-from ray_hive import RayHive
-from ray_hive.inference import inference, inference_batch
-from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
-# from ray_hive.core.model_specs import BaseAttentionSpecs  # subclass for custom KV sizing
-
-hive = RayHive(address="ray://YOUR_RAY_HEAD_IP:10001")
 status = hive.deploy_model(
     model_id="qwen",
     model_name="Qwen/Qwen3-0.6B-FP8",
     max_input_prompt_length=1024,
     max_output_prompt_length=2048,
-    replicas=-1,
-    allocation_cls=RayPerformanceAllocator,  # default; can omit
-    # attention_cls=MyAttentionSpecs,  # omit to default to BaseAttentionSpecs (standard attention)
+    replicas=1,
     vllm_kwargs={
-        # planner overrides are lifted automatically from this dict
-        # "max_num_seqs": 32,
-        # "max_num_batched_tokens": 1024,
-        # Qwen3-0.6B-FP8 suggested vLLM args (HF model card / Qwen deploy docs)
         "trust_remote_code": True,
-        "reasoning_parser": "qwen3",  # model card also lists deepseek_r1 + deprecated enable-reasoning
+        "reasoning_parser": "qwen3",
         "default_chat_template_kwargs": {"enable_thinking": False},
     },
 )
-# status == {"model_id": "qwen", "status": "ready", "route": "/qwen", "replicas": {...}}
+```
+
+```text
+{"model_id": "qwen", "status": "ready", "route": "/qwen", "openai_v1": "/v1", "replicas": {...}}
+```
+
+Generate text (batch and stream helpers available):
+
+```python
+from ray_hive.inference import inference, inference_batch, inference_stream
 
 answer = inference("Explain Ray in one sentence.", model_id="qwen")
 answers = inference_batch(["Prompt one", "Prompt two"], model_id="qwen")
+for delta in inference_stream("Count to three.", model_id="qwen"):
+    print(delta, end="")
 ```
 
-Ray Hive-specific `deploy_model` arguments:
-
-- `model_id` — local name used for the deployment, router, and API path.
-- `model_name` — Hugging Face model ID or model path passed to vLLM.
-- `max_input_prompt_length` / `max_output_prompt_length` — expected limits used to plan context memory and concurrency.
-- `replicas` — number of GPUs when TP=1 (including multi-pin); number of TP *groups* when auto TP>1; must be `1` for a pinned TP group; `-1` uses every eligible GPU/group.
-- `gpu` — optional pin: a string for one GPU; a list with `replicas=1` for one same-node TP group; a list with `replicas=len(list)` for N single-GPU pins. Overrides `allocation_cls`. Omit to auto-place (single GPU, else same-node TP).
-- `cpu_ram_per_instance` — hive host-RAM extension arg (not a vLLM kwarg; default `0`; **TP=1 only**):
-  - `0` — off (GPU-only; no weight spill)
-  - `-1` — auto: budget exactly the weight spill this replica needs (0 if weights fit), capped at 70% of Ray free host memory / replicas on host
-  - `>0` — hard host ceiling in GiB for weight spill (unused if weights fit on GPU)
-  Policy: keep weights on GPU if they fit; else spill overflow to host. KV offloading is not supported yet. With TP>1, must be `0` (GPU VRAM only).
-  Do not pass as vLLM kwargs: `kv_offloading_size`, `kv_offloading_backend`, `kv_transfer_config` (raises — KV offload unsupported), or `cpu_offload_gb` (raises — use `cpu_ram_per_instance`).
-- `attention_cls` — optional `BaseAttentionSpecs` subclass for KV planning; defaults to standard attention (no TP awareness required).
-- `allocation_cls` — optional single-GPU placement policy; defaults to `RayPerformanceAllocator` (ignored when `gpu=` is set; auto TP always uses `RayTensorParallelAllocator`).
-- `idle_timeout` — seconds of inference inactivity before the model self-shutdowns; `-1` (default) means never, must be `-1` or a positive integer. Survives client script exit; uses the same cleanup as `hive.shutdown(model_id)`.
-- `sleep_timeout` — seconds of inference inactivity before all replicas enter vLLM sleep (level 1: weights offloaded to CPU, KV discarded); `-1` (default) means never. Holds hive VRAM reservations while sleeping; next inference wakes replicas. When set, hive injects `enable_sleep_mode=True` into the engine and plans ~one extra weight copy of CuMemAllocator peak so KV still fits. Survives client script exit.
-- When both `sleep_timeout` and `idle_timeout` are set, `idle_timeout` must be greater than `sleep_timeout` (sleep first, then full destroy after longer quiet).
-- `vllm_kwargs` — dict forwarded to vLLM's `LLM(...)` constructor. Planner keys inside it (`max_num_seqs`, `max_num_batched_tokens`) are lifted into the deploy plan automatically and not double-applied to the engine. Serve-only keys like `default_chat_template_kwargs` are handled by the router.
-
-`deploy_model` returns when the model is ready (router deployed and warmed):
-
-```python
-{"model_id": "...", "status": "ready", "route": "/...", "replicas": {...}}
+```text
+Ray is a distributed computing framework for scaling Python workloads.
 ```
 
-
-Structured output accepts a Pydantic model:
+Structured output:
 
 ```python
 from pydantic import BaseModel
@@ -201,22 +133,184 @@ class Answer(BaseModel):
 result = inference("Summarize Ray.", model_id="qwen", structured_output=Answer)
 ```
 
-Each deployed model also exposes an OpenAI-compatible HTTP API on Ray Serve (default port `8000`):
+Inside an asyncio loop use `a_inference` / `a_inference_batch` instead of the sync helpers.
+
+## Placement
+
+- `gpu="host:gpu0"` — one replica on one GPU.
+- `gpu=[a,b,...]` + `replicas=len(list)` — N single-GPU pins (TP=1 each).
+- `gpu=[a,b,...]` + `replicas=1` — one same-node TP group.
+- `gpu=None` — auto place (single GPU via `allocation_cls`, else same-node TP).
+- `replicas=-1` — every eligible GPU / TP group.
+
+Pin one GPU:
+
+```python
+hive.deploy_model(
+    model_id="qwen-pin",
+    model_name="Qwen/Qwen3-0.6B-FP8",
+    max_input_prompt_length=512,
+    max_output_prompt_length=512,
+    replicas=1,
+    gpu="ergos-06-nv:gpu0",
+    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
+                 "default_chat_template_kwargs": {"enable_thinking": False}},
+)
+```
+
+All eligible GPUs:
+
+```python
+hive.deploy_model(
+    model_id="qwen-all",
+    model_name="Qwen/Qwen3-0.6B-FP8",
+    max_input_prompt_length=512,
+    max_output_prompt_length=512,
+    replicas=-1,
+    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
+                 "default_chat_template_kwargs": {"enable_thinking": False}},
+)
+```
+
+Same-node TP=2 pin:
+
+```python
+hive.deploy_model(
+    model_id="qwen-tp",
+    model_name="Qwen/Qwen3-8B-FP8",
+    max_input_prompt_length=512,
+    max_output_prompt_length=512,
+    replicas=1,
+    gpu=["ergos-02-nv:gpu1", "ergos-02-nv:gpu2"],
+    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
+                 "default_chat_template_kwargs": {"enable_thinking": False}},
+)
+```
+
+Live registry snapshot: `hive.get_vram_state()`. Full TP / policy rules → [Appendix](#appendix).
+
+## Multimodal and context
+
+**Text-only models** — pass a string (or text chat messages). No `limit_mm_per_prompt`.
+
+**MM models** — planner uses `limit_mm_per_prompt` in `vllm_kwargs` to size worst-case image / video / audio placeholders. If omitted on an MM HF config, defaults are derived from `vision_config` / `audio_config` (typically `image: 1` and/or `audio: 1`). Set counts explicitly to enable or disable modalities.
+
+**Token budget** — `max_input_prompt_length` is the **text** side only. Effective input ≈ text + MM placeholders; `max_model_len ≈ effective_input + max_output_prompt_length` (use output `0` for pooling). If that cannot cover placeholders + output, planning raises `MmContextError` — raise `max_input_prompt_length` or lower `limit_mm_per_prompt`.
+
+**Requests vs planning** — on an MM deploy you can still send text-only strings. That does **not** shrink the VRAM plan. For text-only *planning* on an MM checkpoint, zero unused modalities (`{"image": 0, "video": 0, "audio": 0}`).
+
+Enable image chat:
+
+```python
+from ray_hive.core.ray_utils import file_to_data_url
+from ray_hive.inference import inference
+
+hive.deploy_model(
+    model_id="vl",
+    model_name="Qwen/Qwen2.5-VL-3B-Instruct",
+    max_input_prompt_length=2048,   # text tokens you expect
+    max_output_prompt_length=256,
+    replicas=1,
+    vllm_kwargs={
+        "trust_remote_code": True,
+        "limit_mm_per_prompt": {"image": 1},
+    },
+)
+
+messages = [{
+    "role": "user",
+    "content": [
+        {"type": "image_url", "image_url": {"url": file_to_data_url("photo.png")}},
+        {"type": "text", "text": "Describe this image."},
+    ],
+}]
+answer = inference(messages, model_id="vl", max_tokens=64)
+# text-only request on the same deploy still works:
+inference("Say hello.", model_id="vl", max_tokens=32)
+```
+
+```text
+# estimate_vram on MM models also shows:
+  mm_tokens_per_prompt     1280
+```
+
+Content part types: `text`, `image_url`, `video_url` / `video`, `audio_url` / `input_audio`. Fixtures: `examples/media/`. Demos: `examples/8_multimodal_vision.py`, `9_multimodal_audio.py`, `12_multimodal_video.py`, `13_gemma4_multimodal.py`, `14_gemma4_stress.py`.
+
+## Embeddings
+
+Set `runner="pooling"` (legacy `task="embed"` still works). Use `max_output_prompt_length=0`. `inference` returns a vector (or list of vectors for batch).
+
+```python
+hive.deploy_model(
+    model_id="embed",
+    model_name="BAAI/bge-small-en-v1.5",
+    max_input_prompt_length=512,
+    max_output_prompt_length=0,
+    replicas=1,
+    vllm_kwargs={"runner": "pooling", "trust_remote_code": True},
+)
+vec = inference("hello", model_id="embed")
+```
+
+```text
+[-0.012, 0.034, ...]   # length = model hidden size
+```
+
+```bash
+curl http://YOUR_RAY_HEAD_IP:8000/embed/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"model":"embed","input":["hello world"]}'
+```
+
+See `examples/10_text_embeddings.py` and `examples/11_multimodal_embeddings.py`.
+
+## Lifecycle
+
+Sleep after quiet, then optional full destroy (`idle_timeout` must be greater than `sleep_timeout` when both are set):
+
+```python
+hive.deploy_model(
+    model_id="qwen",
+    model_name="Qwen/Qwen3-0.6B-FP8",
+    max_input_prompt_length=512,
+    max_output_prompt_length=256,
+    replicas=1,
+    sleep_timeout=60,
+    idle_timeout=300,
+    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
+                 "default_chat_template_kwargs": {"enable_thinking": False}},
+)
+```
+
+```python
+hive.shutdown("qwen")   # one model
+hive.shutdown()         # all models
+```
+
+```python
+from ray_hive import kill_gpu_registry
+kill_gpu_registry()     # force registry rebuild (DaemonSet re-registers)
+```
+
+See `examples/7_sleep_idle_timeout.py` and `examples/0_shutdown_models.py`.
+
+## OpenAI HTTP
+
+Per-model route and cluster-wide `/v1` gateway (port `8000`). Gateway starts on `deploy_model`; for an already-running cluster call `hive.ensure_openai_api()`.
 
 ```bash
 curl http://YOUR_RAY_HEAD_IP:8000/qwen/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Explain Ray briefly."}]}'
+
+# Open WebUI: API URL = http://YOUR_RAY_HEAD_IP:8000/v1
+curl http://YOUR_RAY_HEAD_IP:8000/v1/models
+curl http://YOUR_RAY_HEAD_IP:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Explain Ray briefly."}]}'
 ```
 
-The current inference helper and HTTP router support text generation. The deployment and planning layers are intended to cover vLLM-compatible:
-
-- text-generation models
-- image/multimodal models
-- audio models
-- embedding models
-
-Image, audio, and embedding request/response routing still require their model-specific interfaces.
+Streaming, structured JSON, and LangChain: `examples/2_test_inference.py`.
 
 ## General Ray CPU Tasks
 
@@ -232,11 +326,25 @@ def square(value):
 results = ray.get([square.remote(value) for value in range(10)])
 ```
 
-## Repository
+### Allocation policies
 
-- `ray_hive/` — planner, registry, deployment service, router, and client API
-- `manifests/` — KubeRay cluster, worker image, and VRAM monitor definitions
-- `examples/` — model deployment and inference experiments (`.env` / `.env.example` for cluster URLs; also used by `basic_ray_tests/`)
-- `basic_ray_tests/` — general cluster and resource checks
+When `gpu=` is unset, `allocation_cls` picks GPUs (`ray_hive.core.gpu_alloc` / `ray_gpu_alloc`). Pins skip policy ranking but still check VRAM fit and arch taints.
+
+- `RayPerformanceAllocator` — rank by compute proxy; top-N.
+- `RayConserveTdpAllocator` — prefer lower approx TDP; SM count tie-break.
+- `RayTensorParallelAllocator` — same-node packs; auto when single-GPU fails.
+
+**Arch taint:** native FP8 (HF / vLLM dtype / kv / quantization mentioning fp8 / float8 / float-quantized) needs compute capability ≥ 8.9 (Ada+); Ampere dropped automatically.
+
+TP=1 policies prefer unshared GPUs first, then co-locate. Alive Ray nodes only.
+
+### Repository
+
+- `ray_hive/` — planner, registry, deployment service, router, client API
+- `manifests/` — KubeRay cluster, worker image, VRAM monitor
+- `examples/` — deploy/inference experiments (`.env` / `.env.example`)
+- `examples/requirements.txt` — example-only deps
+- `examples/media/` — multimodal fixtures
+- `basic_ray_tests/` — cluster / resource checks
 
 Related: [rayify](https://github.com/BasicOverflow/rayify), a tool for converting scripts into Ray jobs.

@@ -1,6 +1,8 @@
 """Deploy lifecycle helpers — shutdown and singleton actor teardown."""
 import ray
 
+from ray_hive.errors import ConfigError, ModelAlreadyDeployedError
+
 
 def shutdown_all():
     """Shutdown all Serve apps and clear registry state (from caller / driver)."""
@@ -55,8 +57,13 @@ def assert_model_id_free(model_id: str, registry) -> None:
     """Reject model_id if already present in Serve or the GPU registry."""
     from ray import serve
 
+    from ray_hive.core.openai_gateway import GATEWAY_APP
+
+    if model_id == GATEWAY_APP:
+        raise ConfigError(f"model_id {model_id!r} is reserved for the OpenAI gateway")
+
     apps = serve.status().applications or {}
     if model_id in apps:
-        raise ValueError(f"model_id {model_id!r} already has a Serve application")
+        raise ModelAlreadyDeployedError(f"model_id {model_id!r} already has a Serve application")
     if ray.get(registry.has_deployment.remote(model_id)):
-        raise ValueError(f"model_id {model_id!r} already registered in gpu registry")
+        raise ModelAlreadyDeployedError(f"model_id {model_id!r} already registered in gpu registry")

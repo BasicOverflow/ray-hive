@@ -6,6 +6,13 @@ Hardware accessors (SM count, TDP, etc.) are abstract; Ray wiring fills them in.
 """
 from abc import ABC, abstractmethod
 
+from .arch_reqs import required_min_compute_cap
+
+# Packing fraction for util pool (must match gpu_budget_frac in placement).
+# Leave ~10% outside the util pool for CUDA-graph capture + sampler scratch
+# (vLLM's own default gpu_memory_utilization is 0.9 for the same reason).
+TP1_BUDGET_FRAC = 0.90
+
 
 class BaseGpuAllocator(ABC):
     """Abstract GPU placement policy."""
@@ -37,10 +44,18 @@ class BaseGpuAllocator(ABC):
         hf_params: dict,
         vllm_kwargs: dict,
     ) -> list[tuple[str, dict]]:
-        """Return GPUs with enough available VRAM for model weights."""
+        """Return GPUs that fit weights and satisfy model arch requirements."""
+        # plan_deployment only packs into available * TP1_BUDGET_FRAC.
+        # Util capacity (total × frac) must also cover weight_need.
+        need = min_vram_gb / TP1_BUDGET_FRAC
+        min_cap = required_min_compute_cap(hf_params, vllm_kwargs)
         eligible = []
         for gpu_key, gpu in gpu_map.items():
-            if gpu["available"] < min_vram_gb:
+            if float(gpu["total"]) * TP1_BUDGET_FRAC < min_vram_gb:
+                continue
+            if gpu["available"] < need:
+                continue
+            if min_cap is not None and self.compute_cap(gpu) < min_cap:
                 continue
             eligible.append((gpu_key, gpu))
         return eligible

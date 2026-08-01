@@ -1,14 +1,14 @@
 """
 Model router — engine-queue load balancing with OpenAI-compatible HTTP ingress.
 
-Exposes /v1/models, /v1/chat/completions, /v1/completions on the router
-deployment. Programmatic inference goes through infer() → replica handle.
+Exposes /v1/models, /v1/chat/completions, /v1/completions, /v1/embeddings.
+Programmatic inference goes through infer() → replica handle.
 """
 import asyncio
 import json
 import time
 import uuid
-from typing import AsyncIterator, Literal, Union
+from typing import Any, AsyncIterator, Literal, Union
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -17,6 +17,14 @@ from ray import serve
 from transformers import AutoTokenizer
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
+
+from ray_hive.core.ray_utils.media import (
+    audio_from_b64,
+    audio_from_url,
+    pil_from_url,
+    video_frames_from_url,
+)
+from ray_hive.errors import MediaError, UnsupportedModeError, http_status_for
 
 app = FastAPI()
 
@@ -33,18 +41,38 @@ class TextContentPart(BaseModel):
 
 
 class ImageUrlContentPart(BaseModel):
-    """OpenAI chat content part — image URL (schema only, not yet supported)."""
+    """OpenAI chat content part — image URL or data URL."""
     type: Literal["image_url"]
     image_url: dict
 
 
+class VideoUrlContentPart(BaseModel):
+    """OpenAI chat content part — video URL or data URL."""
+    type: Literal["video_url", "video"]
+    video_url: dict | None = None
+    video: dict | None = None
+
+
+class AudioContentPart(BaseModel):
+    """OpenAI chat content part — audio URL or input_audio."""
+    type: Literal["audio_url", "input_audio"]
+    audio_url: dict | None = None
+    input_audio: dict | None = None
+
+
 class FileContentPart(BaseModel):
-    """OpenAI chat content part — file reference (schema only, not yet supported)."""
+    """OpenAI chat content part — file reference."""
     type: Literal["file"]
     file: dict
 
 
-ContentPart = Union[TextContentPart, ImageUrlContentPart, FileContentPart]
+ContentPart = Union[
+    TextContentPart,
+    ImageUrlContentPart,
+    VideoUrlContentPart,
+    AudioContentPart,
+    FileContentPart,
+]
 
 
 class ChatMessage(BaseModel):
@@ -73,6 +101,35 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
+class EmbeddingRequest(BaseModel):
+    """OpenAI /v1/embeddings request (plus optional multimodal messages)."""
+    model_config = ConfigDict(extra="allow")
+    model: str
+    input: Union[str, list[str], None] = None
+    messages: list[ChatMessage] | None = None
+    encoding_format: str | None = None
+
+
+def _http_error(exc):
+    raise HTTPException(status_code=http_status_for(exc), detail=str(exc)) from exc
+
+
+def _audio_from_part(part: AudioContentPart):
+    if part.type == "audio_url" and part.audio_url:
+        return audio_from_url(part.audio_url.get("url") or "")
+    if part.type == "input_audio" and part.input_audio:
+        return audio_from_b64(part.input_audio.get("data") or "")
+    _http_error(MediaError("invalid audio content part"))
+
+
+def _video_url(part: VideoUrlContentPart) -> str:
+    if part.video_url and part.video_url.get("url"):
+        return part.video_url["url"]
+    if part.video and part.video.get("url"):
+        return part.video["url"]
+    _http_error(MediaError("invalid video content part"))
+
+
 @serve.deployment(
     ray_actor_options={"num_cpus": 0.1},
     autoscaling_config=None,
@@ -92,6 +149,9 @@ class ModelRouter:
         chat_template_kwargs: dict | None = None,
         idle_timeout: int = -1,
         sleep_timeout: int = -1,
+        pooling: bool = False,
+        multimodal: bool = False,
+        chat_template: str | None = None,
     ):
         """Wire replica handles, load cache, and tokenizer for token counting."""
         self.model_id = model_id
@@ -101,6 +161,8 @@ class ModelRouter:
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.idle_timeout = idle_timeout
         self.sleep_timeout = sleep_timeout
+        self.pooling = pooling
+        self.multimodal = multimodal
         self._handles = None
         self._loads = {name: {"waiting": 0, "running": 0} for name in gpu_deployment_names}
         self._eng_start = 0
@@ -108,11 +170,41 @@ class ModelRouter:
         self._sleeping = False
         self._sleep_lock = asyncio.Lock()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.processor = None
+        self._mm_warmup_modality = "image"
+        if multimodal:
+            from transformers import AutoConfig, AutoProcessor
+
+            cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            if getattr(cfg, "audio_config", None) is not None and getattr(cfg, "vision_config", None) is None:
+                self._mm_warmup_modality = "audio"
+            elif getattr(cfg, "audio_config", None) is not None and getattr(cfg, "vision_config", None) is not None:
+                self._mm_warmup_modality = "image"
+            try:
+                self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+            except Exception:
+                self.processor = None
+        if chat_template:
+            self.tokenizer.chat_template = chat_template
+            if self.processor is not None:
+                self.processor.chat_template = chat_template
         await self._warmup()
         self._last_activity = time.time()
         asyncio.create_task(self._refresh_loads())
         if self.idle_timeout > 0 or self.sleep_timeout > 0:
             asyncio.create_task(self._timeout_watch())
+
+
+    def _apply_chat_template(self, hf_messages: list[dict]) -> str:
+        """Apply processor template when available (needed for Qwen2-Audio multipart)."""
+        kwargs = dict(
+            tokenize=False,
+            add_generation_prompt=not self.pooling,
+            **self.chat_template_kwargs,
+        )
+        if self.processor is not None and hasattr(self.processor, "apply_chat_template"):
+            return self.processor.apply_chat_template(hf_messages, **kwargs)
+        return self.tokenizer.apply_chat_template(hf_messages, **kwargs)
 
 
     def _touch(self):
@@ -180,10 +272,60 @@ class ModelRouter:
             await asyncio.sleep(_LOAD_REFRESH_S)
 
 
+    def _mm_warmup_prompt(self, text: str = "warmup") -> dict:
+        """
+        Build a PromptType dict with chat-template placeholders + dummy media.
+
+        Bare text + multi_modal_data fails (no modality pads). Vision needs
+        ≥~28×28 images; audio needs (array, sample_rate).
+        """
+        import numpy as np
+
+        if self._mm_warmup_modality == "audio":
+            audio = (np.zeros(16000, dtype=np.float32), 16000)
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "audio"},
+                    {"type": "text", "text": text},
+                ],
+            }]
+            prompt = self._apply_chat_template(messages)
+            return {"prompt": prompt, "multi_modal_data": {"audio": audio}}
+
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64), color=(128, 128, 128))
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": text},
+            ],
+        }]
+        prompt = self._apply_chat_template(messages)
+        return {"prompt": prompt, "multi_modal_data": {"image": img}}
+
+
     async def _warmup(self):
         """Heat each replica engine with a fixed batch (no tok/s retained)."""
         handles = self._get_handles()
-        prompts = [f"warmup {i}" for i in range(_WARMUP_PROMPTS)]
+        if self.pooling:
+            if self.multimodal:
+                prompts = [self._mm_warmup_prompt()]
+            else:
+                prompts = [f"warmup {i}" for i in range(min(8, _WARMUP_PROMPTS))]
+            for name in self.gpu_deployment_names:
+                await handles[name].embed.remote(prompts)
+            return
+
+        if self.multimodal:
+            prompts: list[Any] = [
+                self._mm_warmup_prompt(f"warmup {i}")
+                for i in range(min(4, _WARMUP_PROMPTS))
+            ]
+        else:
+            prompts = [f"warmup {i}" for i in range(_WARMUP_PROMPTS)]
         params = SamplingParams(max_tokens=_WARMUP_MAX_TOKENS, temperature=0.0)
         for name in self.gpu_deployment_names:
             await handles[name].generate.remote(prompts, params)
@@ -199,34 +341,123 @@ class ModelRouter:
         return self._handles
 
 
-    def _to_chat_messages(self, messages: list[ChatMessage]) -> list[dict]:
-        """Convert OpenAI chat messages to vLLM chat format."""
-        result = []
+    def _parse_messages(self, messages: list[ChatMessage]) -> tuple[list[dict], dict]:
+        """
+        Convert OpenAI chat messages to HF-style messages + multi_modal_data.
+
+        Returns (hf_messages, multi_modal_data).
+        """
+        hf_messages = []
+        images = []
+        videos = []
+        audios = []
+
         for msg in messages:
             if isinstance(msg.content, str):
-                result.append({"role": msg.role, "content": msg.content})
+                hf_messages.append({"role": msg.role, "content": msg.content})
                 continue
-            text_parts = []
+
+            parts_out = []
             for part in msg.content:
-                if part.type != "text":
-                    raise HTTPException(status_code=400, detail="multimodal content not supported yet")
-                text_parts.append(part.text)
-            result.append({"role": msg.role, "content": "\n".join(text_parts)})
-        return result
+                if part.type == "text":
+                    parts_out.append({"type": "text", "text": part.text})
+                elif part.type == "image_url":
+                    url = (part.image_url or {}).get("url") or ""
+                    images.append(pil_from_url(url))
+                    parts_out.append({"type": "image"})
+                elif part.type in ("video_url", "video"):
+                    try:
+                        videos.append(video_frames_from_url(_video_url(part)))
+                    except MediaError as e:
+                        _http_error(e)
+                    parts_out.append({"type": "video"})
+                elif part.type in ("audio_url", "input_audio"):
+                    audios.append(_audio_from_part(part))
+                    parts_out.append({"type": "audio"})
+                elif part.type == "file":
+                    _http_error(MediaError("file content parts not supported"))
+                else:
+                    _http_error(MediaError(f"unsupported content type: {part.type}"))
+
+            if len(parts_out) == 1 and parts_out[0].get("type") == "text":
+                hf_messages.append({"role": msg.role, "content": parts_out[0]["text"]})
+            else:
+                hf_messages.append({"role": msg.role, "content": parts_out})
+
+        mm: dict[str, Any] = {}
+        if images:
+            mm["image"] = images[0] if len(images) == 1 else images
+        if videos:
+            mm["video"] = videos[0] if len(videos) == 1 else videos
+        if audios:
+            mm["audio"] = audios[0] if len(audios) == 1 else audios
+        return hf_messages, mm
+
+
+    def _chat_prompt_and_mm(self, messages: list[ChatMessage]) -> tuple[str, dict]:
+        """Apply chat template; return (prompt_str, multi_modal_data)."""
+        hf_messages, mm = self._parse_messages(messages)
+        prompt = self._apply_chat_template(hf_messages)
+        return prompt, mm
+
+
+    def _to_engine_prompt(self, prompt: str, mm: dict | None):
+        """Build str or PromptType dict for the engine."""
+        if mm:
+            return {"prompt": prompt, "multi_modal_data": mm}
+        return prompt
+
+
+    def _is_openai_messages(self, obj: Any) -> bool:
+        """True for a chat conversation: list of {role, content} dicts/models."""
+        if not isinstance(obj, list) or not obj:
+            return False
+        first = obj[0]
+        if isinstance(first, ChatMessage):
+            return True
+        return isinstance(first, dict) and "role" in first and "content" in first
+
+
+    def _coerce_chat_messages(self, messages: list) -> list[ChatMessage]:
+        return [
+            m if isinstance(m, ChatMessage) else ChatMessage.model_validate(m)
+            for m in messages
+        ]
+
+
+    def _normalize_prompt(self, item: Any) -> Any:
+        """str | engine PromptType | OpenAI messages → engine prompt."""
+        if self._is_openai_messages(item):
+            prompt, mm = self._chat_prompt_and_mm(self._coerce_chat_messages(item))
+            return self._to_engine_prompt(prompt, mm)
+        if isinstance(item, dict) and "role" in item and "content" in item and "prompt" not in item:
+            prompt, mm = self._chat_prompt_and_mm(self._coerce_chat_messages([item]))
+            return self._to_engine_prompt(prompt, mm)
+        return item
+
+
+    def _normalize_infer_prompts(self, prompt: Any) -> list:
+        """
+        Expand infer() prompt/prompts into engine prompts.
+
+        A single OpenAI conversation is a list of message dicts — that must not
+        be treated as a batch of independent prompts.
+        """
+        if self._is_openai_messages(prompt):
+            return [self._normalize_prompt(prompt)]
+        if isinstance(prompt, list):
+            return [self._normalize_prompt(p) for p in prompt]
+        return [self._normalize_prompt(prompt)]
 
 
     async def _route_chat(self, messages, max_tokens=None, temperature=None, extra=None):
         """Route a chat conversation to the least-loaded replica."""
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **self.chat_template_kwargs,
-        )
+        prompt, mm = self._chat_prompt_and_mm(messages)
+        engine_prompt = self._to_engine_prompt(prompt, mm)
         replica_name = self._select_replica()
         handle = self._get_handles()[replica_name]
         return await handle.generate.remote(
-            [prompt],
+            [engine_prompt],
             self._sampling_params(max_tokens, temperature, extra),
         )
 
@@ -252,8 +483,14 @@ class ModelRouter:
 
     def _sampling_params(self, max_tokens=None, temperature=None, extra=None) -> SamplingParams:
         """Build vLLM SamplingParams from request fields."""
-        kwargs = dict(extra or {})
-        # OpenAI/LangChain send max_completion_tokens; SamplingParams wants max_tokens
+        kwargs = {k: v for k, v in dict(extra or {}).items() if v is not None}
+        # OpenAI request-only fields — not SamplingParams (OpenWebUI sends these).
+        for k in (
+            "stream_options", "user", "tools", "tool_choice", "functions", "function_call",
+            "metadata", "modalities", "audio", "service_tier", "store", "parallel_tool_calls",
+            "prediction", "web_search_options", "logit_bias", "logprobs", "top_logprobs",
+        ):
+            kwargs.pop(k, None)
         mct = kwargs.pop("max_completion_tokens", None)
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
@@ -268,6 +505,10 @@ class ModelRouter:
                 guided_json = (response_format.get("json_schema") or {}).get("schema")
         if guided_json is not None:
             kwargs["structured_outputs"] = StructuredOutputsParams(json=guided_json)
+        # Keep only fields SamplingParams accepts (msgspec Struct).
+        valid = set(getattr(SamplingParams, "__struct_fields__", ()))
+        if valid:
+            kwargs = {k: v for k, v in kwargs.items() if k in valid}
         return SamplingParams(**kwargs)
 
 
@@ -276,7 +517,7 @@ class ModelRouter:
         return [o.outputs[0].text for o in outputs]
 
 
-    def _shard_prompts(self, prompts: list[str]) -> list[tuple[str, list[str], list[int]]]:
+    def _shard_prompts(self, prompts: list) -> list[tuple[str, list, list[int]]]:
         """Split prompts by max_num_seqs; largest-remainder for leftovers."""
         names = self.gpu_deployment_names
         weights = [max(self.replica_metadata[n]["max_num_seqs"], 1) for n in names]
@@ -304,7 +545,7 @@ class ModelRouter:
         return shards
 
 
-    async def _dispatch_prompts(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
+    async def _dispatch_prompts(self, prompts: list, sampling_params: SamplingParams) -> list[str]:
         """Shard a prompt batch by max_num_seqs and run replicas concurrently."""
         handles = self._get_handles()
         if len(prompts) == 1:
@@ -326,31 +567,42 @@ class ModelRouter:
         return texts
 
 
+    async def _dispatch_embeds(self, prompts: list) -> list[list[float]]:
+        """Shard embed prompts across replicas."""
+        handles = self._get_handles()
+        if len(prompts) == 1:
+            name = self._select_replica()
+            return await handles[name].embed.remote(prompts)
+
+        shards = self._shard_prompts(prompts)
+        for name, chunk, _ in shards:
+            self._loads[name]["waiting"] += len(chunk)
+        outputs = await asyncio.gather(*[
+            handles[name].embed.remote(chunk)
+            for name, chunk, _ in shards
+        ])
+        vectors = [None] * len(prompts)
+        for (_, _, idxs), outs in zip(shards, outputs):
+            for local_i, global_i in enumerate(idxs):
+                vectors[global_i] = outs[local_i]
+        return vectors
+
+
     async def _route_text(self, prompt, max_tokens=None, temperature=None, extra=None):
         """Route text prompts across replicas by capacity."""
-        prompts = [prompt] if isinstance(prompt, str) else [str(p) for p in prompt]
+        prompts = [prompt] if isinstance(prompt, str) else list(prompt)
         return await self._dispatch_prompts(
             prompts,
             self._sampling_params(max_tokens, temperature, extra),
         )
 
 
-    async def _route_stream(self, prompt: str, sampling_params: SamplingParams) -> AsyncIterator[str]:
+    async def _route_stream(self, prompt, sampling_params: SamplingParams) -> AsyncIterator[str]:
         """Stream text deltas from the least-loaded replica."""
         replica_name = self._select_replica()
         handle = self._get_handles()[replica_name].options(stream=True)
         async for delta in handle.generate_stream.remote(prompt, sampling_params):
             yield delta
-
-
-    def _chat_prompt(self, messages) -> str:
-        """Apply chat template to messages."""
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **self.chat_template_kwargs,
-        )
 
 
     def _sse(self, payload: dict | str) -> str:
@@ -386,6 +638,20 @@ class ModelRouter:
         }
 
 
+    def _openai_embedding_response(self, vectors: list[list[float]]) -> dict:
+        """Build OpenAI embeddings response dict."""
+        data = [
+            {"object": "embedding", "embedding": vec, "index": i}
+            for i, vec in enumerate(vectors)
+        ]
+        return {
+            "object": "list",
+            "data": data,
+            "model": self.model_id,
+            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+        }
+
+
     @app.get("/v1/models")
     async def list_models(self):
         """OpenAI-compatible model list endpoint."""
@@ -398,7 +664,7 @@ class ModelRouter:
         return {"id": self.model_id, "object": "model", "owned_by": "ray-hive"}
 
 
-    async def _openai_chat_stream(self, prompt: str, sampling_params: SamplingParams):
+    async def _openai_chat_stream(self, prompt, sampling_params: SamplingParams):
         """Yield OpenAI chat.completion.chunk SSE frames then [DONE]."""
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         async for delta in self._route_stream(prompt, sampling_params):
@@ -438,27 +704,30 @@ class ModelRouter:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: ChatCompletionRequest):
-        """OpenAI-compatible chat completions endpoint (text-only)."""
+        """OpenAI-compatible chat completions (text + multimodal)."""
+        if self.pooling:
+            _http_error(UnsupportedModeError("this deployment is pooling/embed; use /v1/embeddings"))
         self._touch()
         await self._ensure_awake()
-        messages = self._to_chat_messages(request.messages)
         extra = request.model_dump(exclude={"model", "messages", "max_tokens", "temperature", "stream"})
         params = self._sampling_params(request.max_tokens, request.temperature, extra)
+        prompt, mm = self._chat_prompt_and_mm(request.messages)
+        engine_prompt = self._to_engine_prompt(prompt, mm)
         if request.stream:
-            prompt = self._chat_prompt(messages)
             return StreamingResponse(
-                self._openai_chat_stream(prompt, params),
+                self._openai_chat_stream(engine_prompt, params),
                 media_type="text/event-stream",
             )
-        outputs = await self._route_chat(messages, request.max_tokens, request.temperature, extra)
+        outputs = await self._route_chat(request.messages, request.max_tokens, request.temperature, extra)
         text = self._extract_texts(outputs)[0] if outputs else ""
-        prompt = outputs[0].prompt if outputs else ""
         return self._openai_chat_response(text, prompt)
 
 
     @app.post("/v1/completions")
     async def completions(self, request: CompletionRequest):
         """OpenAI-compatible text completions endpoint."""
+        if self.pooling:
+            _http_error(UnsupportedModeError("this deployment is pooling/embed; use /v1/embeddings"))
         self._touch()
         await self._ensure_awake()
         prompt = request.prompt if isinstance(request.prompt, str) else "\n".join(request.prompt)
@@ -474,15 +743,44 @@ class ModelRouter:
         return self._openai_completion_response(text, prompt)
 
 
+    @app.post("/v1/embeddings")
+    async def embeddings(self, request: EmbeddingRequest):
+        """OpenAI-compatible embeddings endpoint (text and multimodal messages)."""
+        if not self.pooling:
+            _http_error(UnsupportedModeError("this deployment is generate-only; set runner=pooling"))
+        self._touch()
+        await self._ensure_awake()
+
+        prompts: list[Any] = []
+        if request.messages is not None:
+            prompt, mm = self._chat_prompt_and_mm(request.messages)
+            prompts.append(self._to_engine_prompt(prompt, mm))
+        elif request.input is None:
+            raise HTTPException(status_code=400, detail="input or messages required")
+        elif isinstance(request.input, str):
+            prompts.append(request.input)
+        else:
+            prompts.extend(request.input)
+
+        vectors = await self._dispatch_embeds(prompts)
+        return self._openai_embedding_response(vectors)
+
+
     async def infer(self, request):
-        """Programmatic inference entrypoint — shards batches by planned max_num_seqs."""
+        """Programmatic inference — generate text or embeddings depending on deploy mode."""
         self._touch()
         await self._ensure_awake()
         if isinstance(request, dict):
             prompt = request.get("prompts") or request.get("prompt")
             kwargs = {k: v for k, v in request.items() if k not in ("prompt", "prompts")}
         else:
-            prompt, kwargs = str(request), {}
+            prompt, kwargs = request, {}
 
-        prompts = prompt if isinstance(prompt, list) else [prompt]
+        prompts = self._normalize_infer_prompts(prompt)
+
+        if self.pooling:
+            if kwargs.get("guided_json") is not None or kwargs.get("structured_output") is not None:
+                _http_error(UnsupportedModeError("structured_output not supported for embeddings"))
+            return await self._dispatch_embeds(prompts)
+
         return await self._dispatch_prompts(prompts, self._sampling_params(extra=kwargs))

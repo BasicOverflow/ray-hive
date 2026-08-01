@@ -1,0 +1,7 @@
+# Deps used only by scripts under examples/ (and examples/media/).
+# Install after the root requirements: pip install -r examples/requirements.txt
+langchain-openai
+datasets>=2.14.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+soundfile>=0.12.0

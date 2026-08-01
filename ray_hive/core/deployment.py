@@ -7,7 +7,8 @@ selection → replica reservation → parallel RayLLMActor deploy → ModelRoute
 import ray
 from ray import serve
 
-from .gpu_alloc import reject_unsupported_host_ram_kwargs
+from ray_hive.errors import ConfigError, DeployError, InsufficientVramError
+
 from .gpu_registry import get_gpu_registry
 from .model_specs.estimate import load_hf_config_dict
 from .model_specs.planner import normalize_hf_config
@@ -29,6 +30,8 @@ def deploy_single(
     engine_kwargs: dict,
     resource_names: list[str],
     route_prefix: str,
+    pooling: bool = False,
+    multimodal: bool = False,
 ):
     """Deploy one RayLLMActor replica on a GPU worker (imports vllm here only)."""
     from ray_hive.core.ray_llm_actor import RayLLMActor
@@ -37,7 +40,7 @@ def deploy_single(
     # num_gpus>0 makes Ray remap CUDA_VISIBLE_DEVICES and breaks custom-resource pinning
     # on multi-GPU nodes (wrong card → OOM / Serve "Failed to update"). Pin via CVD only.
     # Do not set ray_actor_options memory — that is a Ray scheduling reservation and
-    # pending-fails on GPU workers with little advertised heap; vLLM owns host KV/spill.
+    # pending-fails on GPU workers with little advertised heap.
     env_vars = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
         "CUDA_VISIBLE_DEVICES": target_gpu_id,
@@ -45,11 +48,6 @@ def deploy_single(
     }
     if len(resource_names) > 1:
         env_vars["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-    # Default "native" OffloadingConnector mmaps CPU KV under /dev/shm (often 64MB in
-    # K8s). Hive always uses SimpleCPUOffload (process RAM) via kv_transfer_config;
-    # keep the env bit for any residual kv_offloading_size path.
-    if engine_kwargs.get("kv_transfer_config") or engine_kwargs.get("kv_offloading_size"):
-        env_vars["VLLM_USE_SIMPLE_KV_OFFLOAD"] = "1"
     deployment = RayLLMActor.options(
         name=replica_id,
         graceful_shutdown_timeout_s=0,
@@ -60,7 +58,13 @@ def deploy_single(
         },
         autoscaling_config=None,
         num_replicas=1,
-    ).bind(model_id=model_id, target_gpu_id=target_gpu_id, engine_kwargs=engine_kwargs)
+    ).bind(
+        model_id=model_id,
+        target_gpu_id=target_gpu_id,
+        engine_kwargs=engine_kwargs,
+        pooling=pooling,
+        multimodal=multimodal,
+    )
     serve.run(deployment, name=replica_id, route_prefix=route_prefix)
     return True
 
@@ -75,6 +79,9 @@ def deploy_router(
     chat_template_kwargs: dict | None = None,
     idle_timeout: int = -1,
     sleep_timeout: int = -1,
+    pooling: bool = False,
+    multimodal: bool = False,
+    chat_template: str | None = None,
 ):
     """Bind/run ModelRouter on a GPU worker (needs transformers/vllm)."""
     from ray_hive.core.model_router import ModelRouter
@@ -93,8 +100,23 @@ def deploy_router(
         chat_template_kwargs=chat_template_kwargs or {},
         idle_timeout=idle_timeout,
         sleep_timeout=sleep_timeout,
+        pooling=pooling,
+        multimodal=multimodal,
+        chat_template=chat_template,
     )
-    serve.run(router, name=model_id, route_prefix=f"/{model_id}")
+    try:
+        serve.run(router, name=model_id, route_prefix=f"/{model_id}")
+    except Exception as e:
+        apps = serve.status().applications or {}
+        app = apps.get(model_id)
+        details = []
+        if app is not None:
+            for dep_name, dep in (app.deployments or {}).items():
+                details.append(f"{dep_name}: {dep.status} — {dep.message}")
+            serve.delete(name=model_id)
+        if details:
+            raise DeployError("; ".join(details)) from e
+        raise
     return True
 
 
@@ -118,12 +140,12 @@ class DeployService:
     def _deploy_model(self, model_id: str, config: dict, model_vllm_kwargs: dict) -> dict:
         """Run the full deploy pipeline for one model."""
         if "max_input_prompt_length" not in config or "max_output_prompt_length" not in config:
-            raise ValueError("max_input_prompt_length and max_output_prompt_length are required")
+            raise ConfigError("max_input_prompt_length and max_output_prompt_length are required")
 
         # Serve-frontend only — not valid on LLM()/EngineArgs; applied by ModelRouter.
         model_vllm_kwargs = dict(model_vllm_kwargs)
-        reject_unsupported_host_ram_kwargs(model_vllm_kwargs)
         chat_template_kwargs = model_vllm_kwargs.pop("default_chat_template_kwargs", None) or {}
+        chat_template = model_vllm_kwargs.pop("chat_template", None)
         model_vllm_kwargs.pop("tensor_parallel_size", None)
         model_vllm_kwargs.pop("distributed_executor_backend", None)
 
@@ -132,6 +154,11 @@ class DeployService:
 
         hf_params = normalize_hf_config(ray.get(fetch_hf_config_dict.remote(config["name"])))
         gpu_map = ray.get(registry.get_all_gpus.remote())
+
+        from ray_hive.core.model_specs.factory import is_multimodal_hf, is_pooling_kwargs
+        pooling = is_pooling_kwargs(model_vllm_kwargs)
+        multimodal = is_multimodal_hf(hf_params)
+
         planned = plan_replica_groups(gpu_map, config, hf_params, model_vllm_kwargs, model_id)
 
         replica_jobs = []
@@ -142,16 +169,17 @@ class DeployService:
             plan = entry["plan"]
             group = entry["group"]
             gpu_keys = entry["gpu_keys"]
-            kv_offload = entry["kv_offload"]
-            cpu_offload = entry["cpu_offload"]
             tp_size = entry["tp_size"]
             max_model_len = entry["max_model_len"]
 
             for gpu_info in group:
                 if gpu_info["available_gb"] < plan["total_vram_gb"]:
-                    raise ValueError(
+                    raise InsufficientVramError(
                         f"GPU {gpu_info['gpu_key']} has {gpu_info['available_gb']:.2f}GB available, "
-                        f"need {plan['total_vram_gb']:.2f}GB for TP plan"
+                        f"need {plan['total_vram_gb']:.2f}GB for TP plan",
+                        gpu=gpu_info["gpu_key"],
+                        available_gb=gpu_info["available_gb"],
+                        need_gb=plan["total_vram_gb"],
                     )
                 ray.get(registry.reserve_replica.remote(
                     replica_id, gpu_info["gpu_key"], plan["total_vram_gb"]
@@ -168,19 +196,6 @@ class DeployService:
             }
             if config.get("sleep_timeout", -1) > 0:
                 engine_kwargs["enable_sleep_mode"] = True
-            if kv_offload > 0:
-                # Avoid kv_offloading_size → OffloadingConnector (/dev/shm mmap). Use
-                # SimpleCPUOffloadConnector (pinned process RAM) explicitly instead.
-                engine_kwargs["enable_prefix_caching"] = True
-                engine_kwargs["kv_transfer_config"] = {
-                    "kv_connector": "SimpleCPUOffloadConnector",
-                    "kv_role": "kv_both",
-                    "kv_connector_extra_config": {
-                        "cpu_bytes_to_use": int(kv_offload * (1 << 30)),
-                    },
-                }
-            if cpu_offload > 0:
-                engine_kwargs["cpu_offload_gb"] = cpu_offload
             if tp_size > 1:
                 engine_kwargs["tensor_parallel_size"] = tp_size
                 engine_kwargs["distributed_executor_backend"] = "mp"
@@ -192,6 +207,8 @@ class DeployService:
                 "target_gpu_id": ",".join(g["gpu_id"] for g in group),
                 "engine_kwargs": engine_kwargs,
                 "resource_names": resource_names,
+                "pooling": pooling,
+                "multimodal": multimodal,
             })
             gpu_mapping[replica_id] = gpu_keys
             replica_metadata[replica_id] = plan
@@ -206,6 +223,8 @@ class DeployService:
                 job["engine_kwargs"],
                 job["resource_names"],
                 f"/{job['replica_id']}",
+                job["pooling"],
+                job["multimodal"],
             ))
         try:
             ray.get(deploy_futures)
@@ -224,7 +243,7 @@ class DeployService:
                 serve.delete(name=app_name)
             ray.get(registry.clear_replicas.remote(replica_ids))
             if details:
-                raise RuntimeError("; ".join(details)) from e
+                raise DeployError("; ".join(details)) from e
             raise
 
         replica_gpu_vram_gb = {
@@ -253,6 +272,9 @@ class DeployService:
             chat_template_kwargs,
             config.get("idle_timeout", -1),
             config.get("sleep_timeout", -1),
+            pooling,
+            multimodal,
+            chat_template,
         ))
 
         return {
