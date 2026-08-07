@@ -10,6 +10,8 @@ The cluster remains a normal Ray cluster: CPU workers can run general distribute
 - [Capabilities](#capabilities)
 - [Quick start](#quick-start)
 - [Placement](#placement)
+- [Allocation policies](#allocation-policies)
+- [Custom attention](#custom-attention)
 - [Multimodal and context](#multimodal-and-context)
 - [Embeddings](#embeddings)
 - [Lifecycle](#lifecycle)
@@ -39,7 +41,7 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 - **GPU sharing** — co-locate when needed; intentional share via same `gpu=` pin (`examples/6_shared_gpu.py`).
 - **Flexible placement** — pin, N replicas, or `replicas=-1` (`examples/1_test_model_configs.py`).
 - **Same-node TP** — auto escalate or pin a GPU list (`examples/5_tensor_parallel.py`).
-- **Custom attention** — subclass for KV / MM token math (`examples/3_custom_attention.py`).
+- **Custom attention** — subclass using HF config fields (`examples/3_custom_attention.py`).
 - **Multimodal generate** — image / video / audio (`examples/8`–`9`, `12`–`14`).
 - **Embeddings** — `runner="pooling"` (`examples/10`–`11`).
 - **Sleep / idle** — level-1 sleep then optional self-destroy (`examples/7_sleep_idle_timeout.py`).
@@ -139,7 +141,7 @@ Inside an asyncio loop use `a_inference` / `a_inference_batch` instead of the sy
 - `gpu="host:gpu0"` — one replica on one GPU.
 - `gpu=[a,b,...]` + `replicas=len(list)` — N single-GPU pins (TP=1 each).
 - `gpu=[a,b,...]` + `replicas=1` — one same-node TP group.
-- `gpu=None` — auto place (single GPU via `allocation_cls`, else same-node TP).
+- `gpu=None` — auto place (single GPU via `allocation_cls`, default `RayPerformanceAllocator`; else same-node TP).
 - `replicas=-1` — every eligible GPU / TP group.
 
 Pin one GPU:
@@ -186,7 +188,41 @@ hive.deploy_model(
 )
 ```
 
-Live registry snapshot: `hive.get_vram_state()`. Full TP / policy rules → [Appendix](#appendix).
+Live registry snapshot: `hive.get_vram_state()`. Policies: [Allocation policies](#allocation-policies).
+
+## Allocation policies
+
+When `gpu=` is unset, `allocation_cls` picks GPUs (`ray_hive.core.ray_gpu_alloc`). Pins skip policy ranking but still check VRAM fit and arch taints. Default: `RayPerformanceAllocator`.
+
+- `RayPerformanceAllocator` — rank by compute (SM count, light bandwidth tie-break); top-N.
+- `RayConserveTdpAllocator` — prefer lower approx TDP; SM count tie-break.
+- `RayTensorParallelAllocator` — same-node packs of size `tensor_parallel_size`; auto when single-GPU fails.
+
+**Arch taint:** native FP8 (HF / vLLM dtype / kv / quantization mentioning fp8 / float8 / float-quantized) needs compute capability ≥ 8.9 (Ada+); Ampere dropped automatically.
+
+TP=1 policies prefer unshared GPUs first, then co-locate. Alive Ray nodes only. See `examples/4_test_allocation_policies.py` and `examples/5_tensor_parallel.py`.
+
+## Custom attention
+
+VRAM planning sizes the KV cache through an attention-specs class. By default that is `BaseAttentionSpecs` (or `MultimodalAttentionSpecs` for multimodal models). Pass a subclass via `attention_cls` on `estimate_vram` / `deploy_model`.
+
+The class sees the same HF config fields the planner already loads. Override properties or methods that use those fields when the default transformer KV math does not match the model (e.g. heads, sliding windows, extra tokens).
+
+```python
+from ray_hive.core.model_specs import BaseAttentionSpecs
+
+class MyAttention(BaseAttentionSpecs):
+    @property
+    def kv_heads(self) -> int:
+        return self.hf_params["num_key_value_heads"]  # from HF config
+
+hive.deploy_model(
+    ...,
+    attention_cls=MyAttention,
+)
+```
+
+See `examples/3_custom_attention.py` (and `examples/14_gemma4_stress.py` for multimodal).
 
 ## Multimodal and context
 
@@ -324,18 +360,6 @@ def square(value):
 
 results = ray.get([square.remote(value) for value in range(10)])
 ```
-
-### Allocation policies
-
-When `gpu=` is unset, `allocation_cls` picks GPUs (`ray_hive.core.gpu_alloc` / `ray_gpu_alloc`). Pins skip policy ranking but still check VRAM fit and arch taints.
-
-- `RayPerformanceAllocator` — rank by compute proxy; top-N.
-- `RayConserveTdpAllocator` — prefer lower approx TDP; SM count tie-break.
-- `RayTensorParallelAllocator` — same-node packs; auto when single-GPU fails.
-
-**Arch taint:** native FP8 (HF / vLLM dtype / kv / quantization mentioning fp8 / float8 / float-quantized) needs compute capability ≥ 8.9 (Ada+); Ampere dropped automatically.
-
-TP=1 policies prefer unshared GPUs first, then co-locate. Alive Ray nodes only.
 
 ### Running tests
 

@@ -44,32 +44,32 @@ deployments = [
     #     },
     # },
     # Template: every eligible GPU under default allocation policy
-    # {
-    #     "model_id": "qwen-all-gpus",
-    #     "description": "replicas=-1 (all eligible GPUs)",
-    #     "config": {
-    #         "model_name": "Qwen/Qwen3-0.6B-FP8",
-    #         "max_input_prompt_length": 512,
-    #         "max_output_prompt_length": 512,
-    #         "replicas": -1,
-    #         "vllm_kwargs": VLLM_KWARGS,
-    #     },
-    # },
     {
-        "model_id": "gemma4-12b-w4a16",
-        "description": "Gemma 4 12B QAT W4A16 auto-placed",
+        "model_id": "qwen-all-gpus",
+        "description": "replicas=-1 (all eligible GPUs)",
         "config": {
-            "model_name": "google/gemma-4-12B-it-qat-w4a16-ct",
-            "max_input_prompt_length": 512,
-            "max_output_prompt_length": 512,
+            "model_name": "Qwen/Qwen3-0.6B-FP8",
+            "max_input_prompt_length": 4096,
+            "max_output_prompt_length": 4096,
             "replicas": 1,
-            "vllm_kwargs": dict(
-                trust_remote_code=True,
-                reasoning_parser="gemma4",
-                default_chat_template_kwargs={"enable_thinking": False},
-            ),
+            "vllm_kwargs": VLLM_KWARGS,
         },
     },
+    # {
+    #     "model_id": "gemma4-12b-w4a16",
+    #     "description": "Gemma 4 12B QAT W4A16 auto-placed",
+    #     "config": {
+    #         "model_name": "google/gemma-4-12B-it-qat-w4a16-ct",
+    #         "max_input_prompt_length": 512,
+    #         "max_output_prompt_length": 512,
+    #         "replicas": 1,
+    #         "vllm_kwargs": dict(
+    #             trust_remote_code=True,
+    #             reasoning_parser="gemma4",
+    #             default_chat_template_kwargs={"enable_thinking": False},
+    #         ),
+    #     },
+    # },
 ]
 
 prompt = "Write a short poem about beer"
