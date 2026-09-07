@@ -34,7 +34,9 @@ def test_remote_task(ray_ok):
 
 def test_gpu_registry_actor(ray_ok):
     try:
-        registry = ray_ok.get_actor("gpu_registry", namespace="system")
+        from ray_hive.core.ray_utils.naming import ray_namespace
+
+        registry = ray_ok.get_actor("gpu_registry", namespace=ray_namespace())
     except ValueError:
         pytest.skip("gpu_registry actor not found")
     state = ray_ok.get(registry.get_all_gpus.remote(), timeout=60)

@@ -57,7 +57,8 @@ spec:
 
 
           def get_registry():
-              return ray.get_actor("gpu_registry", namespace="system")
+              ns = os.getenv("RAY_HIVE_NAMESPACE", "ray_hive")
+              return ray.get_actor("gpu_registry", namespace=ns)
 
 
           def get_gpu_count():
@@ -220,6 +221,8 @@ spec:
               fieldPath: spec.nodeName
         - name: RAY_ADDRESS
           value: "raycluster-head-svc:6379"
+        - name: RAY_HIVE_NAMESPACE
+          value: "ray_hive"
       volumes:
       - name: ray-tmp
         emptyDir: {}

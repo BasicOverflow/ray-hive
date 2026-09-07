@@ -3,12 +3,14 @@ GPU registry: deployment reservations + live VRAM state from cluster daemon.
 
 ClusterStateManager tracks logical deployment VRAM reservations.
 VRAMAllocator adds live per-GPU state updated by the cluster DaemonSet.
-RayGpuRegistry wraps VRAMAllocator as a detached Ray actor (name: gpu_registry).
+RayGpuRegistry wraps VRAMAllocator as a detached Ray actor (name: gpu_registry)
+in the hive Ray namespace (default ``ray_hive``).
 """
 from abc import ABC, abstractmethod
 
 import ray
 
+from ray_hive.core.ray_utils.naming import NAMESPACE_ENV, ray_namespace
 from ray_hive.errors import InsufficientVramError
 
 
@@ -272,11 +274,13 @@ class RayGpuRegistry(VRAMAllocator):
 
 def get_gpu_registry():
     """Get or create the detached gpu registry actor."""
+    ns = ray_namespace()
     try:
-        return ray.get_actor("gpu_registry", namespace="system")
+        return ray.get_actor("gpu_registry", namespace=ns)
     except ValueError:
         return RayGpuRegistry.options(
             name="gpu_registry",
-            namespace="system",
+            namespace=ns,
             lifetime="detached",
+            runtime_env={"env_vars": {NAMESPACE_ENV: ns}},
         ).remote()

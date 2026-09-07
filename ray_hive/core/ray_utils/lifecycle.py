@@ -1,6 +1,7 @@
 """Deploy lifecycle helpers — shutdown and singleton actor teardown."""
 import ray
 
+from ray_hive.core.ray_utils.naming import ray_namespace
 from ray_hive.errors import ConfigError, ModelAlreadyDeployedError
 
 
@@ -43,12 +44,13 @@ def shutdown_model(model_id: str):
 
 def kill_gpu_registry():
     """Kill detached singleton actors so they are recreated fresh on next init."""
+    ns = ray_namespace()
     try:
-        ray.kill(ray.get_actor("gpu_registry", namespace="system"))
+        ray.kill(ray.get_actor("gpu_registry", namespace=ns))
     except ValueError:
         pass
     try:
-        ray.kill(ray.get_actor("deploy_service", namespace="system"))
+        ray.kill(ray.get_actor("deploy_service", namespace=ns))
     except ValueError:
         pass
 

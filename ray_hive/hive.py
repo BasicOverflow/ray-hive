@@ -69,7 +69,11 @@ class RayHive:
     """Main client for distributed LLM serving."""
 
     def __init__(self, address: str, suppress_logging: bool = True, show_banner: bool = True, **kwargs):
-        """Connect to Ray cluster at address and ensure singleton actors exist."""
+        """Connect to Ray cluster at address and ensure singleton actors exist.
+
+        Named hive actors live in Ray namespace ``ray_hive`` (override with
+        ``namespace=`` or ``RAY_HIVE_NAMESPACE``). Extra kwargs go to ``ray.init``.
+        """
         if show_banner:
             print_banner()
         warn(

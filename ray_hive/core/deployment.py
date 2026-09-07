@@ -13,6 +13,7 @@ from .gpu_registry import get_gpu_registry
 from .model_specs.estimate import load_hf_config_dict
 from .model_specs.planner import normalize_hf_config
 from .ray_utils import assert_model_id_free
+from .ray_utils.naming import NAMESPACE_ENV, ray_namespace
 from .ray_utils.placement import plan_replica_groups
 from .ray_utils.session import SERVE_FASTAPI_RUNTIME_ENV
 
@@ -46,6 +47,7 @@ def deploy_single(
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
         "CUDA_VISIBLE_DEVICES": target_gpu_id,
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+        NAMESPACE_ENV: ray_namespace(),
     }
     if len(resource_names) > 1:
         env_vars["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
@@ -97,7 +99,10 @@ def deploy_router(
             "resources": {resource_name: 0.01},
             # Pin FastAPI on the Serve replica so ingress unpickle matches
             # whatever version imported ModelRouter (worker image / client).
-            "runtime_env": dict(SERVE_FASTAPI_RUNTIME_ENV),
+            "runtime_env": {
+                **dict(SERVE_FASTAPI_RUNTIME_ENV),
+                "env_vars": {NAMESPACE_ENV: ray_namespace()},
+            },
         },
     ).bind(
         model_id=model_id,
@@ -298,7 +303,13 @@ class DeployService:
 
 def get_deploy_service():
     """Get or create the detached DeployService singleton actor."""
+    ns = ray_namespace()
     try:
-        return ray.get_actor("deploy_service", namespace="system")
+        return ray.get_actor("deploy_service", namespace=ns)
     except ValueError:
-        return DeployService.options(name="deploy_service", namespace="system", lifetime="detached").remote()
+        return DeployService.options(
+            name="deploy_service",
+            namespace=ns,
+            lifetime="detached",
+            runtime_env={"env_vars": {NAMESPACE_ENV: ns}},
+        ).remote()

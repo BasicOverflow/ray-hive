@@ -18,7 +18,9 @@ def main():
 
     try:
         try:
-            registry = ray.get_actor("gpu_registry", namespace="system")
+            from ray_hive.core.ray_utils.naming import ray_namespace
+
+            registry = ray.get_actor("gpu_registry", namespace=ray_namespace())
             print("✅ GPU registry actor found")
         except ValueError:
             print("❌ GPU registry actor not found. Is the DaemonSet running?")

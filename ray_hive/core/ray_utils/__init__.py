@@ -40,7 +40,14 @@ from .mm_helpers import (
     vision_tokens_per_image,
     vision_tokens_per_video,
 )
-from .naming import deployment_name, gpu_info_entry, gpu_resource_name
+from .naming import (
+    DEFAULT_RAY_NAMESPACE,
+    NAMESPACE_ENV,
+    deployment_name,
+    gpu_info_entry,
+    gpu_resource_name,
+    ray_namespace,
+)
 from .placement import (
     AUTO_INPUT_FLOOR,
     build_vram_reqs_for_tp,
@@ -85,6 +92,8 @@ __all__ = [
     "chunk_gpu_groups",
     "compute_cap",
     "count_by_host",
+    "DEFAULT_RAY_NAMESPACE",
+    "NAMESPACE_ENV",
     "deployment_name",
     "error",
     "estimate_encoder_params",
@@ -107,6 +116,7 @@ __all__ = [
     "mm_size_hint",
     "pil_from_url",
     "plan_replica_groups",
+    "ray_namespace",
     "print_banner",
     "print_deployment_plan",
     "print_panel",

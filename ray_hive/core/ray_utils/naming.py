@@ -1,4 +1,17 @@
 """Serve / Ray resource naming for model replicas and GPU pins."""
+import os
+
+DEFAULT_RAY_NAMESPACE = "ray_hive"
+NAMESPACE_ENV = "RAY_HIVE_NAMESPACE"
+
+
+def ray_namespace() -> str:
+    """Ray namespace for hive named actors (``gpu_registry``, ``deploy_service``).
+
+    Override with ``RAY_HIVE_NAMESPACE``. Empty values fall back to ``ray_hive``.
+    """
+    value = os.environ.get(NAMESPACE_ENV, DEFAULT_RAY_NAMESPACE).strip()
+    return value or DEFAULT_RAY_NAMESPACE
 
 
 def gpu_resource_name(gpu_key: str) -> str:

@@ -7,6 +7,7 @@ import warnings
 
 import ray
 import ray_hive
+from ray_hive.core.ray_utils.naming import NAMESPACE_ENV, ray_namespace
 from ray_hive.errors import InferenceError
 
 
@@ -96,6 +97,9 @@ def init_ray(address: str, suppress_logging: bool = True, **kwargs):
     """
     Initialize Ray with optional warning suppression.
 
+    Defaults the job to hive's Ray namespace (``RAY_HIVE_NAMESPACE`` / ``ray_hive``)
+    so named actors are not created in the cluster default namespace.
+
     When connecting via ray://, packages the package parent as runtime_env
     working_dir so ray_hive is available on the cluster for serialization.
     Also pins FastAPI to the worker image version so Serve ingress pickles
@@ -103,11 +107,21 @@ def init_ray(address: str, suppress_logging: bool = True, **kwargs):
     """
     suppress_ray_warnings(suppress_logging)
 
+    ns = kwargs.setdefault("namespace", ray_namespace())
+    os.environ[NAMESPACE_ENV] = ns
+
     if address.startswith("ray://") and "runtime_env" not in kwargs:
         kwargs["runtime_env"] = {
             "working_dir": _WORKING_DIR,
             **SERVE_FASTAPI_RUNTIME_ENV,
         }
+
+    if "runtime_env" in kwargs:
+        runtime_env = dict(kwargs["runtime_env"])
+        env_vars = dict(runtime_env.get("env_vars") or {})
+        env_vars.setdefault(NAMESPACE_ENV, ns)
+        runtime_env["env_vars"] = env_vars
+        kwargs["runtime_env"] = runtime_env
 
     ray.init(
         address=address,
