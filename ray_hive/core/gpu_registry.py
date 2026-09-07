@@ -203,6 +203,30 @@ class VRAMAllocator(ClusterStateManager):
             gpu["active"][replica_id] = gpu["pending"].pop(replica_id)
 
 
+    def mark_sleeping(self, replica_ids: list[str]) -> int:
+        """Move active → pending so freed VRAM stays reserved while sleeping."""
+        ids = set(replica_ids)
+        moved = 0
+        for gpu in self.gpus.values():
+            for rid in list(gpu["active"]):
+                if rid in ids:
+                    gpu["pending"][rid] = gpu["active"].pop(rid)
+                    moved += 1
+        return moved
+
+
+    def mark_awake(self, replica_ids: list[str]) -> int:
+        """Move pending → active after wake (clear sleep hold once VRAM is back)."""
+        ids = set(replica_ids)
+        moved = 0
+        for gpu in self.gpus.values():
+            for rid in list(gpu["pending"]):
+                if rid in ids:
+                    gpu["active"][rid] = gpu["pending"].pop(rid)
+                    moved += 1
+        return moved
+
+
     def get_gpu_vram(self, gpu_key: str) -> dict | None:
         """Return public VRAM view for one GPU."""
         return self._gpu_view(gpu_key)

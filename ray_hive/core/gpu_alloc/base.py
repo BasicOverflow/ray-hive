@@ -9,9 +9,8 @@ from abc import ABC, abstractmethod
 from .arch_reqs import required_min_compute_cap
 
 # Packing fraction for util pool (must match gpu_budget_frac in placement).
-# Leave ~10% outside the util pool for CUDA-graph capture + sampler scratch
-# (vLLM's own default gpu_memory_utilization is 0.9 for the same reason).
-TP1_BUDGET_FRAC = 0.90
+# Leave ~5% outside the util pool for CUDA-graph capture + sampler scratch.
+TP1_BUDGET_FRAC = 0.95
 
 
 class BaseGpuAllocator(ABC):

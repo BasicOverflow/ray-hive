@@ -237,6 +237,7 @@ class ModelRouter:
                     if quiet < self.sleep_timeout:
                         continue
                     self._sleeping = True
+                    await self._hold_vram_for_sleep()
                     handles = self._get_handles()
                     await asyncio.gather(*[
                         handles[name].sleep.remote(1)
@@ -256,7 +257,30 @@ class ModelRouter:
                 handles[name].wake_up.remote()
                 for name in self.gpu_deployment_names
             ])
+            await self._release_vram_after_wake()
             self._sleeping = False
+
+
+    async def _hold_vram_for_sleep(self):
+        """Pending-hold planned VRAM before engine sleep so allocators cannot steal it."""
+        import ray
+        from ray_hive.core.gpu_registry import get_gpu_registry
+
+        registry = get_gpu_registry()
+        await asyncio.to_thread(
+            ray.get, registry.mark_sleeping.remote(self.gpu_deployment_names)
+        )
+
+
+    async def _release_vram_after_wake(self):
+        """Clear sleep pending hold after engines have reclaimed VRAM."""
+        import ray
+        from ray_hive.core.gpu_registry import get_gpu_registry
+
+        registry = get_gpu_registry()
+        await asyncio.to_thread(
+            ray.get, registry.mark_awake.remote(self.gpu_deployment_names)
+        )
 
 
     async def _refresh_loads(self):

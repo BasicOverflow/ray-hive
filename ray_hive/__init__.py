@@ -71,7 +71,7 @@ __all__ = [
     "estimate_vram",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def __getattr__(name):

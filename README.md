@@ -34,7 +34,7 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 
 ## Capabilities
 
-- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.90).
+- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.95).
 - **Heterogeneous replicas** — per-GPU plans so different cards each contribute what they can.
 - **Least-loaded routing** — relative to each replica’s planned capacity.
 - **Live VRAM scheduling** — registry + reservations; see `examples/4_test_allocation_policies.py`.
@@ -301,7 +301,7 @@ See `examples/10_text_embeddings.py` and `examples/11_multimodal_embeddings.py`.
 
 ## Lifecycle
 
-Sleep after quiet, then optional full destroy (`idle_timeout` must be greater than `sleep_timeout` when both are set):
+Sleep after quiet, then optional full destroy (`idle_timeout` must be greater than `sleep_timeout` when both are set). While sleeping, planned VRAM stays reserved so other deploys cannot take wake capacity:
 
 ```python
 hive.deploy_model(

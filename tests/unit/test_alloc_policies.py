@@ -26,7 +26,7 @@ def test_replicas_one_and_all(perf_alloc, tiny_hf_dense):
 
 
 def test_partial_vram_eligibility(perf_alloc, tiny_hf_dense):
-    # need = min_vram / 0.9; available must clear that and total*0.9 >= min_vram
+    # need = min_vram / TP1_BUDGET_FRAC; available must clear that and total*frac >= min_vram
     min_vram = 5.0
     need = min_vram / TP1_BUDGET_FRAC
     gmap = {
