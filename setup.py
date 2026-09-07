@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="ray-hive",
-    version="0.1.1",
+    version="0.1.2",
     author="Your Name",
     description="Distributed LLM serving engine for Ray clusters",
     long_description=long_description,
