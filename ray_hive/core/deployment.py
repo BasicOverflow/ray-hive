@@ -14,6 +14,7 @@ from .model_specs.estimate import load_hf_config_dict
 from .model_specs.planner import normalize_hf_config
 from .ray_utils import assert_model_id_free
 from .ray_utils.placement import plan_replica_groups
+from .ray_utils.session import SERVE_FASTAPI_RUNTIME_ENV
 
 
 @ray.remote(num_gpus=0.01)
@@ -91,7 +92,13 @@ def deploy_router(
         graceful_shutdown_timeout_s=0,
         autoscaling_config=None,
         num_replicas=1,
-        ray_actor_options={"num_cpus": 0.1, "resources": {resource_name: 0.01}},
+        ray_actor_options={
+            "num_cpus": 0.1,
+            "resources": {resource_name: 0.01},
+            # Pin FastAPI on the Serve replica so ingress unpickle matches
+            # whatever version imported ModelRouter (worker image / client).
+            "runtime_env": dict(SERVE_FASTAPI_RUNTIME_ENV),
+        },
     ).bind(
         model_id=model_id,
         model_name=model_name,
@@ -141,6 +148,8 @@ class DeployService:
         """Run the full deploy pipeline for one model."""
         if "max_input_prompt_length" not in config or "max_output_prompt_length" not in config:
             raise ConfigError("max_input_prompt_length and max_output_prompt_length are required")
+        from .ray_utils.placement import validate_auto_input_config
+        validate_auto_input_config(config)
 
         # Serve-frontend only — not valid on LLM()/EngineArgs; applied by ModelRouter.
         model_vllm_kwargs = dict(model_vllm_kwargs)

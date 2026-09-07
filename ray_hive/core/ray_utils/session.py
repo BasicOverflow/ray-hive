@@ -13,6 +13,11 @@ from ray_hive.errors import InferenceError
 # Parent of the installed/editable `ray_hive` package — Ray Client working_dir.
 _WORKING_DIR = os.path.dirname(os.path.dirname(os.path.abspath(ray_hive.__file__)))
 
+# Must match manifests/Dockerfile.ray-vllm-worker. Serve ingress pickles FastAPI
+# internals (_DefaultLifespan); client/worker/replica skew → DEPLOY_FAILED.
+SERVE_FASTAPI_PIP = ("fastapi==0.133.0", "starlette==1.0.1")
+SERVE_FASTAPI_RUNTIME_ENV = {"pip": list(SERVE_FASTAPI_PIP)}
+
 
 class StderrFilter:
     """Filters stderr to suppress Ray C++ warnings."""
@@ -93,11 +98,16 @@ def init_ray(address: str, suppress_logging: bool = True, **kwargs):
 
     When connecting via ray://, packages the package parent as runtime_env
     working_dir so ray_hive is available on the cluster for serialization.
+    Also pins FastAPI to the worker image version so Serve ingress pickles
+    (``_DefaultLifespan``, etc.) round-trip on replicas that use Ray pip envs.
     """
     suppress_ray_warnings(suppress_logging)
 
     if address.startswith("ray://") and "runtime_env" not in kwargs:
-        kwargs["runtime_env"] = {"working_dir": _WORKING_DIR}
+        kwargs["runtime_env"] = {
+            "working_dir": _WORKING_DIR,
+            **SERVE_FASTAPI_RUNTIME_ENV,
+        }
 
     ray.init(
         address=address,

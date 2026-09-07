@@ -31,6 +31,8 @@ USER ray
 # numpy>=2.4 needs X86_V2 — pin <2.4 for Proxmox guest CPUs.
 # pyOpenSSL/cryptography mismatch breaks Qwen3.5 import via boto3 (GEN_EMAIL).
 # protobuf: vLLM wants >=5.29.6; Ray Serve breaks on 7.x — pin 5.29.6 after install.
+# FastAPI must match the Ray Client pin (ray_hive.core.ray_utils.session) — Serve
+# ingress pickles FastAPI internals (_DefaultLifespan); skew → replica DEAD.
 # Smoke test is the build gate. `pip check` always screams on Ray+vLLM — run it advisory only.
 ARG VLLM_VERSION=0.25.1
 RUN pip install --no-cache-dir --upgrade "uv" \
@@ -38,6 +40,7 @@ RUN pip install --no-cache-dir --upgrade "uv" \
         "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
         --torch-backend=cu129 \
     && uv pip install --system --no-cache --upgrade "transformers" "numpy<2.4" "cryptography" "pyopenssl" \
+        "fastapi==0.133.0" "starlette==1.0.1" \
     && pip install --no-cache-dir --force-reinstall "protobuf==5.29.6" \
     && python /opt/ray-hive/smoke_test_worker_deps.py
 

@@ -61,7 +61,10 @@ def _proxy_url(model_id: str, suffix: str) -> str:
 
 @serve.deployment(
     name="openai-gateway",
-    ray_actor_options={"num_cpus": 0.1},
+    ray_actor_options={
+        "num_cpus": 0.1,
+        "runtime_env": {"pip": ["fastapi==0.133.0", "starlette==1.0.1"]},
+    },
     autoscaling_config=None,
     num_replicas=1,
     max_ongoing_requests=100,

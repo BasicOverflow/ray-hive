@@ -1,9 +1,14 @@
-"""Live Deploy A–I cycles with dynamic GPU claims (single pytest process)."""
+"""Live Deploy cycles with dynamic GPU claims (single pytest process).
+
+Parallel suite covers A–H. Dedicated tests: J (auto input), K (sleep VRAM hold),
+I (nightly registry kill).
+"""
 import json
 import time
 import urllib.request
 
 import pytest
+import ray
 
 from tests.live.cluster_sched import GpuNeed, UnsatisfiableError, run_cycles_parallel
 from tests.live.conftest import (
@@ -45,6 +50,23 @@ def _openai_chat(model_id: str, prompt: str, max_tokens: int = 16) -> str:
 def _fp8_need(**kwargs) -> GpuNeed:
     kwargs.setdefault("min_compute_cap", FP8_CAP)
     return GpuNeed(**kwargs)
+
+
+def _wait_replica_pending(hive, pin: str, replica_ids: list[str], *, max_wait_s: float = 45.0):
+    """Poll registry until a replica id moves active → pending (sleep hold)."""
+    deadline = time.time() + max_wait_s
+    last = None
+    while time.time() < deadline:
+        view = (hive.get_vram_state() or {}).get(pin) or {}
+        last = view
+        pending = view.get("pending") or {}
+        if any(rid in pending for rid in replica_ids):
+            return view
+        time.sleep(1.0)
+    raise TimeoutError(
+        f"replicas {replica_ids} never entered pending on {pin} within {max_wait_s}s; "
+        f"last_view={last}"
+    )
 
 
 def test_live_cycles_parallel(hive, scheduler):
@@ -158,7 +180,7 @@ def test_live_cycles_parallel(hive, scheduler):
 
     cycles.append((_fp8_need(min_free_gb=3.0, count=2, same_host=True, name="E"), cycle_e))
 
-    # F — short sleep/idle (HTTP)
+    # F — short sleep/idle (HTTP wake)
     def cycle_f(claim):
         mid = uniq("f")
         try:
@@ -231,6 +253,123 @@ def test_live_cycles_parallel(hive, scheduler):
         pytest.fail("live cycle failures: " + "; ".join(hard))
     if ok == 0:
         pytest.skip("no free GPUs for any cycle: " + "; ".join(soft))
+
+
+def test_live_auto_input_deploys(hive, scheduler):
+    """J — deploy with max_input_prompt_length=\"auto\" and run chat."""
+    claim = None
+    mid = uniq("j")
+    try:
+        claim = scheduler.claim(_fp8_need(min_free_gb=4.0, count=1, name="J"))
+        pin = claim.gpu_keys[0]
+        kwargs = {**VLLM_TEXT, "max_num_seqs": 4}
+
+        planned = hive.estimate_vram(
+            TEXT_MODEL,
+            max_input_prompt_length="auto",
+            max_output_prompt_length=64,
+            replicas=1,
+            gpu=pin,
+            vllm_kwargs=kwargs,
+        )
+        est = next(iter(planned.values()))
+        est_plan = est["plan"]
+        assert est_plan["max_input_prompt_length_auto"] is True
+        assert est_plan["max_input_prompt_length"] >= 256
+        assert est_plan["max_num_seqs"] == 4
+        assert est["max_model_len"] == est_plan["max_input_prompt_length"] + 64
+
+        status = hive.deploy_model(
+            model_id=mid,
+            model_name=TEXT_MODEL,
+            max_input_prompt_length="auto",
+            max_output_prompt_length=64,
+            replicas=1,
+            gpu=pin,
+            vllm_kwargs=kwargs,
+        )
+        assert status["status"] == "ready"
+        dep_plan = next(iter(status["replicas"].values()))["plan"]
+        assert dep_plan["max_input_prompt_length_auto"] is True
+        assert dep_plan["max_input_prompt_length"] >= 256
+        assert dep_plan["max_num_seqs"] == 4
+        assert dep_plan["max_input_prompt_length"] == est_plan["max_input_prompt_length"]
+        assert _openai_chat(mid, "Say ok in one word.")
+    except TimeoutError as e:
+        note_vram_skip(f"J auto-input: {e}")
+        pytest.skip(str(e))
+    finally:
+        hive.shutdown(mid)
+        if claim is not None:
+            scheduler.release(claim)
+
+
+def test_live_sleep_vram_hold(hive, scheduler):
+    """K — after sleep, planned VRAM stays pending so freed smi cannot be stolen."""
+    from ray_hive.core.gpu_registry import get_gpu_registry
+
+    claim = None
+    mid = uniq("k")
+    probe_id = f"steal-probe-{uniq('k')}"
+    registry = get_gpu_registry()
+    sleep_s = 8
+    try:
+        claim = scheduler.claim(_fp8_need(min_free_gb=4.0, count=1, name="K"))
+        pin = claim.gpu_keys[0]
+        status = hive.deploy_model(
+            model_id=mid,
+            model_name=TEXT_MODEL,
+            max_input_prompt_length=256,
+            max_output_prompt_length=64,
+            replicas=1,
+            gpu=pin,
+            sleep_timeout=sleep_s,
+            idle_timeout=sleep_s + 90,
+            vllm_kwargs={**VLLM_TEXT, "max_num_seqs": 8},
+        )
+        assert status["status"] == "ready"
+        replica_ids = list(status["replicas"].keys())
+        reserved = float(next(iter(status["replicas"].values()))["plan"]["total_vram_gb"])
+        assert _openai_chat(mid, "hot")
+
+        view = _wait_replica_pending(hive, pin, replica_ids, max_wait_s=sleep_s + 35)
+        pending = view.get("pending") or {}
+        active = view.get("active") or {}
+        assert any(rid in pending for rid in replica_ids)
+        assert not any(rid in active for rid in replica_ids)
+        pending_sum = float(sum(pending.values()))
+        assert pending_sum >= reserved * 0.9
+        assert view["available"] == pytest.approx(
+            float(view["free"]) - pending_sum, abs=0.25
+        )
+
+        gap = float(view["free"]) - float(view["available"])
+        assert gap >= reserved * 0.9
+        steal_need = float(view["available"]) + max(gap * 0.5, 0.5)
+        assert steal_need > float(view["available"])
+        stole = ray.get(registry.reserve_replica.remote(probe_id, pin, steal_need))
+        assert stole is False, (
+            f"sleep hold failed: reserved {steal_need:.2f}GB on {pin} while "
+            f"available={view['available']:.2f} free={view['free']:.2f} pending={pending}"
+        )
+
+        assert _openai_chat(mid, "wake")
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            awake = (hive.get_vram_state() or {}).get(pin) or {}
+            if any(rid in (awake.get("active") or {}) for rid in replica_ids):
+                break
+            time.sleep(1.0)
+        else:
+            pytest.fail(f"replicas {replica_ids} never returned to active after wake")
+    except TimeoutError as e:
+        note_vram_skip(f"K sleep-hold: {e}")
+        pytest.skip(str(e))
+    finally:
+        ray.get(registry.clear_replicas.remote([probe_id]))
+        hive.shutdown(mid)
+        if claim is not None:
+            scheduler.release(claim)
 
 
 @pytest.mark.nightly

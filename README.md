@@ -34,12 +34,13 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 
 ## Capabilities
 
-- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.95).
+- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.95). With `max_input_prompt_length="auto"` + fixed `max_num_seqs`, grow text context (floor 256) instead.
 - **Heterogeneous replicas** — per-GPU plans so different cards each contribute what they can.
 - **Least-loaded routing** — relative to each replica’s planned capacity.
 - **Live VRAM scheduling** — registry + reservations; see `examples/4_test_allocation_policies.py`.
 - **GPU sharing** — co-locate when needed; intentional share via same `gpu=` pin (`examples/6_shared_gpu.py`).
 - **Flexible placement** — pin, N replicas, or `replicas=-1` (`examples/1_test_model_configs.py`).
+- **Flagship deploy reference** — current open flagships as uncomment-to-run templates (`examples/15_flagship_models.py`).
 - **Same-node TP** — auto escalate or pin a GPU list (`examples/5_tensor_parallel.py`).
 - **Custom attention** — subclass using HF config fields (`examples/3_custom_attention.py`).
 - **Multimodal generate** — image / video / audio (`examples/8`–`9`, `12`–`14`).
@@ -76,6 +77,9 @@ Deployment Plan: Qwen/Qwen3-0.6B-FP8
   Replica                  replica-0
   GPU(s)                   host-a:gpu0
   tensor_parallel_size     1
+  max_input_prompt_length  1024
+  max_output_prompt_length 2048
+  max_model_len            3072
   max_num_seqs             48
   max_num_batched_tokens   8192
   gpu_memory_utilization   0.850
@@ -143,6 +147,36 @@ Inside an asyncio loop use `a_inference` / `a_inference_batch` instead of the sy
 - `gpu=[a,b,...]` + `replicas=1` — one same-node TP group.
 - `gpu=None` — auto place (single GPU via `allocation_cls`, default `RayPerformanceAllocator`; else same-node TP).
 - `replicas=-1` — every eligible GPU / TP group.
+
+### Auto input length
+
+By default context lengths are a fixed contract and omitted `max_num_seqs` is packed to fill VRAM.
+
+`max_input_prompt_length="auto"` does the inverse for **text input only**: you must pass `max_num_seqs` in `vllm_kwargs`, output length stays fixed, and the planner grows text input from a floor of **256** until the VRAM budget is filled (capped by HF `max_position_embeddings` / `model_max_length` when present). Multimodal placeholder tokens are still added on top of the chosen text length, so `max_model_len` always covers MM + output.
+
+```python
+hive.estimate_vram(
+    "Qwen/Qwen3-0.6B-FP8",
+    max_input_prompt_length="auto",
+    max_output_prompt_length=512,
+    replicas=1,
+    vllm_kwargs={
+        "max_num_seqs": 8,
+        "trust_remote_code": True,
+        "reasoning_parser": "qwen3",
+        "default_chat_template_kwargs": {"enable_thinking": False},
+    },
+)
+```
+
+```text
+  max_input_prompt_length  8192 (auto)
+  max_output_prompt_length 512
+  max_model_len            8704
+  max_num_seqs             8
+```
+
+Passing `"auto"` without `max_num_seqs` raises `ConfigError`.
 
 Pin one GPU:
 
@@ -230,7 +264,7 @@ See `examples/3_custom_attention.py` (and `examples/14_gemma4_stress.py` for mul
 
 **MM models** — planner uses `limit_mm_per_prompt` in `vllm_kwargs` to size worst-case image / video / audio placeholders. If omitted on an MM HF config, defaults are derived from `vision_config` / `audio_config` (typically `image: 1` and/or `audio: 1`). Set counts explicitly to enable or disable modalities.
 
-**Token budget** — `max_input_prompt_length` is the **text** side only. Effective input ≈ text + MM placeholders; `max_model_len ≈ effective_input + max_output_prompt_length` (use output `0` for pooling). If that cannot cover placeholders + output, planning raises `MmContextError` — raise `max_input_prompt_length` or lower `limit_mm_per_prompt`.
+**Token budget** — `max_input_prompt_length` is the **text** side only. Effective input ≈ text + MM placeholders; `max_model_len ≈ effective_input + max_output_prompt_length` (use output `0` for pooling). If that cannot cover placeholders + output, planning raises `MmContextError` — raise `max_input_prompt_length` or lower `limit_mm_per_prompt`. With `max_input_prompt_length="auto"` (requires `max_num_seqs`), text grows from 256 while MM placeholders stay reserved inside `max_model_len`.
 
 **Requests vs planning** — on an MM deploy you can still send text-only strings. That does **not** shrink the VRAM plan. For text-only *planning* on an MM checkpoint, zero unused modalities (`{"image": 0, "video": 0, "audio": 0}`).
 
@@ -384,7 +418,9 @@ Then (single process — do **not** use `pytest -n` here; live GPU claims must s
 
 ```bash
 pytest -m ray    # cluster smoke, no LLM
-pytest -m live   # Deploy A–H; needs GPUs + model download
+pytest -m live   # Deploy A–H + auto-input + sleep-hold; needs GPUs + model download
+# Focused:
+#   pytest -m live -k "auto_input or sleep_vram_hold"
 # or both:
 pytest -m "ray or live"
 ```

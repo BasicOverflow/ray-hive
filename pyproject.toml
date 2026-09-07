@@ -33,6 +33,9 @@ dependencies = [
     "torch>=2.0.0",
     "transformers",
     "rich",
+    # Pin with cluster worker image — Serve ingress pickles FastAPI internals.
+    "fastapi==0.133.0",
+    "starlette==1.0.1",
 ]
 
 [project.optional-dependencies]

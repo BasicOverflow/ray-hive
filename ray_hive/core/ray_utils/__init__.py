@@ -42,13 +42,23 @@ from .mm_helpers import (
 )
 from .naming import deployment_name, gpu_info_entry, gpu_resource_name
 from .placement import (
+    AUTO_INPUT_FLOOR,
     build_vram_reqs_for_tp,
     chunk_gpu_groups,
     fixed_non_kv_gb,
+    is_auto_input,
     plan_replica_groups,
+    solve_auto_text_input,
+    validate_auto_input_config,
 )
 from .select_gpus import resolve_target_gpus
-from .session import StderrFilter, init_ray, serve_base_url, suppress_ray_warnings
+from .session import (
+    SERVE_FASTAPI_RUNTIME_ENV,
+    StderrFilter,
+    init_ray,
+    serve_base_url,
+    suppress_ray_warnings,
+)
 from .tensor_parallel import assert_tp_shardable, tp_shardable
 from .display import (
     error,
@@ -61,6 +71,8 @@ from .display import (
 )
 
 __all__ = [
+    "AUTO_INPUT_FLOOR",
+    "SERVE_FASTAPI_RUNTIME_ENV",
     "StderrFilter",
     "approx_tdp",
     "assert_model_id_free",
@@ -85,6 +97,7 @@ __all__ = [
     "host_memory_available_gb",
     "info",
     "init_ray",
+    "is_auto_input",
     "is_node_alive",
     "kill_gpu_registry",
     "load_bytes_from_url",
@@ -102,9 +115,11 @@ __all__ = [
     "shutdown_all",
     "shutdown_model",
     "sm_count",
+    "solve_auto_text_input",
     "success",
     "suppress_ray_warnings",
     "tp_shardable",
+    "validate_auto_input_config",
     "video_frames_from_url",
     "vision_tokens_per_image",
     "vision_tokens_per_video",

@@ -96,6 +96,16 @@ def print_deployment_plan(model_id: str, results: dict):
         meta.add_row("Replica", replica_id)
         meta.add_row("GPU(s)", ", ".join(gpu_keys))
         meta.add_row("tensor_parallel_size", str(tp))
+        if "max_input_prompt_length" in plan:
+            inp = str(plan["max_input_prompt_length"])
+            if plan.get("max_input_prompt_length_auto"):
+                inp = f"{inp} (auto)"
+            meta.add_row("max_input_prompt_length", inp)
+        if "max_output_prompt_length" in plan:
+            meta.add_row("max_output_prompt_length", str(plan["max_output_prompt_length"]))
+        mml = plan.get("max_model_len", summary.get("max_model_len"))
+        if mml is not None:
+            meta.add_row("max_model_len", str(mml))
         meta.add_row("max_num_seqs", str(plan["max_num_seqs"]))
         meta.add_row("max_num_batched_tokens", str(plan["max_num_batched_tokens"]))
         meta.add_row("gpu_memory_utilization", f"{plan['gpu_memory_utilization']:.3f}")

@@ -6,7 +6,7 @@ Wraps DeployService (serialized deploy) and gpu_registry (VRAM tracking).
 import time
 
 import ray
-from typing import Dict, List, Optional, Type, Union
+from typing import Dict, List, Literal, Optional, Type, Union
 
 from .core.deployment import get_deploy_service
 from .core.gpu_alloc import BaseGpuAllocator
@@ -20,7 +20,7 @@ from .core.ray_utils.display import (
     print_deployment_plan,
     warn,
 )
-from .core.ray_utils.placement import plan_replica_groups
+from .core.ray_utils.placement import plan_replica_groups, validate_auto_input_config
 from .core.openai_gateway import ensure_openai_gateway
 from .errors import ConfigError
 
@@ -86,7 +86,7 @@ class RayHive:
         self,
         model_id: str,
         model_name: str,
-        max_input_prompt_length: int,
+        max_input_prompt_length: Union[int, Literal["auto"]],
         max_output_prompt_length: int,
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
@@ -105,6 +105,8 @@ class RayHive:
         max_input_prompt_length and max_output_prompt_length are required.
         Pass planner overrides (max_num_seqs, max_num_batched_tokens) inside
         vllm_kwargs — they are lifted automatically.
+        max_input_prompt_length=\"auto\" grows text input (floor 256) to fill VRAM at a
+        fixed max_num_seqs (required in vllm_kwargs); output length stays fixed.
         replicas=-1 deploys to all eligible GPUs (or all eligible TP groups when auto TP>1).
         attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
         allocation_cls defaults to RayPerformanceAllocator for single-GPU auto placement;
@@ -136,6 +138,7 @@ class RayHive:
             "sleep_timeout": sleep_timeout,
             **planner_overrides,
         }
+        validate_auto_input_config(config)
 
         deploy_svc = get_deploy_service()
 
@@ -171,7 +174,7 @@ class RayHive:
     def estimate_vram(
         self,
         model_name: str,
-        max_input_prompt_length: int,
+        max_input_prompt_length: Union[int, Literal["auto"]],
         max_output_prompt_length: int,
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
@@ -198,6 +201,7 @@ class RayHive:
             "allocation_cls": allocation_cls,
             **planner_overrides,
         }
+        validate_auto_input_config(config)
 
         hf_params = normalize_hf_config(load_hf_config_dict(model_name))
 
