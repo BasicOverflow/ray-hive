@@ -30,6 +30,7 @@ _BANNER = r"""
 # Component rows for deploy plan printer (only render keys present).
 _BREAKDOWN_ROWS = (
     ("weights_gb", "Weights"),
+    ("draft_weights_gb", "Draft weights"),
     ("weight_need_gb", "Weight need (per GPU)"),
     ("kv_cache_gb", "KV cache"),
     ("activation_gb", "Activations"),

@@ -3,7 +3,7 @@
 #
 # Build → verify → push (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
 #
-#   IMG=10.0.0.52:3000/peter/ray-vllm-worker:2.56.0
+#   IMG=10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr1
 #
 #   docker build -f manifests/Dockerfile.ray-vllm-worker -t "$IMG" .
 #
@@ -31,17 +31,23 @@ USER ray
 # numpy>=2.4 needs X86_V2 — pin <2.4 for Proxmox guest CPUs.
 # pyOpenSSL/cryptography mismatch breaks Qwen3.5 import via boto3 (GEN_EMAIL).
 # protobuf: vLLM wants >=5.29.6; Ray Serve breaks on 7.x — pin 5.29.6 after install.
+# vLLM 0.28 pulls googleapis-common-protos>=1.75 (gencode 6.33) which then
+# crashes Ray dashboard_agent on `from google.rpc import code_pb2`. Pin a 5.x
+# gencode build so raylet can fate-share with the agent.
 # FastAPI must match the Ray Client pin (ray_hive.core.ray_utils.session) — Serve
 # ingress pickles FastAPI internals (_DefaultLifespan); skew → replica DEAD.
+# DeepSeek-OCR / OCR-2 HF remote-code modeling needs addict + matplotlib (+ easydict).
 # Smoke test is the build gate. `pip check` always screams on Ray+vLLM — run it advisory only.
-ARG VLLM_VERSION=0.25.1
+ARG VLLM_VERSION=0.28.0
 RUN pip install --no-cache-dir --upgrade "uv" \
     && uv pip install --system --no-cache --upgrade "scipy" \
         "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" \
         --torch-backend=cu129 \
     && uv pip install --system --no-cache --upgrade "transformers" "numpy<2.4" "cryptography" "pyopenssl" \
         "fastapi==0.133.0" "starlette==1.0.1" \
+        "addict" "matplotlib" "easydict" \
     && pip install --no-cache-dir --force-reinstall "protobuf==5.29.6" \
+        "googleapis-common-protos==1.66.0" \
     && python /opt/ray-hive/smoke_test_worker_deps.py
 
 ENV VLLM_VIDEO_LOADER_BACKEND=opencv

@@ -34,13 +34,13 @@ KubeRay manages the head and worker pods. Ray handles task scheduling and Serve 
 
 ## Capabilities
 
-- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.95). With `max_input_prompt_length="auto"` + fixed `max_num_seqs`, grow text context (floor 256) instead.
+- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.95). With `max_input_prompt_length="auto"` + fixed `max_num_seqs`, grow text context (floor 256) instead. At `max_num_seqs=1`, auto may shrink below 256 so weights + speculative draft still fit. Hybrid GDN/Mamba models cap auto input at 32768 so leftover VRAM is not spent on an unbounded attention window.
 - **Heterogeneous replicas** — per-GPU plans so different cards each contribute what they can.
 - **Least-loaded routing** — relative to each replica’s planned capacity.
 - **Live VRAM scheduling** — registry + reservations; see `examples/4_test_allocation_policies.py`.
 - **GPU sharing** — co-locate when needed; intentional share via same `gpu=` pin (`examples/6_shared_gpu.py`).
 - **Flexible placement** — pin, N replicas, or `replicas=-1` (`examples/1_test_model_configs.py`).
-- **Flagship deploy reference** — current open flagships as uncomment-to-run templates (`examples/15_flagship_models.py`).
+- **Flagship deploy reference** — Qwen3.8-27B + Nemotron 3.5 Lightning variants (`examples/15_flagship_models.py`).
 - **Same-node TP** — auto escalate or pin a GPU list (`examples/5_tensor_parallel.py`).
 - **Custom attention** — subclass using HF config fields (`examples/3_custom_attention.py`).
 - **Multimodal generate** — image / video / audio (`examples/8`–`9`, `12`–`14`).
@@ -152,7 +152,9 @@ Inside an asyncio loop use `a_inference` / `a_inference_batch` instead of the sy
 
 By default context lengths are a fixed contract and omitted `max_num_seqs` is packed to fill VRAM.
 
-`max_input_prompt_length="auto"` does the inverse for **text input only**: you must pass `max_num_seqs` in `vllm_kwargs`, output length stays fixed, and the planner grows text input from a floor of **256** until the VRAM budget is filled (capped by HF `max_position_embeddings` / `model_max_length` when present). Multimodal placeholder tokens are still added on top of the chosen text length, so `max_model_len` always covers MM + output.
+`max_input_prompt_length="auto"` does the inverse for **text input only**: you must pass `max_num_seqs` in `vllm_kwargs`, output length stays fixed, and the planner grows text input from a floor of **256** until the VRAM budget is filled (capped by HF `max_position_embeddings` / `model_max_length` when present). When `max_num_seqs=1` and even 256 does not leave KV room after weights + speculative draft, auto shrinks toward 1 token. Multimodal placeholder tokens are still added on top of the chosen text length, so `max_model_len` always covers MM + output.
+
+`speculative_config` is part of the memory plan: in-checkpoint MTP reserves an extra compute-dtype `lm_head` (and `num_nextn_predict_layers` when set); a separate draft `model` adds that checkpoint’s weights and KV.
 
 ```python
 hive.estimate_vram(
@@ -264,7 +266,7 @@ See `examples/3_custom_attention.py` (and `examples/14_gemma4_stress.py` for mul
 
 **MM models** — planner uses `limit_mm_per_prompt` in `vllm_kwargs` to size worst-case image / video / audio placeholders. If omitted on an MM HF config, defaults are derived from `vision_config` / `audio_config` (typically `image: 1` and/or `audio: 1`). Set counts explicitly to enable or disable modalities.
 
-**Token budget** — `max_input_prompt_length` is the **text** side only. Effective input ≈ text + MM placeholders; `max_model_len ≈ effective_input + max_output_prompt_length` (use output `0` for pooling). If that cannot cover placeholders + output, planning raises `MmContextError` — raise `max_input_prompt_length` or lower `limit_mm_per_prompt`. With `max_input_prompt_length="auto"` (requires `max_num_seqs`), text grows from 256 while MM placeholders stay reserved inside `max_model_len`.
+**Token budget** — `max_input_prompt_length` is the **text** side only. Effective input ≈ text + MM placeholders; `max_model_len ≈ effective_input + max_output_prompt_length` (use output `0` for pooling). If that cannot cover placeholders + output, planning raises `MmContextError` — raise `max_input_prompt_length` or lower `limit_mm_per_prompt`. With `max_input_prompt_length="auto"` (requires `max_num_seqs`), text grows from 256 (or shrinks below that at `max_num_seqs=1`) while MM placeholders stay reserved inside `max_model_len`.
 
 **Requests vs planning** — on an MM deploy you can still send text-only strings. That does **not** shrink the VRAM plan. For text-only *planning* on an MM checkpoint, zero unused modalities (`{"image": 0, "video": 0, "audio": 0}`).
 

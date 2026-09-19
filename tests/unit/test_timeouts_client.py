@@ -9,8 +9,12 @@ from ray_hive.hive import _split_vllm_kwargs
 
 
 def test_split_vllm_kwargs_lifts_planner_keys():
-    overrides, rest = _split_vllm_kwargs({"max_num_seqs": 8, "temperature": 0.5})
-    assert overrides == {"max_num_seqs": 8}
+    overrides, rest = _split_vllm_kwargs({
+        "max_num_seqs": 8,
+        "auto_hybrid_input_cap": 65536,
+        "temperature": 0.5,
+    })
+    assert overrides == {"max_num_seqs": 8, "auto_hybrid_input_cap": 65536}
     assert rest == {"temperature": 0.5}
 
 

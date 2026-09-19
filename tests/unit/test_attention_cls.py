@@ -8,6 +8,22 @@ class FatKV(BaseAttentionSpecs):
         return super().kv_bytes_per_token() * 4
 
 
+def test_kv_layers_skip_linear_attention(tiny_hf_dense):
+    hf = {
+        **tiny_hf_dense,
+        "num_hidden_layers": 4,
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    }
+    vr = build_vram_reqs(hf)
+    assert vr.attention.kv_layers == 1
+    assert vr.attention.num_layers == 4
+
+
 def test_custom_attention_changes_seqs(tiny_hf_dense):
     base = build_vram_reqs(tiny_hf_dense)
     fat = build_vram_reqs(tiny_hf_dense, attention_cls=FatKV)

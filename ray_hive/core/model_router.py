@@ -8,6 +8,7 @@ import asyncio
 import json
 import time
 import uuid
+from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Union
 
 from fastapi import FastAPI, HTTPException
@@ -24,7 +25,118 @@ from ray_hive.core.ray_utils.media import (
     pil_from_url,
     video_frames_from_url,
 )
+from ray_hive.core.openai_protocol import (
+    ToolCallStreamFilter,
+    clamp_max_tokens,
+    finish_reason_for,
+    hf_tool_calls,
+    model_card,
+    normalize_role,
+    normalize_tools,
+    parse_tool_calls,
+    template_apply_errors,
+    template_message_encodings,
+)
+from ray_hive.core.think_split import ThinkStreamFilter, sanitize_stop, strip_think
 from ray_hive.errors import MediaError, UnsupportedModeError, http_status_for
+
+
+def _ensure_llama_flash_attention_compat() -> None:
+    """DeepSeek-OCR* remote code still imports symbols removed in transformers 5.x."""
+    try:
+        import transformers.models.llama.modeling_llama as llama_mod
+    except Exception:
+        return
+    if not hasattr(llama_mod, "LlamaFlashAttention2"):
+        base = getattr(llama_mod, "LlamaAttention", None)
+        if base is not None:
+            llama_mod.LlamaFlashAttention2 = base
+    try:
+        import transformers.utils.import_utils as iu
+
+        if not hasattr(iu, "is_torch_fx_available"):
+            iu.is_torch_fx_available = lambda: False  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _load_hf_tokenizer(model_name: str):
+    """Load tokenizer; avoid DeepSeek remote modeling that breaks on transformers 5.x."""
+    _ensure_llama_flash_attention_compat()
+    # Prefer no remote code for DeepSeek — modeling_*.py is TF4-era and fails on TF5.
+    prefer_remote = "deepseek" not in model_name.lower()
+    order = (True, False) if prefer_remote else (False, True)
+    last_err = None
+    for remote in order:
+        try:
+            return AutoTokenizer.from_pretrained(model_name, trust_remote_code=remote)
+        except Exception as e:
+            last_err = e
+            print(f"[ray-hive] AutoTokenizer(trust_remote_code={remote}) failed: {e}")
+    raise last_err
+
+
+def _default_deepseek_ocr_chat_template() -> str:
+    """Plain DeepSeek-OCR prompt: <image>\\n{text} (no HF chat template on hub)."""
+    return (
+        "{% for message in messages %}"
+        "{% if message['role'] == 'user' %}"
+        "{% if message['content'] is string %}{{ message['content'] }}"
+        "{% else %}"
+        "{% for content in message['content'] %}"
+        "{% if content['type'] == 'image' or content['type'] == 'image_url' %}<image>\n"
+        "{% elif content['type'] == 'text' %}{{ content['text'] }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% endif %}"
+        "{% endif %}"
+        "{% endfor %}"
+    )
+
+
+def _ensure_chat_template(tokenizer, model_name: str, chat_template: str | None) -> None:
+    if chat_template:
+        tokenizer.chat_template = chat_template
+        return
+    if getattr(tokenizer, "chat_template", None):
+        return
+    name = model_name.lower()
+    if "deepseek" in name and "ocr" in name:
+        tokenizer.chat_template = _default_deepseek_ocr_chat_template()
+
+
+def _load_mm_config(model_name: str):
+    """Config for modality detection without executing broken remote modeling modules."""
+    _ensure_llama_flash_attention_compat()
+    try:
+        from transformers import AutoConfig
+
+        return AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except Exception as e:
+        print(f"[ray-hive] AutoConfig(trust_remote_code=True) failed: {e}")
+        from types import SimpleNamespace
+
+        from huggingface_hub import hf_hub_download
+
+        raw = json.loads(Path(hf_hub_download(model_name, "config.json")).read_text(encoding="utf-8"))
+
+        def _ns(obj):
+            if isinstance(obj, dict):
+                return SimpleNamespace(**{k: _ns(v) for k, v in obj.items()})
+            return obj
+
+        return _ns(raw)
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+_TEMPLATE_REQUEST_KEYS = (
+    "chat_template_kwargs",
+    "enable_thinking",
+    "reasoning_effort",
+    "preserve_thinking",
+)
 
 app = FastAPI()
 
@@ -75,10 +187,29 @@ ContentPart = Union[
 ]
 
 
+class ChatFunctionCall(BaseModel):
+    """OpenAI tool function payload."""
+    model_config = ConfigDict(extra="allow")
+    name: str
+    arguments: Union[str, dict] = "{}"
+
+
+class ChatToolCall(BaseModel):
+    """OpenAI assistant tool_calls item."""
+    model_config = ConfigDict(extra="allow")
+    id: str | None = None
+    type: str = "function"
+    function: ChatFunctionCall
+
+
 class ChatMessage(BaseModel):
-    """OpenAI chat message with string or multipart content."""
+    """OpenAI chat message — content may be null when tool_calls are set."""
+    model_config = ConfigDict(extra="allow")
     role: str
-    content: Union[str, list[ContentPart]]
+    content: Union[str, list[ContentPart], None] = None
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[ChatToolCall] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -169,13 +300,14 @@ class ModelRouter:
         self._shutting_down = False
         self._sleeping = False
         self._sleep_lock = asyncio.Lock()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self._template_style = None
+        self.tokenizer = _load_hf_tokenizer(model_name)
         self.processor = None
         self._mm_warmup_modality = "image"
         if multimodal:
-            from transformers import AutoConfig, AutoProcessor
+            from transformers import AutoProcessor
 
-            cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            cfg = _load_mm_config(model_name)
             if getattr(cfg, "audio_config", None) is not None and getattr(cfg, "vision_config", None) is None:
                 self._mm_warmup_modality = "audio"
             elif getattr(cfg, "audio_config", None) is not None and getattr(cfg, "vision_config", None) is not None:
@@ -183,11 +315,16 @@ class ModelRouter:
             try:
                 self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
             except Exception:
-                self.processor = None
-        if chat_template:
-            self.tokenizer.chat_template = chat_template
-            if self.processor is not None:
-                self.processor.chat_template = chat_template
+                try:
+                    self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=False)
+                except Exception:
+                    self.processor = None
+        _ensure_chat_template(self.tokenizer, model_name, chat_template)
+        # DeepSeek-OCR* processor remote-code is TF4-era; chat templating via tokenizer only.
+        if "deepseek" in model_name.lower() and "ocr" in model_name.lower():
+            self.processor = None
+        if self.processor is not None and getattr(self.tokenizer, "chat_template", None):
+            self.processor.chat_template = self.tokenizer.chat_template
         await self._warmup()
         self._last_activity = time.time()
         asyncio.create_task(self._refresh_loads())
@@ -195,16 +332,68 @@ class ModelRouter:
             asyncio.create_task(self._timeout_watch())
 
 
-    def _apply_chat_template(self, hf_messages: list[dict]) -> str:
-        """Apply processor template when available (needed for Qwen2-Audio multipart)."""
+    def _apply_chat_template(
+        self,
+        hf_messages: list[dict],
+        template_kwargs: dict | None = None,
+        tools: list | None = None,
+    ) -> str:
+        """Apply this checkpoint's chat template; retry common tool encodings."""
         kwargs = dict(
             tokenize=False,
             add_generation_prompt=not self.pooling,
             **self.chat_template_kwargs,
         )
+        if template_kwargs:
+            kwargs.update(template_kwargs)
         if self.processor is not None and hasattr(self.processor, "apply_chat_template"):
-            return self.processor.apply_chat_template(hf_messages, **kwargs)
-        return self.tokenizer.apply_chat_template(hf_messages, **kwargs)
+            fn = self.processor.apply_chat_template
+        else:
+            fn = self.tokenizer.apply_chat_template
+
+        encodings = template_message_encodings(hf_messages)
+        attempts: list[tuple[str, bool, list]] = []
+        for name, msgs in encodings:
+            if tools:
+                attempts.append((name, True, msgs))
+            attempts.append((name, False, msgs))
+
+        cached = self._template_style
+        if cached:
+            preferred = [a for a in attempts if a[0] == cached[0] and a[1] == cached[1]]
+            attempts = preferred + [a for a in attempts if a not in preferred]
+
+        last = None
+        errors = template_apply_errors()
+        for name, use_tools, msgs in attempts:
+            kw = dict(kwargs)
+            if use_tools and tools:
+                kw["tools"] = tools
+            else:
+                kw.pop("tools", None)
+            try:
+                prompt = fn(msgs, **kw)
+            except errors as e:
+                last = e
+                continue
+            self._template_style = (name, use_tools)
+            return prompt
+        if last is not None:
+            raise last
+        return fn(hf_messages, **kwargs)
+
+
+    def _request_template_kwargs(self, extra: dict | None) -> dict:
+        """Merge OpenWebUI chat_template_kwargs / enable_thinking into the template."""
+        extra = extra or {}
+        merged: dict = {}
+        req = extra.get("chat_template_kwargs")
+        if isinstance(req, dict):
+            merged.update(req)
+        for key in ("enable_thinking", "reasoning_effort", "preserve_thinking"):
+            if extra.get(key) is not None:
+                merged[key] = extra[key]
+        return merged
 
 
     def _touch(self):
@@ -377,8 +566,24 @@ class ModelRouter:
         audios = []
 
         for msg in messages:
+            row: dict[str, Any] = {"role": normalize_role(msg.role)}
+            if msg.name:
+                row["name"] = msg.name
+            if msg.tool_call_id:
+                row["tool_call_id"] = msg.tool_call_id
+            tc = hf_tool_calls(
+                [c.model_dump() for c in msg.tool_calls] if msg.tool_calls else None
+            )
+            if tc:
+                row["tool_calls"] = tc
+
+            if msg.content is None:
+                row["content"] = None if tc else ""
+                hf_messages.append(row)
+                continue
             if isinstance(msg.content, str):
-                hf_messages.append({"role": msg.role, "content": msg.content})
+                row["content"] = msg.content
+                hf_messages.append(row)
                 continue
 
             parts_out = []
@@ -404,9 +609,10 @@ class ModelRouter:
                     _http_error(MediaError(f"unsupported content type: {part.type}"))
 
             if len(parts_out) == 1 and parts_out[0].get("type") == "text":
-                hf_messages.append({"role": msg.role, "content": parts_out[0]["text"]})
+                row["content"] = parts_out[0]["text"]
             else:
-                hf_messages.append({"role": msg.role, "content": parts_out})
+                row["content"] = parts_out
+            hf_messages.append(row)
 
         mm: dict[str, Any] = {}
         if images:
@@ -418,10 +624,15 @@ class ModelRouter:
         return hf_messages, mm
 
 
-    def _chat_prompt_and_mm(self, messages: list[ChatMessage]) -> tuple[str, dict]:
+    def _chat_prompt_and_mm(
+        self,
+        messages: list[ChatMessage],
+        template_kwargs: dict | None = None,
+        tools: list | None = None,
+    ) -> tuple[str, dict]:
         """Apply chat template; return (prompt_str, multi_modal_data)."""
         hf_messages, mm = self._parse_messages(messages)
-        prompt = self._apply_chat_template(hf_messages)
+        prompt = self._apply_chat_template(hf_messages, template_kwargs, tools=tools)
         return prompt, mm
 
 
@@ -439,7 +650,7 @@ class ModelRouter:
         first = obj[0]
         if isinstance(first, ChatMessage):
             return True
-        return isinstance(first, dict) and "role" in first and "content" in first
+        return isinstance(first, dict) and "role" in first
 
 
     def _coerce_chat_messages(self, messages: list) -> list[ChatMessage]:
@@ -474,9 +685,17 @@ class ModelRouter:
         return [self._normalize_prompt(prompt)]
 
 
-    async def _route_chat(self, messages, max_tokens=None, temperature=None, extra=None):
+    async def _route_chat(
+        self,
+        messages,
+        max_tokens=None,
+        temperature=None,
+        extra=None,
+        template_kwargs=None,
+        tools=None,
+    ):
         """Route a chat conversation to the least-loaded replica."""
-        prompt, mm = self._chat_prompt_and_mm(messages)
+        prompt, mm = self._chat_prompt_and_mm(messages, template_kwargs, tools=tools)
         engine_prompt = self._to_engine_prompt(prompt, mm)
         replica_name = self._select_replica()
         handle = self._get_handles()[replica_name]
@@ -513,17 +732,27 @@ class ModelRouter:
             "stream_options", "user", "tools", "tool_choice", "functions", "function_call",
             "metadata", "modalities", "audio", "service_tier", "store", "parallel_tool_calls",
             "prediction", "web_search_options", "logit_bias", "logprobs", "top_logprobs",
+            *_TEMPLATE_REQUEST_KEYS,
         ):
             kwargs.pop(k, None)
+        if "stop" in kwargs:
+            kwargs["stop"] = sanitize_stop(kwargs["stop"])
+            if kwargs["stop"] is None:
+                kwargs.pop("stop")
         mct = kwargs.pop("max_completion_tokens", None)
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
-        elif mct is not None:
-            kwargs["max_tokens"] = mct
+        requested = max_tokens if max_tokens is not None else mct
+        clamped = clamp_max_tokens(requested, self.replica_metadata)
+        if clamped is not None:
+            kwargs["max_tokens"] = clamped
         if temperature is not None:
             kwargs["temperature"] = temperature
         guided_json = kwargs.pop("guided_json", None)
         response_format = kwargs.pop("response_format", None)
+        vllm_xargs = kwargs.pop("vllm_xargs", None)
+        if vllm_xargs:
+            merged = dict(kwargs.get("extra_args") or {})
+            merged.update(vllm_xargs)
+            kwargs["extra_args"] = merged
         if guided_json is None and isinstance(response_format, dict):
             if response_format.get("type") == "json_schema":
                 guided_json = (response_format.get("json_schema") or {}).get("schema")
@@ -636,29 +865,57 @@ class ModelRouter:
         return f"data: {json.dumps(payload)}\n\n"
 
 
-    def _openai_chat_response(self, text: str, prompt: str) -> dict:
+    def _count_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
+
+
+    def _usage(self, prompt: str, completion: str) -> dict:
+        prompt_tokens = self._count_tokens(prompt)
+        completion_tokens = self._count_tokens(completion)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+
+    def _model_card(self) -> dict:
+        return model_card(self.model_id, self.replica_metadata, self.chat_template_kwargs)
+
+
+    def _openai_chat_response(
+        self,
+        text: str | None,
+        prompt: str,
+        tool_calls: list | None = None,
+        finish_reason: str = "stop",
+        raw_text: str | None = None,
+    ) -> dict:
         """Build OpenAI chat completion response dict."""
-        prompt_tokens = len(self.tokenizer.encode(prompt, add_special_tokens=False))
-        completion_tokens = len(self.tokenizer.encode(text, add_special_tokens=False))
+        message = {"role": "assistant", "content": text}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            if text is None:
+                message["content"] = None
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
             "model": self.model_id,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens},
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+            "usage": self._usage(prompt, raw_text if raw_text is not None else (text or "")),
         }
 
 
-    def _openai_completion_response(self, text: str, prompt: str) -> dict:
+    def _openai_completion_response(self, text: str, prompt: str, finish_reason: str = "stop") -> dict:
         """Build OpenAI text completion response dict."""
-        prompt_tokens = len(self.tokenizer.encode(prompt, add_special_tokens=False))
-        completion_tokens = len(self.tokenizer.encode(text, add_special_tokens=False))
         return {
             "id": f"cmpl-{uuid.uuid4().hex}",
             "object": "text_completion",
             "model": self.model_id,
-            "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens},
+            "choices": [{"index": 0, "text": text, "finish_reason": finish_reason}],
+            "usage": self._usage(prompt, text),
         }
 
 
@@ -679,31 +936,81 @@ class ModelRouter:
     @app.get("/v1/models")
     async def list_models(self):
         """OpenAI-compatible model list endpoint."""
-        return {"object": "list", "data": [{"id": self.model_id, "object": "model", "owned_by": "ray-hive"}]}
+        return {"object": "list", "data": [self._model_card()]}
 
 
     @app.get("/v1/models/{model_id}")
     async def get_model(self, model_id: str):
         """OpenAI-compatible single model endpoint."""
-        return {"id": self.model_id, "object": "model", "owned_by": "ray-hive"}
+        return self._model_card()
 
 
-    async def _openai_chat_stream(self, prompt, sampling_params: SamplingParams):
+    def _chat_chunk(self, chunk_id: str, delta: dict, finish_reason=None, usage=None) -> str:
+        payload = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "model": self.model_id,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            payload["usage"] = usage
+        return self._sse(payload)
+
+
+    async def _openai_chat_stream(
+        self,
+        prompt,
+        sampling_params: SamplingParams,
+        prompt_text: str = "",
+        include_usage: bool = False,
+    ):
         """Yield OpenAI chat.completion.chunk SSE frames then [DONE]."""
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+        yield self._chat_chunk(chunk_id, {"role": "assistant", "content": ""})
+        think = ThinkStreamFilter()
+        tools = ToolCallStreamFilter()
+        visible = []
+        raw_bits = []
         async for delta in self._route_stream(prompt, sampling_params):
+            raw_bits.append(delta)
+            piece = think.feed(delta)
+            if not piece:
+                continue
+            emit = tools.feed(piece)
+            if emit:
+                visible.append(emit)
+                yield self._chat_chunk(chunk_id, {"content": emit})
+        tail_think = think.flush()
+        if tail_think:
+            emit = tools.feed(tail_think)
+            if emit:
+                visible.append(emit)
+                yield self._chat_chunk(chunk_id, {"content": emit})
+        held, tool_calls = tools.flush()
+        if held and not tool_calls:
+            visible.append(held)
+            yield self._chat_chunk(chunk_id, {"content": held})
+        elif held and tool_calls:
+            visible.append(held)
+            yield self._chat_chunk(chunk_id, {"content": held})
+        if tool_calls:
+            yield self._chat_chunk(chunk_id, {"tool_calls": tool_calls})
+            finish = "tool_calls"
+        else:
+            finish = "length" if (
+                sampling_params.max_tokens
+                and self._count_tokens("".join(raw_bits)) >= sampling_params.max_tokens
+            ) else "stop"
+        usage = self._usage(prompt_text, "".join(raw_bits))
+        yield self._chat_chunk(chunk_id, {}, finish_reason=finish, usage=usage)
+        if include_usage:
             yield self._sse({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "model": self.model_id,
-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                "choices": [],
+                "usage": usage,
             })
-        yield self._sse({
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "model": self.model_id,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        })
         yield self._sse("[DONE]")
 
 
@@ -728,23 +1035,36 @@ class ModelRouter:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: ChatCompletionRequest):
-        """OpenAI-compatible chat completions (text + multimodal)."""
+        """OpenAI-compatible chat completions (text + multimodal + tools)."""
         if self.pooling:
             _http_error(UnsupportedModeError("this deployment is pooling/embed; use /v1/embeddings"))
         self._touch()
         await self._ensure_awake()
         extra = request.model_dump(exclude={"model", "messages", "max_tokens", "temperature", "stream"})
+        tmpl = self._request_template_kwargs(extra)
+        tools = normalize_tools(extra.get("tools"), extra.get("functions"))
         params = self._sampling_params(request.max_tokens, request.temperature, extra)
-        prompt, mm = self._chat_prompt_and_mm(request.messages)
+        prompt, mm = self._chat_prompt_and_mm(request.messages, tmpl, tools=tools)
         engine_prompt = self._to_engine_prompt(prompt, mm)
+        include_usage = bool((extra.get("stream_options") or {}).get("include_usage"))
         if request.stream:
             return StreamingResponse(
-                self._openai_chat_stream(engine_prompt, params),
+                self._openai_chat_stream(
+                    engine_prompt, params, prompt_text=prompt, include_usage=include_usage,
+                ),
                 media_type="text/event-stream",
+                headers=_SSE_HEADERS,
             )
-        outputs = await self._route_chat(request.messages, request.max_tokens, request.temperature, extra)
-        text = self._extract_texts(outputs)[0] if outputs else ""
-        return self._openai_chat_response(text, prompt)
+        outputs = await self._route_chat(
+            request.messages, request.max_tokens, request.temperature, extra, tmpl, tools,
+        )
+        raw = self._extract_texts(outputs)[0] if outputs else ""
+        text = strip_think(raw)
+        content, tool_calls = parse_tool_calls(text)
+        finish = finish_reason_for(outputs[0] if outputs else None, tool_calls, params.max_tokens)
+        return self._openai_chat_response(
+            content, prompt, tool_calls=tool_calls or None, finish_reason=finish, raw_text=raw,
+        )
 
 
     @app.post("/v1/completions")
@@ -761,6 +1081,7 @@ class ModelRouter:
             return StreamingResponse(
                 self._openai_completion_stream(prompt, params),
                 media_type="text/event-stream",
+                headers=_SSE_HEADERS,
             )
         results = await self._route_text(prompt, request.max_tokens, request.temperature, extra)
         text = results[0] if results else ""

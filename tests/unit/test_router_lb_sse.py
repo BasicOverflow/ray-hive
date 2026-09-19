@@ -60,6 +60,28 @@ def test_sampling_max_completion_tokens():
     assert params.max_tokens == 32
 
 
+def test_sampling_strips_openwebui_qwen_stops():
+    r = _bare_router(["a"], [1])
+    try:
+        params = r._sampling_params(
+            extra={"stop": ["\n", "</think>", "<|im_end|>"], "temperature": 0.0},
+        )
+    except Exception as e:
+        pytest.skip(f"SamplingParams import/env: {e}")
+    assert params.stop == ["<|im_end|>"]
+
+
+def test_request_template_kwargs_from_openwebui():
+    r = _bare_router(["a"], [1])
+    r.chat_template_kwargs = {"enable_thinking": False}
+    merged = r._request_template_kwargs({
+        "chat_template_kwargs": {"enable_thinking": True},
+        "reasoning_effort": "low",
+    })
+    assert merged["enable_thinking"] is True
+    assert merged["reasoning_effort"] == "low"
+
+
 def test_http_status_for_matrix():
     assert http_status_for(ModelNotFoundError("x")) == 404
     assert http_status_for(ConfigError("x")) == 400

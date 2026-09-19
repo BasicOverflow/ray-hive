@@ -18,6 +18,22 @@ from .factory import (
 )
 from .vram_reqs import BaseVramReqs
 
+# vLLM Mamba align mode (prefix cache on hybrid GDN) sets attention block_size
+# to the Mamba page (~784 on Qwen3.8-27B) and asserts BT >= that.
+MAMBA_ALIGN_BT_FLOOR = 1024
+
+
+def hybrid_mamba_bt_floor(hf_params: dict) -> int:
+    """min max_num_batched_tokens when prefix cache forces Mamba align mode."""
+    if not hf_params.get("enable_prefix_caching"):
+        return 0
+    types = hf_params.get("layer_types")
+    if isinstance(types, list) and any(
+        t not in ("full_attention", "sliding_attention") for t in types
+    ):
+        return MAMBA_ALIGN_BT_FLOOR
+    return 0
+
 
 def normalize_hf_config(hf_config) -> dict:
     """
@@ -37,6 +53,10 @@ def normalize_hf_config(hf_config) -> dict:
         params["vision_config"] = vision_config
     if isinstance(audio_config, dict):
         params["audio_config"] = audio_config
+    if params.get("num_hidden_layers") is None:
+        types = params.get("layers_block_type") or params.get("layer_types")
+        if isinstance(types, list) and types:
+            params["num_hidden_layers"] = len(types)
     return params
 
 
@@ -48,7 +68,9 @@ def build_vram_reqs(
     """Build the appropriate VramReqs subclass from HF config + deploy kwargs."""
     params = dict(hf_config)
     vllm_like = dict(kwargs)
-    attn_cls, vram_cls = select_vram_classes(params, attention_cls=attention_cls)
+    attn_cls, vram_cls = select_vram_classes(
+        params, attention_cls=attention_cls, vllm_kwargs=vllm_like
+    )
 
     if is_multimodal_hf(params):
         vllm_like.setdefault(
@@ -57,9 +79,36 @@ def build_vram_reqs(
         )
 
     params.update(vllm_like)
+    params = attach_speculative_draft(params)
     vram_reqs = vram_cls(attention_cls=attn_cls, **params)
     vram_reqs.pooling = is_pooling_kwargs(vllm_like)
     return vram_reqs
+
+
+def attach_speculative_draft(params: dict) -> dict:
+    """
+    Attach draft-model HF config for speculative decoding VRAM/KV planning.
+
+    ``_draft_hf`` (already a dict) wins. Otherwise, when speculative_config
+    names a separate draft checkpoint (EAGLE / DSpark / …), load it.
+    In-checkpoint MTP and ngram add no extra HF config.
+    """
+    params = dict(params)
+    existing = params.get("_draft_hf")
+    if isinstance(existing, dict):
+        params["_draft_hf"] = normalize_hf_config(existing)
+        return params
+    spec = params.get("speculative_config")
+    if not isinstance(spec, dict):
+        return params
+    method = str(spec.get("method") or "").lower()
+    draft_id = spec.get("model")
+    if not draft_id or method in ("mtp", "ngram"):
+        return params
+    from .estimate import load_hf_config_dict
+
+    params["_draft_hf"] = normalize_hf_config(load_hf_config_dict(str(draft_id)))
+    return params
 
 
 def effective_input_len(vram_reqs: BaseVramReqs, text_input_len: int) -> int:
@@ -271,7 +320,23 @@ def plan_deployment(
         kv_cache_gb = vram_reqs.calc_kv_cache_gb(max_model_len, max_num_seqs)
         total_vram_gb = non_kv_vram_gb + kv_cache_gb
 
+    align_bt = hybrid_mamba_bt_floor(vram_reqs.hf_params)
+    if max_num_batched_tokens < align_bt:
+        max_num_batched_tokens = align_bt
+        non_kv_vram_gb = _non_kv(max_num_batched_tokens)
+        total_vram_gb = non_kv_vram_gb + kv_cache_gb
+
     gpu_memory_utilization = total_vram_gb / device_gb
+    # vLLM loads weights from the util pool. Tiny KV (short ctx / hybrid) must
+    # not drop util below what the checkpoint + min KV actually need.
+    min_pool_gb = fixed_on_gpu + min_kv_gb
+    min_util = min(0.99, min_pool_gb / device_gb) if device_gb > 0 else gpu_memory_utilization
+    if live_avail < device_gb and device_gb > 0:
+        min_util = min(min_util, live_avail / device_gb)
+    if gpu_memory_utilization < min_util:
+        gpu_memory_utilization = min_util
+        total_vram_gb = gpu_memory_utilization * device_gb
+        kv_cache_gb = max(min_kv_gb, total_vram_gb - non_kv_vram_gb)
     # vLLM requires free >= util * device_total at startup.
     if live_avail < device_gb and device_gb > 0:
         max_util = live_avail / device_gb

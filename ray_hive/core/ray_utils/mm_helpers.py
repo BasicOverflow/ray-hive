@@ -108,12 +108,17 @@ def audio_tokens_per_item(hf_params: dict, limit_mm_per_prompt: dict | None = No
 
 def estimate_encoder_params(config: dict, default_hidden: int = 1024) -> float:
     """Coarse parameter count for a vision/audio encoder tower from its config dict."""
-    hidden = int(
+    # DeepSeek-OCR* stores width as a nested dict (sam_vit_b / qwen towers), not an int.
+    raw_hidden = (
         config.get("hidden_size")
         or config.get("width")
         or config.get("d_model")
         or default_hidden
     )
+    if isinstance(raw_hidden, dict):
+        sam = raw_hidden.get("sam_vit_b") or next(iter(raw_hidden.values()), {})
+        raw_hidden = sam.get("width") if isinstance(sam, dict) else default_hidden
+    hidden = int(raw_hidden or default_hidden)
     layers = int(
         config.get("num_hidden_layers")
         or config.get("depth")

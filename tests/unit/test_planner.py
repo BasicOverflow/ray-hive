@@ -38,6 +38,23 @@ def test_plan_deployment_basic(tiny_hf_dense):
     assert 0 < plan["gpu_memory_utilization"] <= 1.0
 
 
+def test_util_floored_to_weight_pool(tiny_hf_dense):
+    """Short context must not drop util below weights + min KV."""
+    vr = build_vram_reqs(tiny_hf_dense)
+    plan = plan_deployment(
+        vr,
+        vram_budget_gb=24.0,
+        live_total_vram_gb=24.0,
+        max_model_len=8,
+        input_len=4,
+        output_len=4,
+        max_num_seqs_override=1,
+    )
+    min_pool = vr.calc_fixed_non_kv_gb(False) + vr.calc_kv_cache_gb(8, 1)
+    assert plan["gpu_memory_utilization"] >= min(0.99, min_pool / 24.0) - 1e-9
+    assert plan["total_vram_gb"] >= min_pool - 1e-6
+
+
 def test_sleep_mode_increases_fixed_non_kv(tiny_hf_dense):
     vr = build_vram_reqs(tiny_hf_dense)
     base = fixed_non_kv_gb(vr, sleep_mode=False)
@@ -76,6 +93,27 @@ def test_overrides(tiny_hf_dense):
     )
     assert plan["max_num_seqs"] == 4
     assert plan["max_num_batched_tokens"] == 256
+
+
+def test_prefix_cache_hybrid_floors_batched_tokens(tiny_hf_dense):
+    hf = {
+        **tiny_hf_dense,
+        "num_hidden_layers": 4,
+        "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+        "enable_prefix_caching": True,
+    }
+    vr = build_vram_reqs(hf, enable_prefix_caching=True)
+    plan = plan_deployment(
+        vr,
+        vram_budget_gb=12.0,
+        live_total_vram_gb=24.0,
+        max_model_len=256,
+        input_len=128,
+        output_len=128,
+        max_num_seqs_override=1,
+        max_num_batched_tokens_override=128,
+    )
+    assert plan["max_num_batched_tokens"] >= 1024
 
 
 def test_too_small_budget_raises(tiny_hf_dense):

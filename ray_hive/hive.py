@@ -25,7 +25,7 @@ from .core.openai_gateway import ensure_openai_gateway
 from .errors import ConfigError
 
 # Lifted out of vllm_kwargs into planner config (must not also reach engine_kwargs).
-_PLANNER_VLLM_KEYS = ("max_num_seqs", "max_num_batched_tokens")
+_PLANNER_VLLM_KEYS = ("max_num_seqs", "max_num_batched_tokens", "auto_hybrid_input_cap")
 
 
 def _split_vllm_kwargs(vllm_kwargs: dict | None) -> tuple[dict, dict]:
@@ -107,10 +107,14 @@ class RayHive:
         model_id, status="ready", route, and per-replica plan/GPU info.
 
         max_input_prompt_length and max_output_prompt_length are required.
-        Pass planner overrides (max_num_seqs, max_num_batched_tokens) inside
-        vllm_kwargs — they are lifted automatically.
+        Pass planner overrides (max_num_seqs, max_num_batched_tokens,
+        auto_hybrid_input_cap) inside vllm_kwargs — they are lifted automatically.
         max_input_prompt_length=\"auto\" grows text input (floor 256) to fill VRAM at a
         fixed max_num_seqs (required in vllm_kwargs); output length stays fixed.
+        When max_num_seqs==1, auto may shrink below 256 so weights + draft still fit.
+        Hybrid models (GDN/Mamba layers without transformer KV) cap auto at 32768
+        so leftover VRAM is not spent on an unbounded attention window. Raise
+        auto_hybrid_input_cap to spend freed draft/KV room on a longer window.
         replicas=-1 deploys to all eligible GPUs (or all eligible TP groups when auto TP>1).
         attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
         allocation_cls defaults to RayPerformanceAllocator for single-GPU auto placement;

@@ -4,13 +4,15 @@ import pytest
 from ray_hive.core.model_specs.attention import BaseAttentionSpecs
 from ray_hive.core.model_specs.planner import build_vram_reqs, effective_input_len
 from ray_hive.core.ray_utils.placement import (
+    AUTO_HYBRID_INPUT_CAP,
     AUTO_INPUT_FLOOR,
+    AUTO_INPUT_MIN,
     is_auto_input,
     plan_replica_groups,
     solve_auto_text_input,
     validate_auto_input_config,
 )
-from ray_hive.errors import ConfigError, ModelDoesNotFitError
+from ray_hive.errors import ConfigError, KvBudgetError, ModelDoesNotFitError
 from tests.helpers import FakePerformanceAllocator, make_gpu
 
 
@@ -169,6 +171,50 @@ def test_auto_mm_hf_cap_reserves_placeholders(tiny_hf_mm):
     assert plan["max_input_prompt_length"] + 128 + 128 <= 1024
 
 
+class HugeKV(BaseAttentionSpecs):
+    """~2 MiB/token so 256-token auto floor misses a tight 1-seq budget."""
+
+    def kv_bytes_per_token(self) -> float:
+        return 2 * 1024 * 1024
+
+
+def test_auto_seqs_one_shrinks_below_floor(tiny_hf_dense):
+    gmap = {"host-a:gpu0": make_gpu("host-a:gpu0", 0.85, 1.0)}
+    results = plan_replica_groups(
+        gmap,
+        _pin_config(
+            max_input_prompt_length="auto",
+            max_num_seqs=1,
+            max_output_prompt_length=128,
+            attention_cls=HugeKV,
+        ),
+        tiny_hf_dense,
+        {},
+        model_id="shrink",
+    )
+    plan = next(iter(results.values()))["plan"]
+    assert plan["max_num_seqs"] == 1
+    assert plan["max_input_prompt_length_auto"] is True
+    assert AUTO_INPUT_MIN <= plan["max_input_prompt_length"] < AUTO_INPUT_FLOOR
+
+
+def test_auto_seqs_above_one_does_not_shrink(tiny_hf_dense):
+    gmap = {"host-a:gpu0": make_gpu("host-a:gpu0", 0.85, 1.0)}
+    with pytest.raises((ModelDoesNotFitError, KvBudgetError, ValueError)):
+        plan_replica_groups(
+            gmap,
+            _pin_config(
+                max_input_prompt_length="auto",
+                max_num_seqs=8,
+                max_output_prompt_length=128,
+                attention_cls=HugeKV,
+            ),
+            tiny_hf_dense,
+            {},
+            model_id="noshrink",
+        )
+
+
 def test_auto_floor_does_not_fit_raises(tiny_hf_dense):
     # Near-zero free VRAM after weights → floor cannot pack.
     gmap = {"host-a:gpu0": make_gpu("host-a:gpu0", 0.05, 24.0)}
@@ -197,3 +243,70 @@ def test_solve_auto_text_input_direct(tiny_hf_dense):
     assert input_len == text_in
     assert mml == text_in + 64
     assert plan["max_num_seqs"] == 4
+
+
+def test_auto_hybrid_caps_overgrown_kv_window(tiny_hf_dense):
+    """Cheap KV (few full-attn layers) must not auto-grow past the hybrid cap."""
+    hf = {
+        **tiny_hf_dense,
+        "num_hidden_layers": 8,
+        "layer_types": ["linear_attention"] * 7 + ["full_attention"],
+        "max_position_embeddings": 32768,
+    }
+    gmap = {"host-a:gpu0": make_gpu("host-a:gpu0", 22.0, 24.0)}
+    results = plan_replica_groups(
+        gmap,
+        _pin_config(
+            max_input_prompt_length="auto",
+            max_num_seqs=1,
+            max_output_prompt_length=256,
+            attention_cls=None,
+        ),
+        hf,
+        {},
+        model_id="hybrid-cap",
+    )
+    plan = next(iter(results.values()))["plan"]
+    assert plan["max_input_prompt_length"] <= AUTO_HYBRID_INPUT_CAP
+    assert plan["max_input_prompt_length"] >= AUTO_INPUT_FLOOR
+
+
+def test_auto_hybrid_cap_override_grows_window(tiny_hf_dense):
+    """Raising auto_hybrid_input_cap lets leftover VRAM become context."""
+    hf = {
+        **tiny_hf_dense,
+        "num_hidden_layers": 8,
+        "layer_types": ["linear_attention"] * 7 + ["full_attention"],
+        "max_position_embeddings": 262144,
+    }
+    gmap = {"host-a:gpu0": make_gpu("host-a:gpu0", 22.0, 24.0)}
+    default = plan_replica_groups(
+        gmap,
+        _pin_config(
+            max_input_prompt_length="auto",
+            max_num_seqs=1,
+            max_output_prompt_length=256,
+            attention_cls=None,
+        ),
+        hf,
+        {},
+        model_id="hybrid-default",
+    )
+    raised = plan_replica_groups(
+        gmap,
+        _pin_config(
+            max_input_prompt_length="auto",
+            max_num_seqs=1,
+            max_output_prompt_length=256,
+            attention_cls=None,
+            auto_hybrid_input_cap=65536,
+        ),
+        hf,
+        {},
+        model_id="hybrid-raised",
+    )
+    d_in = next(iter(default.values()))["plan"]["max_input_prompt_length"]
+    r_in = next(iter(raised.values()))["plan"]["max_input_prompt_length"]
+    assert d_in <= AUTO_HYBRID_INPUT_CAP
+    assert r_in > d_in
+    assert r_in <= 65536

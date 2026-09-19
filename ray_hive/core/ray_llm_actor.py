@@ -5,6 +5,7 @@ import asyncio
 import os
 import uuid
 from ray import serve
+from ray_hive.core.prompt_coerce import coerce_engine_prompt
 from vllm import SamplingParams
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -70,6 +71,17 @@ class RayLLMActor:
         """
         from ray_hive.core.model_specs.factory import is_pooling_kwargs
 
+        # DeepSeek-OCR* HF remote code still imports LlamaFlashAttention2 (gone in TF 5.x).
+        try:
+            import transformers.models.llama.modeling_llama as _llama_mod
+
+            if not hasattr(_llama_mod, "LlamaFlashAttention2"):
+                base = getattr(_llama_mod, "LlamaAttention", None)
+                if base is not None:
+                    _llama_mod.LlamaFlashAttention2 = base
+        except Exception:
+            pass
+
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = target_gpu_id
         if "," in target_gpu_id:
@@ -116,11 +128,16 @@ class RayLLMActor:
         return params
 
 
+    def _engine_prompt(self, prompt):
+        """Tokenize strings so VL checkpoints do not use the broken MM renderer."""
+        return coerce_engine_prompt(prompt, self.engine.get_tokenizer().encode)
+
+
     async def _generate_one(self, prompt, sampling_params: SamplingParams):
         """Run one prompt (str or PromptType dict) to completion."""
         final = None
         async for output in self.engine.generate(
-            prompt,
+            self._engine_prompt(prompt),
             sampling_params,
             request_id=uuid.uuid4().hex,
         ):
@@ -162,7 +179,7 @@ class RayLLMActor:
         """Yield text deltas (DELTA) for a single prompt until finished."""
         params = self._params(sampling_params, RequestOutputKind.DELTA)
         async for output in self.engine.generate(
-            prompt,
+            self._engine_prompt(prompt),
             params,
             request_id=uuid.uuid4().hex,
         ):
@@ -181,7 +198,7 @@ class RayLLMActor:
         pooling_params = PoolingParams(task="embed", use_activation=True)
         final = None
         async for output in self.engine.encode(
-            prompt,
+            self._engine_prompt(prompt),
             pooling_params,
             request_id=uuid.uuid4().hex,
         ):

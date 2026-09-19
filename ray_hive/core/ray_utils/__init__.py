@@ -49,7 +49,9 @@ from .naming import (
     ray_namespace,
 )
 from .placement import (
+    AUTO_HYBRID_INPUT_CAP,
     AUTO_INPUT_FLOOR,
+    AUTO_INPUT_MIN,
     build_vram_reqs_for_tp,
     chunk_gpu_groups,
     fixed_non_kv_gb,
@@ -78,7 +80,9 @@ from .display import (
 )
 
 __all__ = [
+    "AUTO_HYBRID_INPUT_CAP",
     "AUTO_INPUT_FLOOR",
+    "AUTO_INPUT_MIN",
     "SERVE_FASTAPI_RUNTIME_ENV",
     "StderrFilter",
     "approx_tdp",

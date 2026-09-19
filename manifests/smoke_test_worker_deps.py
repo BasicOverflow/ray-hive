@@ -17,6 +17,9 @@ IMPORTS = [
     "ray.serve",
     "fastapi",
     "starlette",
+    "addict",
+    "matplotlib",
+    "easydict",
 ]
 
 for name in IMPORTS:
@@ -29,6 +32,7 @@ from OpenSSL import SSL, crypto  # noqa: F401 — GEN_EMAIL skew dies here
 import fastapi
 import fastapi.routing as fastapi_routing
 import google.protobuf as pb
+from google.rpc import code_pb2  # noqa: F401 — dashboard_agent dies if gencode > runtime
 
 np_parts = [int(x) for x in numpy.__version__.split(".")[:2]]
 assert np_parts < [2, 4], f"numpy {numpy.__version__} needs X86_V2"

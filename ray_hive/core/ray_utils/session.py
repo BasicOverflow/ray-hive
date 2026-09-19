@@ -62,6 +62,13 @@ class StderrFilter:
         """Flush the underlying stderr stream."""
         self.original_stderr.flush()
 
+    def fileno(self):
+        """Delegate fileno for faulthandler / Ray worker connect."""
+        return self.original_stderr.fileno()
+
+    def isatty(self):
+        return getattr(self.original_stderr, "isatty", lambda: False)()
+
 
 def suppress_ray_warnings(suppress: bool = True):
     """Suppress Ray warnings and logs only, preserving user print statements."""

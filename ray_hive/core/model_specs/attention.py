@@ -123,14 +123,39 @@ class BaseAttentionSpecs:
 
     @property
     def kv_layers(self) -> int:
-        """Return the number of layers that contribute KV cache."""
+        """Return the number of layers that contribute transformer KV cache."""
+        types = self.hf_params.get("layer_types")
+        if isinstance(types, list) and types:
+            n = sum(
+                1
+                for t in types
+                if t in ("full_attention", "sliding_attention")
+            )
+            if n:
+                return n
         return self.num_layers
 
 
+    def _draft_kv_bytes_per_token(self) -> float:
+        """Extra per-token KV when speculative_config points at a separate draft model."""
+        draft = self.hf_params.get("_draft_hf")
+        if not isinstance(draft, dict):
+            return 0.0
+        nested = {
+            k: v for k, v in draft.items() if k not in ("speculative_config", "_draft_hf")
+        }
+        draft_attn = BaseAttentionSpecs(
+            kv_bytes_per_element=self.kv_bytes_per_element,
+            tensor_parallel_size=self.tp_size,
+            **nested,
+        )
+        return draft_attn.kv_bytes_per_token()
+
+
     def kv_bytes_per_token(self) -> float:
-        """Return per-GPU KV cache bytes needed per token."""
+        """Return per-GPU KV cache bytes needed per token (target + draft)."""
         full = 2 * self.kv_bytes_per_element * self.kv_layers * self.kv_heads * self.head_dim
-        return full / self.tp_size
+        return full / self.tp_size + self._draft_kv_bytes_per_token()
 
 
     def kv_bytes_per_sequence(self, max_model_len: int) -> float:

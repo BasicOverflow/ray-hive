@@ -1,4 +1,6 @@
 """P — less common VRAM branches."""
+import pytest
+
 from ray_hive.core.model_specs.planner import build_vram_reqs, normalize_hf_config
 
 
@@ -18,6 +20,70 @@ def test_hybrid_pattern(tiny_hf_dense):
     }
     vr = build_vram_reqs(hf)
     assert vr.calc_weights_gb() > 0
+
+
+def test_checkpoint_bytes_floor_weights(tiny_hf_dense):
+    base = build_vram_reqs(tiny_hf_dense).calc_weights_gb()
+    # 8 GiB packed → 8 * 1.10 after load factor
+    floored = build_vram_reqs(
+        {**tiny_hf_dense, "_checkpoint_bytes": int(8 * 1024**3)}
+    ).calc_weights_gb()
+    assert floored > base
+    assert floored == pytest.approx(8.0 * 1.10, rel=1e-6)
+
+
+def test_text_only_drops_vision_from_checkpoint_floor(tiny_hf_mm):
+    hf = {**tiny_hf_mm, "_checkpoint_bytes": int(8 * 1024**3)}
+    with_vision = build_vram_reqs(hf).calc_weights_gb()
+    text_only = build_vram_reqs(hf, language_model_only=True).calc_weights_gb()
+    assert text_only < with_vision
+
+
+def test_mtp_draft_adds_lm_head(tiny_hf_dense):
+    base = build_vram_reqs(tiny_hf_dense)
+    mtp = build_vram_reqs(
+        tiny_hf_dense,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+    )
+    assert base.calc_draft_weights_gb() == 0.0
+    assert mtp.calc_draft_weights_gb() > 0.0
+    assert mtp.calc_fixed_non_kv_gb() > base.calc_fixed_non_kv_gb()
+    assert mtp.attention.kv_bytes_per_token() == base.attention.kv_bytes_per_token()
+
+
+def test_dflash_uses_checkpoint_not_embed_formula(tiny_hf_dense):
+    """DFlash2 shares target embed/lm_head; packed 1.19 GiB must win over vocab math."""
+    draft = {
+        **tiny_hf_dense,
+        "num_hidden_layers": 5,
+        "vocab_size": 248320,
+        "hidden_size": 5120,
+        "_checkpoint_bytes": int(1.19 * 1024**3),
+    }
+    spec = build_vram_reqs(
+        tiny_hf_dense,
+        speculative_config={
+            "method": "dflash",
+            "model": "draft/dflash",
+            "num_speculative_tokens": 7,
+        },
+        _draft_hf=draft,
+    )
+    assert spec.calc_draft_weights_gb() == pytest.approx(1.19 * 1.10, rel=1e-6)
+    # Formula path would have counted a 2.4 GiB unused vocab table.
+    assert spec.calc_draft_weights_gb() < 2.0
+
+
+def test_separate_draft_adds_weights_and_kv(tiny_hf_dense):
+    draft = {**tiny_hf_dense, "num_hidden_layers": 4, "vocab_size": 512}
+    base = build_vram_reqs(tiny_hf_dense)
+    spec = build_vram_reqs(
+        tiny_hf_dense,
+        speculative_config={"method": "eagle", "model": "draft/dummy"},
+        _draft_hf=draft,
+    )
+    assert spec.calc_draft_weights_gb() > 0.0
+    assert spec.attention.kv_bytes_per_token() > base.attention.kv_bytes_per_token()
 
 
 def test_nested_text_config_mm(tiny_hf_dense):

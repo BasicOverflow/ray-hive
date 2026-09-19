@@ -59,6 +59,31 @@ def _proxy_url(model_id: str, suffix: str) -> str:
     return f"{_head_http_base()}/{model_id}/v1/{suffix.lstrip('/')}"
 
 
+def _fallback_model_card(model_id: str) -> dict:
+    return {"id": model_id, "object": "model", "owned_by": "ray-hive"}
+
+
+def _router_model_card(model_id: str) -> dict:
+    """Pull the per-model card (context / output caps) from the live router."""
+    url = _proxy_url(model_id, "models")
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError):
+        return _fallback_model_card(model_id)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        card = dict(data[0])
+        card.setdefault("id", model_id)
+        card.setdefault("object", "model")
+        card.setdefault("owned_by", "ray-hive")
+        return card
+    if isinstance(payload, dict) and payload.get("id"):
+        return payload
+    return _fallback_model_card(model_id)
+
+
 @serve.deployment(
     name="openai-gateway",
     ray_actor_options={
@@ -76,10 +101,7 @@ class OpenAIGateway:
     @app.get("/models")
     async def list_models(self):
         """OpenAI model list — one entry per live hive model_id."""
-        data = [
-            {"id": mid, "object": "model", "owned_by": "ray-hive"}
-            for mid in _live_model_ids()
-        ]
+        data = [_router_model_card(mid) for mid in _live_model_ids()]
         return {"object": "list", "data": data}
 
 
@@ -88,7 +110,7 @@ class OpenAIGateway:
         """OpenAI single-model lookup."""
         if model_id not in _live_model_ids():
             _model_not_found(model_id)
-        return {"id": model_id, "object": "model", "owned_by": "ray-hive"}
+        return _router_model_card(model_id)
 
 
     @app.post("/chat/completions")
@@ -140,11 +162,13 @@ class OpenAIGateway:
         if stream:
             def gen():
                 try:
+                    # Line-oriented: read(n) waits for n bytes and can split a
+                    # `data:` JSON frame so OpenWebUI aborts after the first sentence.
                     while True:
-                        chunk = upstream.read(1024)
-                        if not chunk:
+                        line = upstream.readline()
+                        if not line:
                             break
-                        yield chunk
+                        yield line
                 finally:
                     upstream.close()
 
@@ -152,6 +176,11 @@ class OpenAIGateway:
                 gen(),
                 media_type=upstream.headers.get("Content-Type", "text/event-stream"),
                 status_code=upstream.status,
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
             )
 
         try:

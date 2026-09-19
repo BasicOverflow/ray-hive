@@ -11,6 +11,7 @@ from ray_hive.errors import (
     ConfigError,
     InsufficientVramError,
     KvBudgetError,
+    ModelDoesNotFitError,
     NoPlacementError,
     PlacementError,
 )
@@ -19,8 +20,13 @@ from .naming import deployment_name
 
 # Text-token floor when max_input_prompt_length="auto" (output stays user-fixed).
 AUTO_INPUT_FLOOR = 256
+# When max_num_seqs==1, auto may shrink below the floor so weights + draft still fit.
+AUTO_INPUT_MIN = 1
 # Safety cap when HF config has no max_position_embeddings / model_max_length.
 AUTO_INPUT_ABS_CAP = 1 << 20
+# Hybrid GDN/Mamba layers are not in the KV formula. Auto would otherwise spend
+# leftover VRAM on a huge transformer window (Qwen3.8: 16/64 KV layers → 15k).
+AUTO_HYBRID_INPUT_CAP = 32768
 
 
 def is_auto_input(value) -> bool:
@@ -33,6 +39,7 @@ def validate_auto_input_config(config: dict) -> None:
     Require max_num_seqs when max_input_prompt_length=\"auto\".
 
     Auto grows text input only (floor AUTO_INPUT_FLOOR); output length stays fixed.
+    With max_num_seqs==1, auto may shrink below the floor so the model still loads.
     """
     text_in = config.get("max_input_prompt_length")
     if not is_auto_input(text_in):
@@ -170,17 +177,29 @@ def solve_auto_text_input(
     max_num_batched_tokens_override: int | None = None,
     sleep_mode: bool = False,
     enforce_eager: bool = False,
+    hybrid_input_cap: int | None = None,
 ) -> tuple[dict, int, int, int]:
     """
-    Largest text input (>= AUTO_INPUT_FLOOR) that fits at fixed max_num_seqs.
+    Largest text input that fits at fixed max_num_seqs.
 
-    Output length is fixed. Effective input includes MM placeholders, so auto
-    never drops below what MmContextError would require for those placeholders.
+    Starts at AUTO_INPUT_FLOOR and grows. When max_num_seqs==1 and the floor
+    does not fit (weights + draft + min KV), shrink toward AUTO_INPUT_MIN.
+    Output length is fixed. Effective input includes MM placeholders.
+    hybrid_input_cap overrides AUTO_HYBRID_INPUT_CAP when the model is hybrid.
     """
     floor = AUTO_INPUT_FLOOR
     hf_cap = _hf_text_input_cap(hf_params, vram_reqs, text_out, is_pooling_vram(vram_reqs))
     abs_hi = AUTO_INPUT_ABS_CAP if hf_cap is None else min(AUTO_INPUT_ABS_CAP, hf_cap)
-    if abs_hi < floor:
+    attn = vram_reqs.attention
+    if attn.kv_layers < attn.num_layers:
+        cap = AUTO_HYBRID_INPUT_CAP if hybrid_input_cap is None else int(hybrid_input_cap)
+        abs_hi = min(abs_hi, cap)
+    if abs_hi < AUTO_INPUT_MIN:
+        raise ConfigError(
+            f"HF context cap ({abs_hi}) is below auto input minimum ({AUTO_INPUT_MIN}) "
+            f"after MM placeholders / output reservation"
+        )
+    if abs_hi < floor and int(max_num_seqs) != 1:
         raise ConfigError(
             f"HF context cap ({abs_hi}) is below auto input floor ({floor}) "
             f"after MM placeholders / output reservation"
@@ -200,11 +219,26 @@ def solve_auto_text_input(
             enforce_eager=enforce_eager,
         )
 
-    # Floor must fit; MM placeholders are already folded into effective input.
-    best = _at(floor)
+    # Floor must fit unless seqs==1, in which case shrink context to make room.
+    start = min(floor, abs_hi)
+    try:
+        best = _at(start)
+    except (ModelDoesNotFitError, KvBudgetError):
+        if int(max_num_seqs) != 1:
+            raise
+        lo, fail_hi = AUTO_INPUT_MIN, start
+        best = _at(lo)
+        while lo + 1 < fail_hi:
+            mid = (lo + fail_hi) // 2
+            try:
+                best = _at(mid)
+                lo = mid
+            except (ModelDoesNotFitError, KvBudgetError):
+                fail_hi = mid
+        return best
 
-    lo = floor
-    hi = floor
+    lo = start
+    hi = start
     while True:
         nxt = min(hi * 2 if hi > 0 else floor * 2, abs_hi)
         if nxt <= hi:
@@ -331,6 +365,7 @@ def plan_replica_groups(
                     max_num_batched_tokens_override=config.get("max_num_batched_tokens"),
                     sleep_mode=sleep_mode,
                     enforce_eager=enforce_eager,
+                    hybrid_input_cap=config.get("auto_hybrid_input_cap"),
                 )
                 output_len = 0 if pooling else text_out
             else:
@@ -366,6 +401,9 @@ def plan_replica_groups(
             max_model_len=max_model_len,
             auto_input=auto_input,
         )
+        draft_gb = vram_reqs.calc_draft_weights_gb() * tp_size
+        if draft_gb > 0:
+            plan["draft_weights_gb"] = draft_gb
 
         replica_id = deployment_name(model_id, gpu_keys)
         results[replica_id] = {

@@ -4,6 +4,8 @@ Deployment service — singleton Ray actor that serializes model deploys.
 DeployService runs the full per-model pipeline: HF config → planner → GPU
 selection → replica reservation → parallel RayLLMActor deploy → ModelRouter.
 """
+import time
+
 import ray
 from ray import serve
 
@@ -16,6 +18,10 @@ from .ray_utils import assert_model_id_free
 from .ray_utils.naming import NAMESPACE_ENV, ray_namespace
 from .ray_utils.placement import plan_replica_groups
 from .ray_utils.session import SERVE_FASTAPI_RUNTIME_ENV
+
+# Bump when worker-side actor/router generate behavior changes so a stale
+# detached DeployService (old working_dir zip) is killed and recreated.
+HIVE_DEPLOY_CODE_REV = 21
 
 
 @ray.remote(num_gpus=0.01)
@@ -136,6 +142,11 @@ def deploy_router(
 class DeployService:
     """Singleton actor — serializes model deploys across apps."""
 
+    def code_rev(self) -> int:
+        """Working-dir generation; client recreates the actor on mismatch."""
+        return HIVE_DEPLOY_CODE_REV
+
+
     def deploy_models(self, model_configs: dict, vllm_kwargs: dict | None = None) -> dict:
         """Deploy one or more models; returns per-replica plan dicts."""
         serve.start(
@@ -171,7 +182,9 @@ class DeployService:
 
         from ray_hive.core.model_specs.factory import is_multimodal_hf, is_pooling_kwargs
         pooling = is_pooling_kwargs(model_vllm_kwargs)
-        multimodal = is_multimodal_hf(hf_params)
+        multimodal = is_multimodal_hf(hf_params) and not model_vllm_kwargs.get(
+            "language_model_only"
+        )
 
         planned = plan_replica_groups(gpu_map, config, hf_params, model_vllm_kwargs, model_id)
 
@@ -305,11 +318,33 @@ def get_deploy_service():
     """Get or create the detached DeployService singleton actor."""
     ns = ray_namespace()
     try:
-        return ray.get_actor("deploy_service", namespace=ns)
+        actor = ray.get_actor("deploy_service", namespace=ns)
+        try:
+            if ray.get(actor.code_rev.remote()) == HIVE_DEPLOY_CODE_REV:
+                return actor
+        except Exception:
+            pass
+        ray.kill(actor)
+        time.sleep(1)
     except ValueError:
-        return DeployService.options(
-            name="deploy_service",
-            namespace=ns,
-            lifetime="detached",
-            runtime_env={"env_vars": {NAMESPACE_ENV: ns}},
-        ).remote()
+        pass
+    last = None
+    for attempt in range(16):
+        try:
+            # Ray Client can return InProgressSentinel while working_dir uploads;
+            # brief backoff then retry actor creation.
+            if attempt:
+                time.sleep(min(2 * attempt, 10))
+            return DeployService.options(
+                name="deploy_service",
+                namespace=ns,
+                lifetime="detached",
+                runtime_env={"env_vars": {NAMESPACE_ENV: ns}},
+            ).remote()
+        except Exception as e:
+            last = e
+            if "InProgressSentinel" not in type(e).__name__ and "InProgressSentinel" not in str(e):
+                # still retry a few times for name-conflict races after kill
+                if attempt >= 3 and "already exists" not in str(e).lower():
+                    time.sleep(0.5)
+    raise last

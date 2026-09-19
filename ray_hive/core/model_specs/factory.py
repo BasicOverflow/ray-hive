@@ -39,12 +39,28 @@ def resolve_limit_mm_per_prompt(hf_params: dict, vllm_kwargs: dict | None) -> di
     return default_limit_mm_per_prompt(hf_params)
 
 
+def is_text_only_serve(hf_params: dict, vllm_kwargs: dict | None = None) -> bool:
+    """True when vLLM will skip MM towers (language_model_only or all limits 0)."""
+    kw = vllm_kwargs or {}
+    if kw.get("language_model_only") or hf_params.get("language_model_only"):
+        return True
+    limit = kw.get("limit_mm_per_prompt")
+    if limit is None:
+        limit = hf_params.get("limit_mm_per_prompt")
+    if isinstance(limit, dict) and limit and all(int(v or 0) == 0 for v in limit.values()):
+        return True
+    return False
+
+
 def select_vram_classes(
     hf_params: dict,
     attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
+    vllm_kwargs: dict | None = None,
 ) -> tuple[Type[BaseAttentionSpecs], Type[BaseVramReqs]]:
     """Pick attention + VramReqs classes (multimodal vs text). Pooling is a flag."""
-    multimodal = is_multimodal_hf(hf_params)
+    multimodal = is_multimodal_hf(hf_params) and not is_text_only_serve(
+        hf_params, vllm_kwargs
+    )
     if multimodal:
         return attention_cls or MultimodalAttentionSpecs, MultimodalVramReqs
     return attention_cls or BaseAttentionSpecs, BaseVramReqs

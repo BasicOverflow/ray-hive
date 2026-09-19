@@ -18,6 +18,8 @@ from .attention import BaseAttentionSpecs
 
 # vLLM CUDA-graph capture outside the util pool (~1–3 GiB).
 CUDA_GRAPH_HEADROOM_GB = 2.0
+# Packed safetensors vs CUDA allocation (AWQ scales / Marlin workspace).
+CHECKPOINT_LOAD_FACTOR = 1.10
 # FlashInfer logits + masked + softmax scratch outside the util pool.
 SAMPLER_BYTES_PER_SEQ_VOCAB = 10.0
 
@@ -308,7 +310,108 @@ class BaseVramReqs:
                 params += mlp_wide if i >= shared_start else mlp
 
         bytes_per_param = self._param_dtype_bytes()
-        return (params * bytes_per_param) / (1024 ** 3) / self.tp_size
+        formula_gb = (params * bytes_per_param) / (1024 ** 3) / self.tp_size
+        raw = self.hf_params.get("_checkpoint_bytes")
+        if raw:
+            skip = self._skipped_mm_checkpoint_bytes()
+            ckpt_gb = (
+                (max(0.0, float(raw) - skip) / (1024 ** 3))
+                * CHECKPOINT_LOAD_FACTOR
+                / self.tp_size
+            )
+            return max(formula_gb, ckpt_gb)
+        return formula_gb
+
+
+    def _text_only_serve(self) -> bool:
+        if self.hf_params.get("language_model_only"):
+            return True
+        limit = self.hf_params.get("limit_mm_per_prompt")
+        if isinstance(limit, dict) and limit and all(int(v or 0) == 0 for v in limit.values()):
+            return True
+        return False
+
+
+    def _skipped_mm_checkpoint_bytes(self) -> float:
+        """Vision/audio tower bytes vLLM will not load in text-only serve."""
+        if not self._text_only_serve():
+            return 0.0
+        from ray_hive.core.ray_utils.mm_helpers import estimate_encoder_params
+
+        params = 0.0
+        vision = self.hf_params.get("vision_config")
+        if isinstance(vision, dict):
+            params += estimate_encoder_params(vision)
+        audio = self.hf_params.get("audio_config")
+        if isinstance(audio, dict):
+            params += estimate_encoder_params(audio, default_hidden=1280)
+        # These towers stay BF16 in the W4A16 quants.
+        return params * 2.0
+
+
+    def calc_draft_weights_gb(self) -> float:
+        """
+        Extra weights for speculative decoding (per GPU).
+
+        Separate draft checkpoint (``_draft_hf``): full draft weight estimate.
+        In-checkpoint MTP: untied compute-dtype lm_head (vLLM builds ParallelLMHead
+        even when the target is quantized) plus ``num_nextn_predict_layers`` extras.
+        """
+        spec = self.hf_params.get("speculative_config")
+        if not isinstance(spec, dict):
+            return 0.0
+        method = str(spec.get("method") or "").lower()
+        if method == "ngram":
+            return 0.0
+
+        draft_hf = self.hf_params.get("_draft_hf")
+        if isinstance(draft_hf, dict):
+            # DFlash2 ships neither embeddings nor lm_head (shares the target).
+            # The HF-shape formula would add a full vocab table (~2.4 GiB) that
+            # is never allocated; prefer the Hub packed size when present.
+            if method == "dflash":
+                raw = draft_hf.get("_checkpoint_bytes")
+                if raw:
+                    return (
+                        float(raw)
+                        / (1024 ** 3)
+                        * CHECKPOINT_LOAD_FACTOR
+                        / self.tp_size
+                    )
+            nested = {
+                k: v
+                for k, v in draft_hf.items()
+                if k not in ("speculative_config", "_draft_hf")
+            }
+            draft = type(self)(
+                attention_cls=type(self.attention),
+                tensor_parallel_size=self.tp_size,
+                **nested,
+            )
+            return draft.calc_weights_gb()
+
+        if method and method != "mtp":
+            return 0.0
+
+        hidden = float(self._hf("hidden_size"))
+        vocab = float(self._hf("vocab_size"))
+        lm_head = vocab * hidden * self._activation_dtype_bytes()
+        extra = 0.0
+        n_mtp = int(self.hf_params.get("num_nextn_predict_layers") or 0)
+        if n_mtp > 0:
+            intermediate = float(self._hf("intermediate_size"))
+            kv_heads = float(self.attention.kv_heads)
+            head_dim = float(self.attention.head_dim)
+            n_q = float(
+                self.hf_params.get("num_attention_heads")
+                or self.hf_params.get("num_heads")
+                or max(1.0, hidden / max(head_dim, 1.0))
+            )
+            attn = 2.0 * hidden * n_q * head_dim + 2.0 * hidden * kv_heads * head_dim
+            mlp = 3.0 * hidden * intermediate
+            extra = n_mtp * (attn + mlp) * self._param_dtype_bytes()
+        return (lm_head + extra) / (1024 ** 3) / self.tp_size
+
 
     def calc_misc_vram_gb(self) -> float:
         """
@@ -374,8 +477,10 @@ class BaseVramReqs:
     # ------------------------------------------------------------
 
     def calc_sleep_peak_gb(self, sleep_mode: bool = False) -> float:
-        """Extra profiled peak under vLLM enable_sleep_mode (~weights again)."""
-        return self.calc_weights_gb() if sleep_mode else 0.0
+        """Extra profiled peak under vLLM enable_sleep_mode (~weights + draft again)."""
+        if not sleep_mode:
+            return 0.0
+        return self.calc_weights_gb() + self.calc_draft_weights_gb()
 
 
     def calc_cuda_graph_gb(
@@ -414,10 +519,11 @@ class BaseVramReqs:
 
 
     def calc_fixed_non_kv_gb(self, sleep_mode: bool = False) -> float:
-        """Weights + overhead + misc + sleep peak (before activations/KV)."""
+        """Weights + draft + overhead + misc + sleep peak (before activations/KV)."""
         return (
             self.calc_system_overhead_gb()
             + self.calc_weights_gb()
+            + self.calc_draft_weights_gb()
             + self.calc_misc_vram_gb()
             + self.calc_sleep_peak_gb(sleep_mode)
         )
