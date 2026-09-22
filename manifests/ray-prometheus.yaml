@@ -1,0 +1,77 @@
+# Minimal Prometheus that scrapes all Ray metrics agents (pod network),
+# exposed via MetalLB so insights-host can federate.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-prometheus-config
+  namespace: ray-system
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+      - job_name: ray
+        http_sd_configs:
+          - url: http://raycluster-head-svc.ray-system.svc:8265/api/prometheus/sd
+            refresh_interval: 30s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-prometheus
+  namespace: ray-system
+  labels:
+    app: ray-prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ray-prometheus
+  template:
+    metadata:
+      labels:
+        app: ray-prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+            - --web.enable-lifecycle
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: ray-prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-prometheus
+  namespace: ray-system
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: "10.0.1.53"
+  labels:
+    app: ray-prometheus
+spec:
+  type: LoadBalancer
+  selector:
+    app: ray-prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090

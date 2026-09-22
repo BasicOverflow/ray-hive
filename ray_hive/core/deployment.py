@@ -21,16 +21,16 @@ from .ray_utils.session import SERVE_FASTAPI_RUNTIME_ENV
 
 # Bump when worker-side actor/router generate behavior changes so a stale
 # detached DeployService (old working_dir zip) is killed and recreated.
-HIVE_DEPLOY_CODE_REV = 21
+HIVE_DEPLOY_CODE_REV = 31
 
 
-@ray.remote(num_gpus=0.01)
+@ray.remote(num_cpus=0)
 def fetch_hf_config_dict(model_name: str) -> dict:
-    """Load HF config.json on a GPU worker (delegates to shared loader)."""
+    """Load HF config.json on a GPU worker (needs transformers)."""
     return load_hf_config_dict(model_name)
 
 
-@ray.remote
+@ray.remote(num_cpus=0)
 def deploy_single(
     replica_id: str,
     model_id: str,
@@ -61,6 +61,7 @@ def deploy_single(
         name=replica_id,
         graceful_shutdown_timeout_s=0,
         ray_actor_options={
+            "num_cpus": 0,
             "num_gpus": 0,
             "resources": resources,
             "runtime_env": {"env_vars": env_vars},
@@ -78,7 +79,7 @@ def deploy_single(
     return True
 
 
-@ray.remote
+@ray.remote(num_cpus=0)
 def deploy_router(
     model_id: str,
     model_name: str,
@@ -95,16 +96,16 @@ def deploy_router(
     """Bind/run ModelRouter on a GPU worker (needs transformers/vllm)."""
     from ray_hive.core.model_router import ModelRouter
 
+    # Low CPU: lexis-markets often leaves <3 CPUs free; default 1.0 never schedules.
+    # Pin FastAPI so ingress unpickle matches ModelRouter (worker image / client).
     router = ModelRouter.options(
         name=f"{model_id}-router",
         graceful_shutdown_timeout_s=0,
         autoscaling_config=None,
         num_replicas=1,
         ray_actor_options={
-            "num_cpus": 0.1,
+            "num_cpus": 0,
             "resources": {resource_name: 0.01},
-            # Pin FastAPI on the Serve replica so ingress unpickle matches
-            # whatever version imported ModelRouter (worker image / client).
             "runtime_env": {
                 **dict(SERVE_FASTAPI_RUNTIME_ENV),
                 "env_vars": {NAMESPACE_ENV: ray_namespace()},
@@ -175,10 +176,35 @@ class DeployService:
         model_vllm_kwargs.pop("distributed_executor_backend", None)
 
         registry = get_gpu_registry()
+        print(f"_deploy assert free {model_id}", flush=True)
         assert_model_id_free(model_id, registry)
 
-        hf_params = normalize_hf_config(ray.get(fetch_hf_config_dict.remote(config["name"])))
+        print(f"_deploy normalize hf {config['name']}", flush=True)
+        # Pin to any advertised hive GPU custom-resource (workers have transformers;
+        # head often does not). Avoid num_gpus=0.01 — fights lexis / fractional GPU.
+        gpu_res = None
+        for k, v in ray.available_resources().items():
+            if "_gpu" in k and v >= 0.01:
+                gpu_res = k
+                break
+        if gpu_res is None:
+            for k, v in ray.cluster_resources().items():
+                if "_gpu" in k and v >= 0.01:
+                    gpu_res = k
+                    break
+        fetch_opts = {"num_cpus": 0}
+        if gpu_res:
+            fetch_opts["resources"] = {gpu_res: 0.01}
+            print(f"_deploy fetch_hf via {gpu_res}", flush=True)
+        else:
+            fetch_opts["num_gpus"] = 0.01
+            print("_deploy fetch_hf via num_gpus=0.01 fallback", flush=True)
+        hf_params = normalize_hf_config(
+            ray.get(fetch_hf_config_dict.options(**fetch_opts).remote(config["name"]))
+        )
+        print(f"_deploy get_all_gpus", flush=True)
         gpu_map = ray.get(registry.get_all_gpus.remote())
+        print(f"_deploy gpu_map keys={list(gpu_map)[:12]} n={len(gpu_map)}", flush=True)
 
         from ray_hive.core.model_specs.factory import is_multimodal_hf, is_pooling_kwargs
         pooling = is_pooling_kwargs(model_vllm_kwargs)
@@ -186,7 +212,9 @@ class DeployService:
             "language_model_only"
         )
 
+        print(f"_deploy plan_replica_groups multimodal={multimodal}", flush=True)
         planned = plan_replica_groups(gpu_map, config, hf_params, model_vllm_kwargs, model_id)
+        print(f"_deploy planned={list(planned)}", flush=True)
 
         replica_jobs = []
         gpu_mapping = {}
@@ -243,7 +271,8 @@ class DeployService:
         deploy_futures = []
         for job in replica_jobs:
             resources = {name: 0.01 for name in job["resource_names"]}
-            deploy_futures.append(deploy_single.options(resources=resources).remote(
+            print(f"_deploy launch deploy_single {job['replica_id']} resources={resources}", flush=True)
+            deploy_futures.append(deploy_single.options(resources=resources, num_cpus=0).remote(
                 job["replica_id"],
                 job["model_id"],
                 job["target_gpu_id"],
@@ -254,7 +283,9 @@ class DeployService:
                 job["multimodal"],
             ))
         try:
+            print(f"_deploy waiting {len(deploy_futures)} deploy_single", flush=True)
             ray.get(deploy_futures)
+            print(f"_deploy deploy_single done", flush=True)
         except Exception as e:
             for f in deploy_futures:
                 ray.cancel(f, force=True)
@@ -290,7 +321,8 @@ class DeployService:
 
         gpu_deployment_names = [job["replica_id"] for job in replica_jobs]
         router_resource = replica_jobs[0]["resource_names"][0]
-        ray.get(deploy_router.options(resources={router_resource: 0.01}).remote(
+        print(f"deploy_router start model_id={model_id} resource={router_resource}", flush=True)
+        ray.get(deploy_router.options(resources={router_resource: 0.01}, num_cpus=0).remote(
             model_id,
             config["name"],
             gpu_deployment_names,
@@ -303,6 +335,7 @@ class DeployService:
             multimodal,
             chat_template,
         ))
+        print(f"deploy_router done model_id={model_id}", flush=True)
 
         return {
             replica_id: {
@@ -335,6 +368,9 @@ def get_deploy_service():
             # brief backoff then retry actor creation.
             if attempt:
                 time.sleep(min(2 * attempt, 10))
+            # Do not set working_dir here: Ray Jobs forbid path URIs on actors.
+            # Inherit the creator job/client working_dir; bump HIVE_DEPLOY_CODE_REV
+            # to force recreate when ModelRouter/deploy code changes.
             return DeployService.options(
                 name="deploy_service",
                 namespace=ns,

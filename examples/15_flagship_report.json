@@ -1,0 +1,65 @@
+{
+  "gpus": {
+    "ergos-06-nv:gpu0": {
+      "name": "NVIDIA GeForce RTX 3090",
+      "total": 24.0,
+      "available": 0.5625
+    },
+    "ergos-04-nv:gpu0": {
+      "name": "NVIDIA GeForce RTX 4060 Ti",
+      "total": 15.99609375,
+      "available": 15.69921875
+    },
+    "ergos-04-nv:gpu1": {
+      "name": "NVIDIA GeForce RTX 4060 Ti",
+      "total": 7.99609375,
+      "available": 7.7470703125
+    },
+    "ergos-02-nv:gpu0": {
+      "name": "NVIDIA GeForce RTX 3060 Ti",
+      "total": 8.0,
+      "available": 7.7802734375
+    },
+    "ergos-02-nv:gpu1": {
+      "name": "NVIDIA GeForce RTX 3060 Ti",
+      "total": 8.0,
+      "available": 7.7802734375
+    },
+    "ergos-02-nv:gpu2": {
+      "name": "NVIDIA GeForce RTX 3060",
+      "total": 12.0,
+      "available": 11.755859375
+    }
+  },
+  "runs": [
+    {
+      "id": "qwen-autoround-3090",
+      "description": "AutoRound W4A16 + graphs, no MTP; extra VRAM \u2192 longer ctx",
+      "model": "dbirks/Qwen3.8-27B-W4A16-AutoRound",
+      "estimate": {
+        "dbirks/Qwen3.8-27B-W4A16-AutoRound-ergos-06-nv-gpu0": {
+          "gpus": [
+            "ergos-06-nv:gpu0"
+          ],
+          "total_vram_gb": 23.68454321920872,
+          "max_num_seqs": 1,
+          "gpu_memory_utilization": 0.98685596746703,
+          "max_input_prompt_length": 77329,
+          "max_output_prompt_length": 8192,
+          "max_model_len": 85521
+        }
+      },
+      "deploy": {
+        "status": "ready"
+      },
+      "bench": {
+        "n": 32,
+        "elapsed_s": 147.804,
+        "req_per_s": 0.217,
+        "approx_out_tok": 5726,
+        "approx_tok_per_s": 38.74,
+        "sample": " The capital of France is **Paris**. It is the largest city in France and serves as the country's political, economic, and cultural center. Paris is renowned for its rich history, iconic landmarks such as the Eiffel Tower, and its significa"
+      }
+    }
+  ]
+}

@@ -47,7 +47,7 @@ def _normalize_engine_kwargs(engine_kwargs: dict) -> dict:
 
 
 @serve.deployment(
-    ray_actor_options={"num_gpus": 0},
+    ray_actor_options={"num_gpus": 0, "num_cpus": 0},
     autoscaling_config=None,
     num_replicas=1,
     max_ongoing_requests=64,

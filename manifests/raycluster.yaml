@@ -13,6 +13,7 @@ spec:
     rayStartParams:
       dashboard-host: "0.0.0.0"
       num-cpus: "2"  # Head node - minimal CPUs
+      metrics-export-port: "8080"
     template:
       spec:
         containers:
@@ -28,6 +29,8 @@ spec:
             name: client
           - containerPort: 8000
             name: serve
+          - containerPort: 8080
+            name: metrics
           resources:
             requests:
               cpu: "2"
@@ -38,6 +41,15 @@ spec:
             value: "1"
           - name: RAY_SCHEDULER_EVENTS
             value: "0"  # Disable autoscaler event messages
+          # Embed Grafana panels in Ray Dashboard (insights-host stack)
+          - name: RAY_PROMETHEUS_HOST
+            value: "http://10.0.121.218:9090"
+          - name: RAY_PROMETHEUS_NAME
+            value: "prometheus"
+          - name: RAY_GRAFANA_HOST
+            value: "http://10.0.121.218:3000"
+          - name: RAY_GRAFANA_IFRAME_HOST
+            value: "http://10.0.121.218:3000"
   workerGroupSpecs:
   # CPU Worker Groups - one per CPU node to set exact CPU counts
   # ergos-01: 12 CPUs
@@ -47,6 +59,7 @@ spec:
     maxReplicas: 1
     rayStartParams:
       num-cpus: "12"  # Explicitly set to match node CPU count
+      metrics-export-port: "8080"
     template:
       spec:
         affinity:
@@ -78,6 +91,7 @@ spec:
     maxReplicas: 1
     rayStartParams:
       num-cpus: "13"  # Explicitly set to match node CPU count
+      metrics-export-port: "8080"
     template:
       spec:
         affinity:
@@ -109,6 +123,7 @@ spec:
     maxReplicas: 1
     rayStartParams:
       num-cpus: "5"  # Explicitly set to match node CPU count
+      metrics-export-port: "8080"
     template:
       spec:
         affinity:
@@ -142,6 +157,7 @@ spec:
     rayStartParams:
       num-cpus: "12"
       num-gpus: "3"
+      metrics-export-port: "8080"
       resources: '"{\"ergos-02-nv_gpu0\": 100, \"ergos-02-nv_gpu1\": 100, \"ergos-02-nv_gpu2\": 100}"'
     template:
       spec:
@@ -228,6 +244,7 @@ spec:
     rayStartParams:
       num-cpus: "13"
       num-gpus: "2"
+      metrics-export-port: "8080"
       resources: '"{\"ergos-04-nv_gpu0\": 100, \"ergos-04-nv_gpu1\": 100}"'
     template:
       spec:
@@ -314,6 +331,7 @@ spec:
     rayStartParams:
       num-cpus: "5"
       num-gpus: "1"
+      metrics-export-port: "8080"
       resources: '"{\"ergos-06-nv_gpu0\": 100}"'
     template:
       spec:

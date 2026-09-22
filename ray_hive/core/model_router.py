@@ -105,6 +105,51 @@ def _ensure_chat_template(tokenizer, model_name: str, chat_template: str | None)
         tokenizer.chat_template = _default_deepseek_ocr_chat_template()
 
 
+def _image_placeholder_for_model(model_name: str) -> str:
+    """Vision pad token(s) when flattening list content for brittle chat templates."""
+    name = (model_name or "").lower()
+    if "dots" in name and "ocr" in name:
+        return "<|img|><|imgpad|><|endofimg|>"
+    if "deepseek" in name and "ocr" in name:
+        return "<image>\n"
+    return "<image>\n"
+
+
+def _flatten_mm_message_content(
+    messages: list[dict],
+    *,
+    image_placeholder: str,
+) -> list[dict]:
+    """Collapse OpenAI-style multimodal list content to plain strings.
+
+    Some OCR chat templates (notably dots.ocr) do ``'<|role|>' + m.content`` on
+    system/assistant turns and break when any turn still has list content, or
+    when processor preprocessing leaves list-shaped fields. Flattening keeps
+    image pads so vLLM can still bind ``multi_modal_data``.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        row = dict(msg)
+        content = row.get("content")
+        if isinstance(content, list):
+            bits: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if (
+                    ptype in ("image", "image_url")
+                    or "image" in part
+                    or "image_url" in part
+                ):
+                    bits.append(image_placeholder)
+                elif ptype == "text" or "text" in part:
+                    bits.append(str(part.get("text") or ""))
+            row["content"] = "".join(bits)
+        out.append(row)
+    return out
+
+
 def _load_mm_config(model_name: str):
     """Config for modality detection without executing broken remote modeling modules."""
     _ensure_llama_flash_attention_compat()
@@ -262,7 +307,7 @@ def _video_url(part: VideoUrlContentPart) -> str:
 
 
 @serve.deployment(
-    ray_actor_options={"num_cpus": 0.1},
+    ray_actor_options={"num_cpus": 0},
     autoscaling_config=None,
     num_replicas=1,
     max_ongoing_requests=100,
@@ -320,8 +365,10 @@ class ModelRouter:
                 except Exception:
                     self.processor = None
         _ensure_chat_template(self.tokenizer, model_name, chat_template)
-        # DeepSeek-OCR* processor remote-code is TF4-era; chat templating via tokenizer only.
-        if "deepseek" in model_name.lower() and "ocr" in model_name.lower():
+        # DeepSeek-OCR* / dots.ocr: prefer tokenizer chat template. Processor
+        # apply_chat_template has broken on list-shaped multimodal content.
+        _mn = model_name.lower()
+        if ("deepseek" in _mn and "ocr" in _mn) or ("dots" in _mn and "ocr" in _mn):
             self.processor = None
         if self.processor is not None and getattr(self.tokenizer, "chat_template", None):
             self.processor.chat_template = self.tokenizer.chat_template
@@ -352,6 +399,14 @@ class ModelRouter:
             fn = self.tokenizer.apply_chat_template
 
         encodings = template_message_encodings(hf_messages)
+        # Retry with flattened MM content if list-shaped parts break Jinja.
+        flat = _flatten_mm_message_content(
+            hf_messages,
+            image_placeholder=_image_placeholder_for_model(self.model_name),
+        )
+        if flat != hf_messages:
+            encodings = list(encodings) + [("mm_flat_str", flat)]
+
         attempts: list[tuple[str, bool, list]] = []
         for name, msgs in encodings:
             if tools:
