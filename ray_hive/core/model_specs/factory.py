@@ -56,11 +56,18 @@ def select_vram_classes(
     hf_params: dict,
     attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
     vllm_kwargs: dict | None = None,
+    vram_cls: Optional[Type[BaseVramReqs]] = None,
 ) -> tuple[Type[BaseAttentionSpecs], Type[BaseVramReqs]]:
-    """Pick attention + VramReqs classes (multimodal vs text). Pooling is a flag."""
+    """Pick attention + VramReqs classes (multimodal vs text). Pooling is a flag.
+
+    ``vram_cls`` overrides the default calculator (e.g. custom ``calc_sleep_peak_gb``).
+    """
     multimodal = is_multimodal_hf(hf_params) and not is_text_only_serve(
         hf_params, vllm_kwargs
     )
     if multimodal:
-        return attention_cls or MultimodalAttentionSpecs, MultimodalVramReqs
-    return attention_cls or BaseAttentionSpecs, BaseVramReqs
+        return (
+            attention_cls or MultimodalAttentionSpecs,
+            vram_cls or MultimodalVramReqs,
+        )
+    return attention_cls or BaseAttentionSpecs, vram_cls or BaseVramReqs

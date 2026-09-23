@@ -477,10 +477,19 @@ class BaseVramReqs:
     # ------------------------------------------------------------
 
     def calc_sleep_peak_gb(self, sleep_mode: bool = False) -> float:
-        """Extra profiled peak under vLLM enable_sleep_mode (~weights + draft again)."""
+        """Extra profiled peak under vLLM enable_sleep_mode (~weights + draft again).
+
+        Override via planner key ``sleep_peak_factor`` (in ``vllm_kwargs`` at deploy):
+        - ``1.0`` (default): reserve a second weight-scale peak while asleep
+        - ``0.0``: disable the extra hold (tight cards; risk of allocator steal on wake)
+        - ``0 < f < 1``: fractional hold
+        """
         if not sleep_mode:
             return 0.0
-        return self.calc_weights_gb() + self.calc_draft_weights_gb()
+        factor = float(self.hf_params.get("sleep_peak_factor", 1.0))
+        if factor <= 0:
+            return 0.0
+        return factor * (self.calc_weights_gb() + self.calc_draft_weights_gb())
 
 
     def calc_cuda_graph_gb(

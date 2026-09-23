@@ -21,7 +21,7 @@ from .ray_utils.session import SERVE_FASTAPI_RUNTIME_ENV
 
 # Bump when worker-side actor/router generate behavior changes so a stale
 # detached DeployService (old working_dir zip) is killed and recreated.
-HIVE_DEPLOY_CODE_REV = 31
+HIVE_DEPLOY_CODE_REV = 32
 
 
 @ray.remote(num_cpus=0)

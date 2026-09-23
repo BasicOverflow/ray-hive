@@ -191,7 +191,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr1
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
           imagePullPolicy: Always
           securityContext:
             privileged: true
@@ -278,7 +278,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr1
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
           imagePullPolicy: Always
           securityContext:
             privileged: true
@@ -365,7 +365,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr1
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
           imagePullPolicy: Always
           securityContext:
             privileged: true

@@ -58,11 +58,18 @@ def fixed_non_kv_gb(vram_reqs, sleep_mode: bool = False) -> float:
     return vram_reqs.calc_fixed_non_kv_gb(sleep_mode)
 
 
-def build_vram_reqs_for_tp(hf_params, attention_cls, model_vllm_kwargs, tp_size: int):
+def build_vram_reqs_for_tp(
+    hf_params,
+    attention_cls,
+    model_vllm_kwargs,
+    tp_size: int,
+    vram_cls=None,
+):
     """Build VramReqs for a given TP size."""
     return build_vram_reqs(
         hf_params,
         attention_cls=attention_cls,
+        vram_cls=vram_cls,
         tensor_parallel_size=tp_size,
         **model_vllm_kwargs,
     )
@@ -309,6 +316,11 @@ def plan_replica_groups(
             resolve_limit_mm_per_prompt(hf_params, model_vllm_kwargs),
         )
 
+    # Planner-only knobs must reach VramReqs (lifted out of engine kwargs in RayHive).
+    plan_kwargs = dict(model_vllm_kwargs)
+    if "sleep_peak_factor" in config:
+        plan_kwargs["sleep_peak_factor"] = float(config["sleep_peak_factor"])
+
     tp_size, target_gpus, vram_reqs = resolve_target_gpus(
         gpu_map,
         config.get("replicas", -1),
@@ -316,8 +328,9 @@ def plan_replica_groups(
         hf_params,
         config.get("allocation_cls"),
         config.get("attention_cls"),
-        model_vllm_kwargs,
+        plan_kwargs,
         sleep_mode=sleep_mode,
+        vram_cls=config.get("vram_cls"),
     )
     gpu_groups = chunk_gpu_groups(target_gpus, tp_size)
 

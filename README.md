@@ -337,7 +337,7 @@ See `examples/10_text_embeddings.py` and `examples/11_multimodal_embeddings.py`.
 
 ## Lifecycle
 
-Sleep after quiet, then optional full destroy (`idle_timeout` must be greater than `sleep_timeout` when both are set). While sleeping, planned VRAM stays reserved so other deploys cannot take wake capacity:
+Sleep after quiet, then optional full destroy (`idle_timeout` must be greater than `sleep_timeout` when both are set). While sleeping, planned VRAM stays reserved so other deploys cannot take wake capacity (planner adds a second weight-scale peak by default). On tight GPUs, pass `sleep_peak_factor=0.0` in `vllm_kwargs` to disable that extra hold, or pass a custom `vram_cls` that overrides `calc_sleep_peak_gb`:
 
 ```python
 hive.deploy_model(
@@ -348,8 +348,12 @@ hive.deploy_model(
     replicas=1,
     sleep_timeout=60,
     idle_timeout=300,
-    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
-                 "default_chat_template_kwargs": {"enable_thinking": False}},
+    vllm_kwargs={
+        "trust_remote_code": True,
+        "reasoning_parser": "qwen3",
+        "default_chat_template_kwargs": {"enable_thinking": False},
+        # "sleep_peak_factor": 0.0,  # optional: skip second weight reservation
+    },
 )
 ```
 

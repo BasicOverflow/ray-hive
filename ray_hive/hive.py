@@ -14,6 +14,7 @@ from .core.gpu_registry import get_gpu_registry
 from .core.model_specs.attention import BaseAttentionSpecs
 from .core.model_specs.estimate import load_hf_config_dict
 from .core.model_specs.planner import normalize_hf_config
+from .core.model_specs.vram_reqs import BaseVramReqs
 from .core.ray_utils import init_ray, shutdown_all, shutdown_model, suppress_ray_warnings
 from .core.ray_utils.display import (
     print_banner,
@@ -25,7 +26,12 @@ from .core.openai_gateway import ensure_openai_gateway
 from .errors import ConfigError
 
 # Lifted out of vllm_kwargs into planner config (must not also reach engine_kwargs).
-_PLANNER_VLLM_KEYS = ("max_num_seqs", "max_num_batched_tokens", "auto_hybrid_input_cap")
+_PLANNER_VLLM_KEYS = (
+    "max_num_seqs",
+    "max_num_batched_tokens",
+    "auto_hybrid_input_cap",
+    "sleep_peak_factor",
+)
 
 
 def _split_vllm_kwargs(vllm_kwargs: dict | None) -> tuple[dict, dict]:
@@ -95,6 +101,7 @@ class RayHive:
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
+        vram_cls: Optional[Type[BaseVramReqs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         idle_timeout: int = -1,
         sleep_timeout: int = -1,
@@ -108,7 +115,11 @@ class RayHive:
 
         max_input_prompt_length and max_output_prompt_length are required.
         Pass planner overrides (max_num_seqs, max_num_batched_tokens,
-        auto_hybrid_input_cap) inside vllm_kwargs — they are lifted automatically.
+        auto_hybrid_input_cap, sleep_peak_factor) inside vllm_kwargs — they are
+        lifted automatically.
+        sleep_peak_factor (default 1.0): when sleep_timeout>0, planner reserves
+        factor × (weights+draft) as a second peak so allocators cannot steal the
+        GPU while the engine sleeps. Set 0.0 to disable that hold on tight cards.
         max_input_prompt_length=\"auto\" grows text input (floor 256) to fill VRAM at a
         fixed max_num_seqs (required in vllm_kwargs); output length stays fixed.
         When max_num_seqs==1, auto may shrink below 256 so weights + draft still fit.
@@ -117,6 +128,7 @@ class RayHive:
         auto_hybrid_input_cap to spend freed draft/KV room on a longer window.
         replicas=-1 deploys to all eligible GPUs (or all eligible TP groups when auto TP>1).
         attention_cls defaults to BaseAttentionSpecs (standard transformer KV sizing).
+        vram_cls overrides the default VramReqs calculator (optional).
         allocation_cls defaults to RayPerformanceAllocator for single-GPU auto placement;
         ignored when gpu= is set. Auto TP packing always uses RayTensorParallelAllocator.
         gpu=None: place on one GPU if any fits; otherwise same-node TP (2, 3, ...).
@@ -141,6 +153,7 @@ class RayHive:
             "max_input_prompt_length": max_input_prompt_length,
             "max_output_prompt_length": max_output_prompt_length,
             "attention_cls": attention_cls,
+            "vram_cls": vram_cls,
             "allocation_cls": allocation_cls,
             "idle_timeout": idle_timeout,
             "sleep_timeout": sleep_timeout,
@@ -187,6 +200,7 @@ class RayHive:
         replicas: int = 1,
         gpu: Optional[Union[str, List[str]]] = None,
         attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
+        vram_cls: Optional[Type[BaseVramReqs]] = None,
         allocation_cls: Optional[Type[BaseGpuAllocator]] = None,
         vllm_kwargs: Optional[dict] = None,
     ) -> dict:
@@ -206,6 +220,7 @@ class RayHive:
             "max_input_prompt_length": max_input_prompt_length,
             "max_output_prompt_length": max_output_prompt_length,
             "attention_cls": attention_cls,
+            "vram_cls": vram_cls,
             "allocation_cls": allocation_cls,
             **planner_overrides,
         }

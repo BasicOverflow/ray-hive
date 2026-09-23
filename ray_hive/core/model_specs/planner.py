@@ -63,13 +63,17 @@ def normalize_hf_config(hf_config) -> dict:
 def build_vram_reqs(
     hf_config,
     attention_cls: Optional[Type[BaseAttentionSpecs]] = None,
+    vram_cls: Optional[Type[BaseVramReqs]] = None,
     **kwargs,
 ) -> BaseVramReqs:
     """Build the appropriate VramReqs subclass from HF config + deploy kwargs."""
     params = dict(hf_config)
     vllm_like = dict(kwargs)
-    attn_cls, vram_cls = select_vram_classes(
-        params, attention_cls=attention_cls, vllm_kwargs=vllm_like
+    attn_cls, resolved_vram_cls = select_vram_classes(
+        params,
+        attention_cls=attention_cls,
+        vllm_kwargs=vllm_like,
+        vram_cls=vram_cls,
     )
 
     if is_multimodal_hf(params):
@@ -80,7 +84,7 @@ def build_vram_reqs(
 
     params.update(vllm_like)
     params = attach_speculative_draft(params)
-    vram_reqs = vram_cls(attention_cls=attn_cls, **params)
+    vram_reqs = resolved_vram_cls(attention_cls=attn_cls, **params)
     vram_reqs.pooling = is_pooling_kwargs(vllm_like)
     return vram_reqs
 

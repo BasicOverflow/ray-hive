@@ -1,9 +1,9 @@
-# GPU Ray worker image: Ray + ffmpeg (torchcodec) + vLLM.
+# GPU Ray worker image: Ray + ffmpeg (torchcodec) + vLLM + ray-hive package.
 # Official vLLM approach: apt packages live in the RUNTIME image.
 #
 # Build → verify → push (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
 #
-#   IMG=10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr1
+#   IMG=10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
 #
 #   docker build -f manifests/Dockerfile.ray-vllm-worker -t "$IMG" .
 #
@@ -25,6 +25,8 @@ RUN apt-get update -qq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY manifests/smoke_test_worker_deps.py /opt/ray-hive/smoke_test_worker_deps.py
+COPY pyproject.toml README.md /opt/ray-hive-src/
+COPY ray_hive /opt/ray-hive-src/ray_hive
 
 USER ray
 # PyPI's default vllm wheel links CUDA 13 (libcudart.so.13). Use the cu129 build.
@@ -48,7 +50,9 @@ RUN pip install --no-cache-dir --upgrade "uv" \
         "addict" "matplotlib" "easydict" \
     && pip install --no-cache-dir --force-reinstall "protobuf==5.29.6" \
         "googleapis-common-protos==1.66.0" \
-    && python /opt/ray-hive/smoke_test_worker_deps.py
+    && pip install --no-cache-dir --no-deps /opt/ray-hive-src \
+    && python /opt/ray-hive/smoke_test_worker_deps.py \
+    && python -c "from ray_hive.core.deployment import HIVE_DEPLOY_CODE_REV; assert HIVE_DEPLOY_CODE_REV >= 32"
 
 ENV VLLM_VIDEO_LOADER_BACKEND=opencv
 ENV HF_HOME=/home/ray/.cache/huggingface

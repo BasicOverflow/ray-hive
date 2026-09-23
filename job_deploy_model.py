@@ -82,6 +82,9 @@ def main() -> None:
     kwargs = _vllm_kwargs(MODEL_ID, MODEL_NAME)
     alloc = _allocation_cls()
     print(f"deploy {MODEL_ID} ({MODEL_NAME}) allocator={alloc.__name__} kwargs={kwargs}")
+    sleep_timeout = int(os.environ.get("NINI_SLEEP_TIMEOUT", "600"))  # 10 min → sleep
+    idle_timeout = int(os.environ.get("NINI_IDLE_TIMEOUT", "900"))  # 15 min → offload
+    print(f"timeouts sleep={sleep_timeout}s idle={idle_timeout}s")
     status = hive.deploy_model(
         model_id=MODEL_ID,
         model_name=MODEL_NAME,
@@ -89,6 +92,8 @@ def main() -> None:
         max_output_prompt_length=MAX_OUT,
         replicas=1,
         allocation_cls=alloc,
+        sleep_timeout=sleep_timeout,
+        idle_timeout=idle_timeout,
         vllm_kwargs=kwargs,
     )
     print(status)

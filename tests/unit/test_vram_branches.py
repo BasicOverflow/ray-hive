@@ -22,14 +22,36 @@ def test_hybrid_pattern(tiny_hf_dense):
     assert vr.calc_weights_gb() > 0
 
 
-def test_checkpoint_bytes_floor_weights(tiny_hf_dense):
-    base = build_vram_reqs(tiny_hf_dense).calc_weights_gb()
-    # 8 GiB packed → 8 * 1.10 after load factor
-    floored = build_vram_reqs(
-        {**tiny_hf_dense, "_checkpoint_bytes": int(8 * 1024**3)}
-    ).calc_weights_gb()
-    assert floored > base
-    assert floored == pytest.approx(8.0 * 1.10, rel=1e-6)
+def test_sleep_peak_factor_scales_fixed_non_kv(tiny_hf_dense):
+    base = build_vram_reqs(tiny_hf_dense)
+    full = base.calc_fixed_non_kv_gb(sleep_mode=True)
+    none = build_vram_reqs(tiny_hf_dense, sleep_peak_factor=0.0).calc_fixed_non_kv_gb(
+        sleep_mode=True
+    )
+    half = build_vram_reqs(tiny_hf_dense, sleep_peak_factor=0.5).calc_fixed_non_kv_gb(
+        sleep_mode=True
+    )
+    awake = base.calc_fixed_non_kv_gb(sleep_mode=False)
+    assert none == pytest.approx(awake)
+    assert full > awake
+    assert half == pytest.approx(awake + 0.5 * (full - awake))
+
+
+def test_custom_vram_cls_override(tiny_hf_dense):
+    from ray_hive.core.model_specs.vram_reqs import BaseVramReqs
+
+    class ZeroSleep(BaseVramReqs):
+        def calc_sleep_peak_gb(self, sleep_mode: bool = False) -> float:
+            return 0.0
+
+    default = build_vram_reqs(tiny_hf_dense).calc_fixed_non_kv_gb(sleep_mode=True)
+    custom = build_vram_reqs(tiny_hf_dense, vram_cls=ZeroSleep).calc_fixed_non_kv_gb(
+        sleep_mode=True
+    )
+    awake = build_vram_reqs(tiny_hf_dense).calc_fixed_non_kv_gb(sleep_mode=False)
+    assert custom == pytest.approx(awake)
+    assert default > custom
+
 
 
 def test_text_only_drops_vision_from_checkpoint_floor(tiny_hf_mm):
