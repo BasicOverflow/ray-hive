@@ -3,6 +3,7 @@
 #
 # Build → verify → push (Docker host needs insecure-registries: ["10.0.0.52:3000"]):
 #
+#   # build the wheel first: py -3 -m build
 #   IMG=10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
 #
 #   docker build -f manifests/Dockerfile.ray-vllm-worker -t "$IMG" .
@@ -25,8 +26,8 @@ RUN apt-get update -qq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY manifests/smoke_test_worker_deps.py /opt/ray-hive/smoke_test_worker_deps.py
-COPY pyproject.toml README.md /opt/ray-hive-src/
-COPY ray_hive /opt/ray-hive-src/ray_hive
+# Prebuilt wheel (py -m build) — avoid writing egg-info as non-root into a root COPY.
+COPY dist/ray_hive-*.whl /tmp/
 
 USER ray
 # PyPI's default vllm wheel links CUDA 13 (libcudart.so.13). Use the cu129 build.
@@ -50,7 +51,7 @@ RUN pip install --no-cache-dir --upgrade "uv" \
         "addict" "matplotlib" "easydict" \
     && pip install --no-cache-dir --force-reinstall "protobuf==5.29.6" \
         "googleapis-common-protos==1.66.0" \
-    && pip install --no-cache-dir --no-deps /opt/ray-hive-src \
+    && pip install --no-cache-dir --no-deps /tmp/ray_hive-*.whl \
     && python /opt/ray-hive/smoke_test_worker_deps.py \
     && python -c "from ray_hive.core.deployment import HIVE_DEPLOY_CODE_REV; assert HIVE_DEPLOY_CODE_REV >= 32"
 
