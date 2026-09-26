@@ -74,7 +74,7 @@ def test_kv_cache_bytes_follow_planned_seqs(tiny_hf_dense):
 
 
 def test_sleep_hold_does_not_enlarge_vllm_pool(tiny_hf_dense):
-    vr = build_vram_reqs(tiny_hf_dense)
+    vr = build_vram_reqs(tiny_hf_dense, sleep_peak_factor=1.0)
     plan = plan_deployment(
         vr,
         vram_budget_gb=24.0,
@@ -92,11 +92,13 @@ def test_sleep_hold_does_not_enlarge_vllm_pool(tiny_hf_dense):
     assert awake + sleep < plan["total_vram_gb"] + 1.0
 
 
-def test_sleep_mode_increases_fixed_non_kv(tiny_hf_dense):
+def test_sleep_mode_does_not_double_weights_by_default(tiny_hf_dense):
     vr = build_vram_reqs(tiny_hf_dense)
     base = fixed_non_kv_gb(vr, sleep_mode=False)
     sleep = fixed_non_kv_gb(vr, sleep_mode=True)
-    assert sleep > base
+    assert sleep == pytest.approx(base)
+    doubled = build_vram_reqs(tiny_hf_dense, sleep_peak_factor=1.0)
+    assert fixed_non_kv_gb(doubled, sleep_mode=True) > base
 
 
 def test_tp_divides_weights(tiny_hf_dense):

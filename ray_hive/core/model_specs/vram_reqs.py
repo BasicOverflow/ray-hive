@@ -477,16 +477,19 @@ class BaseVramReqs:
     # ------------------------------------------------------------
 
     def calc_sleep_peak_gb(self, sleep_mode: bool = False) -> float:
-        """Extra profiled peak under vLLM enable_sleep_mode (~weights + draft again).
+        """Optional extra reservation while ``enable_sleep_mode`` is on.
 
-        Override via planner key ``sleep_peak_factor`` (in ``vllm_kwargs`` at deploy):
-        - ``1.0`` (default): reserve a second weight-scale peak while asleep
-        - ``0.0``: disable the extra hold (tight cards; risk of allocator steal on wake)
-        - ``0 < f < 1``: fractional hold
+        Sleep frees GPU memory (weights move to CPU, KV cache is dropped). Wake
+        needs the same footprint the model used while running — one copy of the
+        weights, not a second one. The default factor is therefore 0.
+
+        Override via planner key ``sleep_peak_factor`` (in ``vllm_kwargs``):
+        - ``0.0`` (default): reserve the running footprint only
+        - ``> 0``: also reserve that fraction of weights+draft
         """
         if not sleep_mode:
             return 0.0
-        factor = float(self.hf_params.get("sleep_peak_factor", 1.0))
+        factor = float(self.hf_params.get("sleep_peak_factor", 0.0))
         if factor <= 0:
             return 0.0
         return factor * (self.calc_weights_gb() + self.calc_draft_weights_gb())

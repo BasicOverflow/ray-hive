@@ -23,7 +23,7 @@ def test_hybrid_pattern(tiny_hf_dense):
 
 
 def test_sleep_peak_factor_scales_fixed_non_kv(tiny_hf_dense):
-    base = build_vram_reqs(tiny_hf_dense)
+    base = build_vram_reqs(tiny_hf_dense, sleep_peak_factor=1.0)
     full = base.calc_fixed_non_kv_gb(sleep_mode=True)
     none = build_vram_reqs(tiny_hf_dense, sleep_peak_factor=0.0).calc_fixed_non_kv_gb(
         sleep_mode=True
@@ -44,7 +44,7 @@ def test_custom_vram_cls_override(tiny_hf_dense):
         def calc_sleep_peak_gb(self, sleep_mode: bool = False) -> float:
             return 0.0
 
-    default = build_vram_reqs(tiny_hf_dense).calc_fixed_non_kv_gb(sleep_mode=True)
+    default = build_vram_reqs(tiny_hf_dense, sleep_peak_factor=1.0).calc_fixed_non_kv_gb(sleep_mode=True)
     custom = build_vram_reqs(tiny_hf_dense, vram_cls=ZeroSleep).calc_fixed_non_kv_gb(
         sleep_mode=True
     )

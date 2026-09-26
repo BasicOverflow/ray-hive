@@ -53,7 +53,7 @@ RUN pip install --no-cache-dir --upgrade "uv" \
         "googleapis-common-protos==1.66.0" \
     && pip install --no-cache-dir --no-deps /tmp/ray_hive-*.whl \
     && python /opt/ray-hive/smoke_test_worker_deps.py \
-    && python -c "from ray_hive.core.deployment import HIVE_DEPLOY_CODE_REV; assert HIVE_DEPLOY_CODE_REV >= 32"
+    && python -c "from ray_hive.core.deployment import HIVE_DEPLOY_CODE_REV; assert HIVE_DEPLOY_CODE_REV >= 35"
 
 ENV VLLM_VIDEO_LOADER_BACKEND=opencv
 ENV HF_HOME=/home/ray/.cache/huggingface

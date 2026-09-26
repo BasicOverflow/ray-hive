@@ -117,9 +117,10 @@ class RayHive:
         Pass planner overrides (max_num_seqs, max_num_batched_tokens,
         auto_hybrid_input_cap, sleep_peak_factor) inside vllm_kwargs — they are
         lifted automatically.
-        sleep_peak_factor (default 1.0): when sleep_timeout>0, planner reserves
-        factor × (weights+draft) as a second peak so allocators cannot steal the
-        GPU while the engine sleeps. Set 0.0 to disable that hold on tight cards.
+        sleep_peak_factor (default 0.0): when sleep_timeout>0, the registry keeps
+        the running footprint reserved so a wake still fits. A positive factor
+        also reserves that fraction of weights+draft. Do not set it unless a
+        model really needs a second weight-sized peak.
         max_input_prompt_length=\"auto\" grows text input (floor 256) to fill VRAM at a
         fixed max_num_seqs (required in vllm_kwargs); output length stays fixed.
         When max_num_seqs==1, auto may shrink below 256 so weights + draft still fit.
