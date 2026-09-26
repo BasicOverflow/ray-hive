@@ -21,7 +21,7 @@ from .ray_utils.session import SERVE_FASTAPI_RUNTIME_ENV
 
 # Bump when worker-side actor/router generate behavior changes so a stale
 # detached DeployService (old working_dir zip) is killed and recreated.
-HIVE_DEPLOY_CODE_REV = 32
+HIVE_DEPLOY_CODE_REV = 33
 
 
 @ray.remote(num_cpus=0)
@@ -247,8 +247,11 @@ class DeployService:
                 "max_num_batched_tokens": plan["max_num_batched_tokens"],
                 "gpu_memory_utilization": plan["gpu_memory_utilization"],
                 "enforce_eager": False,
-                **model_vllm_kwargs,
             }
+            # Caller may set kv_cache_memory_bytes itself; that value wins.
+            if "kv_cache_memory_bytes" not in model_vllm_kwargs:
+                engine_kwargs["kv_cache_memory_bytes"] = int(plan["kv_cache_bytes"])
+            engine_kwargs.update(model_vllm_kwargs)
             if config.get("sleep_timeout", -1) > 0:
                 engine_kwargs["enable_sleep_mode"] = True
             if tp_size > 1:

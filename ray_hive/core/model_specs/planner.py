@@ -365,11 +365,25 @@ def plan_deployment(
             )
             max_num_seqs = min(max_num_seqs, max_num_batched_tokens)
 
+    # vLLM spends (gpu_memory_utilization * GPU - profiled weights) on KV.
+    # That fills the card whenever the util pool is larger than the weights.
+    # Hand vLLM the KV this deployment can actually run instead.
+    seqs = max(1, int(max_num_seqs))
+    needed_kv_gb = vram_reqs.calc_kv_cache_gb(max_model_len, seqs)
+    encoder_gb = 0.0
+    calc_encoder = getattr(vram_reqs, "calc_encoder_cache_gb", None)
+    if callable(calc_encoder):
+        encoder_gb = max(0.0, float(calc_encoder()))
+    # Whole KV pages plus a small multimodal IPC skim.
+    kv_cache_bytes = int(math.ceil((needed_kv_gb + encoder_gb + 0.125) * (1024 ** 3)))
+
     return {
         "max_num_seqs": max_num_seqs,
         "max_num_batched_tokens": max_num_batched_tokens,
         "gpu_memory_utilization": gpu_memory_utilization,
         "total_vram_gb": total_vram_gb,
+        "kv_cache_gb": needed_kv_gb,
+        "kv_cache_bytes": kv_cache_bytes,
         "pooling": pooling,
         "mm_tokens_per_prompt": mm_tok,
     }
