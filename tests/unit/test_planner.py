@@ -73,6 +73,25 @@ def test_kv_cache_bytes_follow_planned_seqs(tiny_hf_dense):
     assert plan["kv_cache_bytes"] < int(0.5 * (1024 ** 3))
 
 
+def test_sleep_hold_does_not_enlarge_vllm_pool(tiny_hf_dense):
+    vr = build_vram_reqs(tiny_hf_dense)
+    plan = plan_deployment(
+        vr,
+        vram_budget_gb=24.0,
+        live_total_vram_gb=24.0,
+        max_model_len=512,
+        input_len=256,
+        output_len=256,
+        max_num_seqs_override=2,
+        sleep_mode=True,
+    )
+    sleep = vr.calc_sleep_peak_gb(True)
+    assert sleep > 0
+    # 0.75 GiB is graph slack in the vLLM fraction, not a second copy of the weights.
+    awake = plan["vllm_gpu_memory_utilization"] * 24.0
+    assert awake + sleep < plan["total_vram_gb"] + 1.0
+
+
 def test_sleep_mode_increases_fixed_non_kv(tiny_hf_dense):
     vr = build_vram_reqs(tiny_hf_dense)
     base = fixed_non_kv_gb(vr, sleep_mode=False)

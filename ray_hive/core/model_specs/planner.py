@@ -377,10 +377,19 @@ def plan_deployment(
     # Whole KV pages plus a small multimodal IPC skim.
     kv_cache_bytes = int(math.ceil((needed_kv_gb + encoder_gb + 0.125) * (1024 ** 3)))
 
+    # Registry total_vram_gb includes the sleep-hold (a second weight copy) so
+    # another deploy cannot take the GPU while this one is asleep. vLLM's
+    # memory fraction is a real reservation: pass only the awake footprint
+    # (weights, activations, and the KV sized above).
+    sleep_peak_gb = float(vram_reqs.calc_sleep_peak_gb(sleep_mode))
+    awake_pool_gb = max(0.0, non_kv_vram_gb - sleep_peak_gb) + (kv_cache_bytes / (1024 ** 3)) + 0.75
+    vllm_gpu_memory_utilization = min(0.95, awake_pool_gb / device_gb)
+
     return {
         "max_num_seqs": max_num_seqs,
         "max_num_batched_tokens": max_num_batched_tokens,
         "gpu_memory_utilization": gpu_memory_utilization,
+        "vllm_gpu_memory_utilization": vllm_gpu_memory_utilization,
         "total_vram_gb": total_vram_gb,
         "kv_cache_gb": needed_kv_gb,
         "kv_cache_bytes": kv_cache_bytes,
