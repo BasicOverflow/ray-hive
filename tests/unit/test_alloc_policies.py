@@ -6,12 +6,7 @@ import pytest
 from ray_hive.core.gpu_alloc import TP1_BUDGET_FRAC, model_needs_fp8_hardware, required_min_compute_cap
 from ray_hive.core.gpu_alloc.tensor_parallel import TensorParallelAllocator
 from ray_hive.core.ray_gpu_alloc import RayPerformanceAllocator
-from tests.helpers import (
-    FakeConserveTdpAllocator,
-    FakePerformanceAllocator,
-    FakeAllocator,
-    make_gpu,
-)
+from tests.helpers import FakePerformanceAllocator, make_gpu
 
 
 def test_replicas_one_and_all(perf_alloc, tiny_hf_dense):
@@ -56,6 +51,14 @@ def test_performance_sm_and_bandwidth_tiebreak(perf_alloc, tiny_hf_dense):
     assert perf_alloc.select(gmap, 1, 0.5, tiny_hf_dense, {})[0][0] == "b:gpu0"
 
 
+def test_prefer_freest_available_over_sm(perf_alloc, tiny_hf_dense):
+    gmap = {
+        "hot:gpu0": make_gpu("hot:gpu0", 10, 24, sm=200),
+        "freest:gpu0": make_gpu("freest:gpu0", 22, 24, sm=50),
+    }
+    assert perf_alloc.select(gmap, 1, 0.5, tiny_hf_dense, {})[0][0] == "freest:gpu0"
+
+
 def test_conserve_tdp_prefers_lower(tdp_alloc, tiny_hf_dense):
     gmap = {
         "hot:gpu0": make_gpu("hot:gpu0", 20, 24, sm=100, tdp=400),
@@ -85,12 +88,8 @@ def test_no_eligible_returns_empty(perf_alloc, tiny_hf_dense):
     assert perf_alloc.select(gmap, 1, 5.0, tiny_hf_dense, {}) == []
 
 
-class FakeTP(FakeAllocator, TensorParallelAllocator):
-    pass
-
-
 def test_tp_allocator_same_host_groups(tiny_hf_dense):
-    alloc = FakeTP()
+    alloc = TensorParallelAllocator()
     gmap = {
         "a:gpu0": make_gpu("a:gpu0", 10, 12, sm=80),
         "a:gpu1": make_gpu("a:gpu1", 10, 12, sm=80),
@@ -103,7 +102,7 @@ def test_tp_allocator_same_host_groups(tiny_hf_dense):
 
 
 def test_tp_requires_tp_size_ge_2(tiny_hf_dense):
-    alloc = FakeTP()
+    alloc = TensorParallelAllocator()
     with pytest.raises(AssertionError):
         alloc.select({"a:gpu0": make_gpu("a:gpu0", 10, 12)}, 1, 0.5, tiny_hf_dense, {})
 

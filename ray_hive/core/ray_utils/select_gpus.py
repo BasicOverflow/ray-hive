@@ -66,24 +66,14 @@ def resolve_target_gpus(
     """
     if gpu is not None:
         if isinstance(gpu, str):
-            return _pin_single(
-                gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, sleep_mode,
-                vram_cls=vram_cls,
-            )
-
+            return _pin(gpu_map, [gpu], hf_params, attention_cls, model_vllm_kwargs,
+                        sleep_mode, vram_cls=vram_cls)
         if isinstance(gpu, list):
             if not gpu:
                 raise InvalidGpuPinError("gpu=[] is empty")
-            if len(gpu) == 1:
-                return _pin_single(
-                    gpu_map, gpu[0], hf_params, attention_cls, model_vllm_kwargs, sleep_mode,
-                    vram_cls=vram_cls,
-                )
-            if replicas == len(gpu) and replicas > 1:
-                return _pin_multi_tp1(
-                    gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, sleep_mode,
-                    vram_cls=vram_cls,
-                )
+            if len(gpu) == 1 or (replicas == len(gpu) and replicas > 1):
+                return _pin(gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs,
+                            sleep_mode, vram_cls=vram_cls)
             if replicas != 1:
                 raise InvalidGpuPinError(
                     "Pinned gpu=[...] with len>1 is either one TP group (replicas=1) "
@@ -91,11 +81,10 @@ def resolve_target_gpus(
                     "one TP replica — for a second TP copy, call deploy_model again with a "
                     f"different model_id / pin. Got replicas={replicas}, len(gpu)={len(gpu)}."
                 )
-            return _pin_tp_group(
-                gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs, sleep_mode,
-                vram_cls=vram_cls,
+            return _pin(
+                gpu_map, gpu, hf_params, attention_cls, model_vllm_kwargs,
+                sleep_mode, vram_cls=vram_cls, tp_group=True,
             )
-
         assert False, "gpu must be a string, list of strings, or None"
 
     return _auto_place(
@@ -104,50 +93,17 @@ def resolve_target_gpus(
     )
 
 
-def _pin_single(
-    gpu_map, gpu_key, hf_params, attention_cls, model_vllm_kwargs, sleep_mode=False,
-    vram_cls=None,
-):
-    tp_size = 1
-    vram_reqs = build_vram_reqs_for_tp(
-        hf_params, attention_cls, model_vllm_kwargs, tp_size, vram_cls=vram_cls,
-    )
-    weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
-    return (
-        tp_size,
-        [_resolve_pinned_gpu(gpu_map, gpu_key, weight_need, hf_params, model_vllm_kwargs)],
-        vram_reqs,
-    )
-
-
-def _pin_multi_tp1(
+def _pin(
     gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwargs, sleep_mode=False,
-    vram_cls=None,
+    vram_cls=None, *, tp_group: bool = False,
 ):
-    tp_size = 1
-    vram_reqs = build_vram_reqs_for_tp(
-        hf_params, attention_cls, model_vllm_kwargs, tp_size, vram_cls=vram_cls,
-    )
-    weight_need = fixed_non_kv_gb(vram_reqs, sleep_mode=sleep_mode)
-    return (
-        tp_size,
-        [
-            _resolve_pinned_gpu(gpu_map, g, weight_need, hf_params, model_vllm_kwargs)
-            for g in gpu_keys
-        ],
-        vram_reqs,
-    )
-
-
-def _pin_tp_group(
-    gpu_map, gpu_keys, hf_params, attention_cls, model_vllm_kwargs, sleep_mode=False,
-    vram_cls=None,
-):
-    tp_size = len(gpu_keys)
-    hosts = {g.split(":")[0] for g in gpu_keys}
-    if len(hosts) != 1:
-        raise PlacementError(f"Same-node TP only — pinned GPUs span hosts {sorted(hosts)}")
-    assert_tp_shardable(hf_params, tp_size)
+    """Pin one or more GPUs; tp_group=True means same-node TP of len(gpu_keys)."""
+    tp_size = len(gpu_keys) if tp_group else 1
+    if tp_group:
+        hosts = {g.split(":")[0] for g in gpu_keys}
+        if len(hosts) != 1:
+            raise PlacementError(f"Same-node TP only — pinned GPUs span hosts {sorted(hosts)}")
+        assert_tp_shardable(hf_params, tp_size)
     vram_reqs = build_vram_reqs_for_tp(
         hf_params, attention_cls, model_vllm_kwargs, tp_size, vram_cls=vram_cls,
     )
@@ -174,7 +130,8 @@ def _auto_place(
     )
     weight_need_1 = fixed_non_kv_gb(vram_reqs_1, sleep_mode=sleep_mode)
     single_cls = allocation_cls or RayPerformanceAllocator
-    chosen = single_cls().select(
+    allocator = single_cls()
+    chosen = allocator.select(
         gpu_map, replicas, weight_need_1, hf_params, model_vllm_kwargs
     )
     if chosen:
@@ -185,6 +142,22 @@ def _auto_place(
                 f"but replicas={replicas}.\nCluster:\n{gpu_inventory_lines(gpu_map)}"
             )
         return 1, [gpu_info_entry(k, g) for k, g in chosen], vram_reqs_1
+
+    # Never TP-escalate when any Alive GPU still passes the TP1 weight gate
+    # (select may have returned empty due to replicas>eligible; freest single wins).
+    tp1_eligible = allocator.filter_eligible(
+        gpu_map, weight_need_1, hf_params, model_vllm_kwargs
+    )
+    if tp1_eligible and replicas == 1:
+        freest = max(tp1_eligible, key=lambda item: float(item[1].get("available") or 0))
+        return 1, [gpu_info_entry(freest[0], freest[1])], vram_reqs_1
+    if tp1_eligible and replicas == -1:
+        ranked = sorted(
+            tp1_eligible,
+            key=lambda item: float(item[1].get("available") or 0),
+            reverse=True,
+        )
+        return 1, [gpu_info_entry(k, g) for k, g in ranked], vram_reqs_1
 
     max_tp = max_gpus_on_any_host(gpu_map)
     best_partial = None

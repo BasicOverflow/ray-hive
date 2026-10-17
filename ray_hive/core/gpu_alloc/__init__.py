@@ -5,8 +5,7 @@ from .arch_reqs import (
     required_min_compute_cap,
 )
 from .base import BaseGpuAllocator, TP1_BUDGET_FRAC
-from .conserve_tdp import ConserveTdpAllocator
-from .performance import PerformanceAllocator
+from .policies import ConserveTdpAllocator, PerformanceAllocator
 from .tensor_parallel import TensorParallelAllocator
 
 __all__ = [

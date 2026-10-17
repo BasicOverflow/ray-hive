@@ -87,6 +87,17 @@ def chunk_gpu_groups(gpus: list[dict], tp_size: int) -> list[list[dict]]:
     return [gpus[i : i + tp_size] for i in range(0, len(gpus), tp_size)]
 
 
+def lengths_for_text_input(
+    vram_reqs, text_in: int, text_out: int
+) -> tuple[int, int, int, bool]:
+    """Return (effective_input, output_len, max_model_len, pooling) for a text input length."""
+    pooling = is_pooling_vram(vram_reqs)
+    input_len = effective_input_len(vram_reqs, text_in)
+    if pooling:
+        return input_len, 0, input_len, True
+    return input_len, text_out, input_len + text_out, False
+
+
 def plan_lengths(vram_reqs, config: dict) -> tuple[int, int, int, bool]:
     """Return (input_len, output_len, max_model_len, pooling) from deploy config."""
     text_in = config["max_input_prompt_length"]
@@ -98,23 +109,7 @@ def plan_lengths(vram_reqs, config: dict) -> tuple[int, int, int, bool]:
         raise ConfigError(
             f"max_input_prompt_length must be a positive int or \"auto\", got {text_in!r}"
         )
-    pooling = is_pooling_vram(vram_reqs)
-    text_out = config["max_output_prompt_length"]
-    input_len = effective_input_len(vram_reqs, text_in)
-    if pooling:
-        return input_len, 0, input_len, True
-    return input_len, text_out, input_len + text_out, False
-
-
-def lengths_for_text_input(
-    vram_reqs, text_in: int, text_out: int
-) -> tuple[int, int, int, bool]:
-    """Return (effective_input, output_len, max_model_len, pooling) for a text input length."""
-    pooling = is_pooling_vram(vram_reqs)
-    input_len = effective_input_len(vram_reqs, text_in)
-    if pooling:
-        return input_len, 0, input_len, True
-    return input_len, text_out, input_len + text_out, False
+    return lengths_for_text_input(vram_reqs, text_in, config["max_output_prompt_length"])
 
 
 def _hf_text_input_cap(hf_params: dict, vram_reqs, text_out: int, pooling: bool) -> int | None:

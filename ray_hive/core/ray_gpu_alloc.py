@@ -1,9 +1,9 @@
 """
-Ray-wired GPU allocators — bind abstract policies to cluster registry specs.
+Ray-wired GPU allocators — bind abstract policies to Alive-node gating.
 
-Hardware accessors and Alive-node gating live here; policy scoring stays in gpu_alloc.
+Hardware accessors live on BaseGpuAllocator (ray_utils.hardware); this module
+only adds the Alive-node filter used on the live cluster.
 """
-from ray_hive.core import ray_utils
 from ray_hive.core.gpu_alloc import (
     ConserveTdpAllocator,
     PerformanceAllocator,
@@ -12,24 +12,8 @@ from ray_hive.core.gpu_alloc import (
 from ray_hive.core.ray_utils.hardware import filter_alive
 
 
-class _RayHardwareMixin:
-    """Shared Ray registry hardware accessors + Alive-node gating."""
-
-    def sm_count(self, gpu: dict) -> int:
-        return ray_utils.sm_count(gpu)
-
-
-    def compute_cap(self, gpu: dict) -> tuple[int, int]:
-        return ray_utils.compute_cap(gpu)
-
-
-    def approx_tdp(self, gpu: dict) -> float:
-        return ray_utils.approx_tdp(gpu)
-
-
-    def mem_bandwidth(self, gpu: dict) -> float:
-        return ray_utils.mem_bandwidth(gpu)
-
+class _AliveFilterMixin:
+    """Drop GPUs whose registry host is not an Alive Ray node."""
 
     def filter_eligible(
         self,
@@ -43,13 +27,13 @@ class _RayHardwareMixin:
         )
 
 
-class RayPerformanceAllocator(_RayHardwareMixin, PerformanceAllocator):
-    """Performance policy with Ray registry hardware + Alive-node gate."""
+class RayPerformanceAllocator(_AliveFilterMixin, PerformanceAllocator):
+    """Performance policy with Alive-node gate."""
 
 
-class RayConserveTdpAllocator(_RayHardwareMixin, ConserveTdpAllocator):
-    """Conserve-TDP policy with Ray registry hardware + Alive-node gate."""
+class RayConserveTdpAllocator(_AliveFilterMixin, ConserveTdpAllocator):
+    """Conserve-TDP policy with Alive-node gate."""
 
 
-class RayTensorParallelAllocator(_RayHardwareMixin, TensorParallelAllocator):
-    """Same-node TP packing with Ray registry hardware + Alive-node gate."""
+class RayTensorParallelAllocator(_AliveFilterMixin, TensorParallelAllocator):
+    """Same-node TP packing with Alive-node gate."""

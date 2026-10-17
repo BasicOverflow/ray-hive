@@ -1,10 +1,15 @@
 """
-Base GPU allocator — abstract placement policy contract.
+Base GPU allocator — placement policy contract.
 
 Policies filter eligible GPUs, score them, and select top-N (or all).
-Hardware accessors (SM count, TDP, etc.) are abstract; Ray wiring fills them in.
+Hardware accessors default to registry PyCUDA helpers in ray_utils.hardware.
 """
-from abc import ABC, abstractmethod
+from ray_hive.core.ray_utils.hardware import (
+    approx_tdp as _approx_tdp,
+    compute_cap as _compute_cap,
+    mem_bandwidth as _mem_bandwidth,
+    sm_count as _sm_count,
+)
 
 from .arch_reqs import required_min_compute_cap
 
@@ -13,28 +18,20 @@ from .arch_reqs import required_min_compute_cap
 TP1_BUDGET_FRAC = 0.95
 
 
-class BaseGpuAllocator(ABC):
-    """Abstract GPU placement policy."""
+class BaseGpuAllocator:
+    """GPU placement policy base (override score / select in subclasses)."""
 
-    @abstractmethod
     def sm_count(self, gpu: dict) -> int:
-        """Return streaming multiprocessor count for a GPU view."""
+        return _sm_count(gpu)
 
-
-    @abstractmethod
     def compute_cap(self, gpu: dict) -> tuple[int, int]:
-        """Return (major, minor) compute capability."""
+        return _compute_cap(gpu)
 
-
-    @abstractmethod
     def approx_tdp(self, gpu: dict) -> float:
-        """Return approximate TDP in watts for power-aware ranking."""
+        return _approx_tdp(gpu)
 
-
-    @abstractmethod
     def mem_bandwidth(self, gpu: dict) -> float:
-        """Return approximate memory bandwidth proxy (higher = better)."""
-
+        return _mem_bandwidth(gpu)
 
     def filter_eligible(
         self,
@@ -59,7 +56,6 @@ class BaseGpuAllocator(ABC):
             eligible.append((gpu_key, gpu))
         return eligible
 
-
     def score(
         self,
         gpu_key: str,
@@ -70,12 +66,10 @@ class BaseGpuAllocator(ABC):
         """Return preference score (higher = better). Override in subclasses."""
         raise NotImplementedError
 
-
     @staticmethod
     def _is_unshared(gpu: dict) -> bool:
         """True when the GPU has no hive pending/active reservations."""
         return not gpu.get("pending") and not gpu.get("active")
-
 
     def select(
         self,
@@ -89,9 +83,13 @@ class BaseGpuAllocator(ABC):
         eligible = self.filter_eligible(gpu_map, min_vram_gb, hf_params, vllm_kwargs)
 
         def _rank(items: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+            # Freest available first, then policy score (SM/TDP/…).
             return sorted(
                 items,
-                key=lambda item: self.score(item[0], item[1], hf_params, vllm_kwargs),
+                key=lambda item: (
+                    float(item[1].get("available") or 0),
+                    self.score(item[0], item[1], hf_params, vllm_kwargs),
+                ),
                 reverse=True,
             )
 

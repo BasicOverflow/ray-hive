@@ -359,15 +359,35 @@ hive.deploy_model(
 
 ```python
 hive.shutdown("qwen")   # one model
-hive.shutdown()         # all models
+hive.shutdown()         # all *hive* models only (never serve.shutdown — Markets stays up)
+free = hive.free_gpus(min_free_gb=8.0)  # Alive + unshared, freest first
 ```
 
 ```python
 from ray_hive import kill_gpu_registry
-kill_gpu_registry()     # force registry rebuild (DaemonSet re-registers)
+kill_gpu_registry()     # explicit rebuild only — not part of normal shutdown
 ```
 
 See `examples/7_sleep_idle_timeout.py` and `examples/0_shutdown_models.py`.
+
+## Ops: GCS FT + home-media supervisor
+
+**GCS FT (Redis):** `manifests/ray-gcs-redis.yaml` + `gcsFaultToleranceOptions` on the RayCluster. After head failover, Serve controllers can revive on surviving workers. Hive’s in-memory `gpu_registry` does **not** survive GCS alone — the supervisor recreates it.
+
+```bash
+kubectl apply -f manifests/ray-gcs-redis.yaml
+# KubeRay ≥1.3 (repo pins operator v1.4.2)
+kubectl apply -f manifests/kuberay-operator.yaml
+kubectl apply -f manifests/raycluster.yaml
+```
+
+**Supervisor LXC (home-media):** CT `119` / `ray-hive-supervisor` @ `10.0.0.59` — Markets-style systemd loop (`deploy/install.sh`). Heals actors, waits for VRAM settle, reconciles ghosts, redeploys sticky models (`HIVE_SUPERVISOR_STATE`).
+
+```bash
+# as root on home-media (10.0.0.20)
+bash deploy/install.sh
+pct exec 119 -- journalctl -u ray-hive-supervisor -f
+```
 
 ## OpenAI HTTP
 
@@ -435,8 +455,9 @@ Markers: `ray` (cluster, no LLM), `live` (small-model cycles), `nightly` (stress
 
 ### Repository
 
-- `ray_hive/` — planner, registry, deployment service, router, client API
-- `manifests/` — KubeRay cluster, worker image, VRAM monitor
+- `ray_hive/` — planner, registry, deployment service, router, client API, supervisor
+- `deploy/` — home-media LXC install for the hive supervisor
+- `manifests/` — KubeRay cluster, GCS Redis FT, worker image, VRAM monitor
 - `examples/` — deploy/inference experiments (`.env` / `.env.example`)
 - `examples/requirements.txt` — example-only deps
 - `examples/media/` — multimodal fixtures

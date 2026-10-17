@@ -1,5 +1,9 @@
 """Shared test doubles and GPU map builders (no Ray / Hub)."""
-from ray_hive.core.gpu_alloc import BaseGpuAllocator
+from ray_hive.core.gpu_alloc import (
+    BaseGpuAllocator,
+    ConserveTdpAllocator,
+    PerformanceAllocator,
+)
 
 
 def make_gpu(
@@ -37,35 +41,10 @@ def make_gpu(
     }
 
 
-class FakeAllocator(BaseGpuAllocator):
-    """Concrete allocator reading hardware fields from gpu['specs']."""
-
-    def sm_count(self, gpu: dict) -> int:
-        return int(gpu["specs"]["multiprocessor_count"])
-
-
-    def compute_cap(self, gpu: dict) -> tuple[int, int]:
-        s = gpu["specs"]
-        return (int(s["compute_capability_major"]), int(s["compute_capability_minor"]))
-
-
-    def approx_tdp(self, gpu: dict) -> float:
-        return float(gpu["specs"].get("tdp", 300.0))
-
-
-    def mem_bandwidth(self, gpu: dict) -> float:
-        return float(gpu["specs"].get("memory_clock_rate_khz", 1000.0))
-
-
-class FakePerformanceAllocator(FakeAllocator):
-    def score(self, gpu_key, gpu, hf_params, vllm_kwargs):
-        return float(self.sm_count(gpu)) + 1e-6 * self.mem_bandwidth(gpu)
-
-
-class FakeConserveTdpAllocator(FakeAllocator):
-    def score(self, gpu_key, gpu, hf_params, vllm_kwargs):
-        tdp = max(self.approx_tdp(gpu), 1.0)
-        return -tdp + 1e-3 * self.sm_count(gpu)
+# Aliases — BaseGpuAllocator now carries hardware accessors; policies are real.
+FakeAllocator = BaseGpuAllocator
+FakePerformanceAllocator = PerformanceAllocator
+FakeConserveTdpAllocator = ConserveTdpAllocator
 
 
 TINY_HF_DENSE = {

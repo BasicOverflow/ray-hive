@@ -25,10 +25,12 @@ def _bare_router(names=("a",), max_seqs=(1,), **meta_extra):
     r._loads = {n: {"waiting": 0, "running": 0} for n in names}
     r._eng_start = 0
     r.model_id = "m"
+    r.model_name = "test-model"
     r.chat_template_kwargs = {}
     r.processor = None
     r.pooling = False
     r.multimodal = False
+    r._template_style = None
     return r
 
 

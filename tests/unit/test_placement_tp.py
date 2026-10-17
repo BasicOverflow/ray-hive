@@ -1,4 +1,6 @@
 """C — select_gpus / TP pin modes / shardability."""
+from unittest.mock import patch
+
 import pytest
 
 from ray_hive.core.ray_utils.placement import chunk_gpu_groups
@@ -103,3 +105,20 @@ def test_tp_shardable_heads():
     assert_tp_shardable(hf, 2)
     bad = {**hf, "num_attention_heads": 5}
     assert not tp_shardable(bad, 2)
+
+
+def test_auto_place_stays_tp1_when_freest_alive_fits(tiny_hf_dense):
+    """Ghost/busy same-node pair must not force TP=2 if a freest single GPU fits."""
+    gmap = {
+        "busy:gpu0": make_gpu("busy:gpu0", 2.0, 24, sm=200, active={"ghost": 8.0}),
+        "busy:gpu1": make_gpu("busy:gpu1", 2.0, 24, sm=200, active={"ghost": 8.0}),
+        "freest:gpu0": make_gpu("freest:gpu0", 23.0, 24, sm=50),
+    }
+    with patch("ray_hive.core.ray_utils.hardware.is_node_alive", return_value=True):
+        # FakePerformanceAllocator has no Alive filter; Ray allocators do.
+        # Exercise freest ranking + no false TP escalate on the pure path.
+        tp, gpus, _ = resolve_target_gpus(
+            gmap, 1, None, tiny_hf_dense, FakePerformanceAllocator, None, {},
+        )
+    assert tp == 1
+    assert gpus[0]["gpu_key"] == "freest:gpu0"

@@ -24,13 +24,6 @@ from .errors import (
     UnsupportedModeError,
     http_status_for,
 )
-from .inference import (
-    inference,
-    a_inference,
-    inference_batch,
-    a_inference_batch,
-    inference_stream,
-)
 
 __all__ = [
     "RayHive",
@@ -73,6 +66,14 @@ __all__ = [
 
 __version__ = "0.1.6"
 
+_INFERENCE = (
+    "inference",
+    "a_inference",
+    "inference_batch",
+    "a_inference_batch",
+    "inference_stream",
+)
+
 
 def __getattr__(name):
     if name == "RayHive":
@@ -81,10 +82,20 @@ def __getattr__(name):
     if name == "estimate_vram":
         from .core.model_specs.estimate import estimate_vram
         return estimate_vram
+    if name in _INFERENCE:
+        from . import inference as inf
+        return getattr(inf, name)
     if name in ("shutdown_all", "shutdown_model", "kill_gpu_registry"):
         from .core import ray_utils
         return getattr(ray_utils, name)
-    if name in ("DeployService", "get_deploy_service", "VRAMAllocator", "get_gpu_registry", "RayLLMActor", "ModelRouter"):
+    if name in (
+        "DeployService",
+        "get_deploy_service",
+        "VRAMAllocator",
+        "get_gpu_registry",
+        "RayLLMActor",
+        "ModelRouter",
+    ):
         from . import core
         return getattr(core, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

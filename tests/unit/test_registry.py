@@ -26,6 +26,21 @@ def test_double_book_fails(alloc):
     assert not alloc.reserve_replica("r2", "host-a:gpu0", 8.0)
 
 
+def test_reserve_replica_group_atomic(alloc):
+    alloc.update_gpu("host-a", 1, free_gb=10.0, total_gb=24.0)
+    assert alloc.reserve_replica_group("r-tp", {"host-a:gpu0": 6.0, "host-a:gpu1": 6.0})
+    assert alloc.get_gpu_vram("host-a:gpu0")["available"] == pytest.approx(4.0)
+    assert alloc.get_gpu_vram("host-a:gpu1")["available"] == pytest.approx(4.0)
+    # Second group needs 8+8 but only 4 available each — no partial pending left.
+    assert not alloc.reserve_replica_group("r2", {"host-a:gpu0": 8.0, "host-a:gpu1": 8.0})
+    assert "r2" not in alloc.get_gpu_vram("host-a:gpu0")["pending"]
+    assert "r2" not in alloc.get_gpu_vram("host-a:gpu1")["pending"]
+
+
+def test_reserve_replica_group_missing_gpu(alloc):
+    assert not alloc.reserve_replica_group("r1", {"missing:gpu0": 1.0})
+
+
 def test_reject_ray_hex_node_id(alloc):
     with pytest.raises(AssertionError):
         alloc.update_gpu("a" * 40, 0, 8.0, 24.0)

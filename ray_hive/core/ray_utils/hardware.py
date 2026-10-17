@@ -66,8 +66,11 @@ def compute_cap(gpu: dict) -> tuple[int, int]:
 
 
 def approx_tdp(gpu: dict) -> float:
-    """Return approximate TDP watts from GPU name (static map, longest key first)."""
-    name = str(gpu.get("specs", {}).get("name", "")).lower()
+    """Return approximate TDP watts (explicit specs.tdp, else name map, else 250)."""
+    specs = gpu.get("specs") or {}
+    if specs.get("tdp") is not None:
+        return float(specs["tdp"])
+    name = str(specs.get("name", "")).lower()
     for key, watts in sorted(_TDP_BY_NAME.items(), key=lambda kv: len(kv[0]), reverse=True):
         if key in name:
             return float(watts)

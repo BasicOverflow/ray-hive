@@ -50,6 +50,7 @@ def _registry_still_settling(exc: Exception) -> bool:
     return (
         "not in registry" in msg
         or "Known: []" in msg
+        or "No GPUs in registry" in msg
         # Fresh registry entries start at free=0; nvidia-smi also reads 0 while
         # a just-killed engine is still releasing CUDA memory.
         or "0.00GB available" in msg
@@ -172,6 +173,27 @@ class RayHive:
 
         replicas_info = _retry_if_registry_empty(_deploy)[model_id]
         ensure_openai_gateway()
+        # Sticky desired-state for supervisor revive (no-op unless HIVE_SUPERVISOR_STATE set).
+        try:
+            import os
+            if os.environ.get("HIVE_SUPERVISOR_STATE"):
+                from ray_hive.supervisor.desired_state import DesiredState, StickyModel
+
+                DesiredState().pin(
+                    StickyModel(
+                        model_id=model_id,
+                        model_name=model_name,
+                        max_input_prompt_length=max_input_prompt_length,
+                        max_output_prompt_length=max_output_prompt_length,
+                        replicas=replicas,
+                        gpu=gpu if isinstance(gpu, str) or gpu is None else list(gpu),
+                        idle_timeout=idle_timeout,
+                        sleep_timeout=sleep_timeout,
+                        vllm_kwargs=vllm_kwargs,
+                    )
+                )
+        except Exception:
+            pass
         return {
             "model_id": model_id,
             "status": "ready",
@@ -240,14 +262,56 @@ class RayHive:
 
 
     def shutdown(self, model_id: Optional[str] = None):
-        """Shutdown one model or all models (model_id=None)."""
+        """Shutdown one model or all hive models (model_id=None). Never kills Serve globally."""
         if model_id is None:
             shutdown_all()
         else:
             shutdown_model(model_id)
 
 
-    def get_vram_state(self) -> Dict:
-        """Return live VRAM state dict for all GPUs from the registry."""
+    def get_vram_state(self, wait: bool = True, timeout_s: float = 40.0) -> Dict:
+        """Return live VRAM state dict for all GPUs from the registry.
+
+        When wait=True (default), poll until the DaemonSet has reported at least
+        one GPU with free>0, or raise with an actionable timeout message.
+        """
         registry = get_gpu_registry()
-        return ray.get(registry.get_all_gpus.remote())
+        if not wait:
+            return ray.get(registry.get_all_gpus.remote())
+
+        deadline = time.time() + timeout_s
+        last: Dict = {}
+        while True:
+            last = ray.get(registry.get_all_gpus.remote())
+            if last and any(float(g.get("free") or 0) > 0 for g in last.values()):
+                return last
+            if time.time() >= deadline:
+                raise ConfigError(
+                    "VRAM registry empty or still at free=0 after "
+                    f"{timeout_s:.0f}s — check ray-vram-monitor DaemonSet, "
+                    f"RAY_HIVE_NAMESPACE, and NODE_NAME on GPU workers. "
+                    f"keys={list(last)}"
+                )
+            time.sleep(1.0)
+
+
+    def free_gpus(self, min_free_gb: float = 4.0, *, unshared_only: bool = True) -> List[str]:
+        """Alive GPUs with available >= min_free_gb, freest first (Lexis helper)."""
+        from ray_hive.core.ray_utils.hardware import is_node_alive
+
+        state = self.get_vram_state(wait=True)
+        rows = []
+        for key, gpu in state.items():
+            host = key.split(":")[0]
+            if not is_node_alive(host):
+                continue
+            avail = float(gpu.get("available") or 0)
+            if avail < min_free_gb:
+                continue
+            pending = gpu.get("pending") or {}
+            active = gpu.get("active") or {}
+            if unshared_only and (pending or active):
+                continue
+            rows.append((avail, key))
+        rows.sort(reverse=True)
+        return [k for _, k in rows]

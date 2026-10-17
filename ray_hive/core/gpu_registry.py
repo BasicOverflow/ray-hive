@@ -32,11 +32,6 @@ class ClusterStateManager(ABC):
         """Return live GPU state for all GPUs."""
 
 
-    def _live_free_vram_gb(self) -> dict[str, float]:
-        """Return per-GPU available VRAM from live registry state."""
-        return {gpu_key: gpu["available"] for gpu_key, gpu in self.get_all_gpus().items()}
-
-
     def _pending_covers_request(self, replica_gpu_vram_gb: dict[str, dict[str, float]]) -> bool:
         """True when every replica is already held in pending with enough VRAM."""
         for replica_id, gpu_vram_gb in replica_gpu_vram_gb.items():
@@ -52,15 +47,15 @@ class ClusterStateManager(ABC):
         if self._pending_covers_request(replica_gpu_vram_gb):
             return
 
-        requested_by_gpu = {}
+        requested_by_gpu: dict[str, float] = {}
         for gpu_vram_gb in replica_gpu_vram_gb.values():
             for gpu_key, vram_gb in gpu_vram_gb.items():
                 requested_by_gpu[gpu_key] = requested_by_gpu.get(gpu_key, 0.0) + vram_gb
 
-        live_free = self._live_free_vram_gb()
+        # available is free - pending; do not subtract used_vram again
+        live = self.get_all_gpus()
         for gpu_key, requested_gb in requested_by_gpu.items():
-            # available is free - pending; do not subtract used_vram again
-            available_gb = live_free.get(gpu_key, 0.0)
+            available_gb = (live.get(gpu_key) or {}).get("available", 0.0)
             if available_gb < requested_gb:
                 raise InsufficientVramError(
                     f"Not enough VRAM on {gpu_key} for deployment {deployment_id}: "
@@ -112,6 +107,11 @@ class ClusterStateManager(ABC):
     def get_deployment(self, deployment_id: str) -> dict | None:
         """Return deployment record or None."""
         return self.deployments.get(deployment_id)
+
+
+    def list_deployments(self) -> dict:
+        """Return a shallow copy of the deployment registry."""
+        return dict(self.deployments)
 
 
     def list_model_ids(self) -> list[str]:
@@ -186,14 +186,23 @@ class VRAMAllocator(ClusterStateManager):
         return view["available"] if view else 0.0
 
 
+    def reserve_replica_group(
+        self, replica_id: str, gpu_vram_gb: dict[str, float]
+    ) -> bool:
+        """Atomically reserve pending VRAM on every GPU in the group, or none."""
+        for gpu_key, vram_gb in gpu_vram_gb.items():
+            if gpu_key not in self.gpus:
+                return False
+            if self.get_available_vram(gpu_key) < vram_gb:
+                return False
+        for gpu_key, vram_gb in gpu_vram_gb.items():
+            self.gpus[gpu_key]["pending"][replica_id] = vram_gb
+        return True
+
+
     def reserve_replica(self, replica_id: str, gpu_key: str, vram_gb: float) -> bool:
         """Create a pending VRAM reservation for a replica before model load."""
-        if gpu_key not in self.gpus:
-            return False
-        if self.get_available_vram(gpu_key) < vram_gb:
-            return False
-        self.gpus[gpu_key]["pending"][replica_id] = vram_gb
-        return True
+        return self.reserve_replica_group(replica_id, {gpu_key: vram_gb})
 
 
     def mark_initialized(self, replica_id: str, gpu_key: str):
@@ -263,6 +272,43 @@ class VRAMAllocator(ClusterStateManager):
                 if rid in ids:
                     gpu["active"].pop(rid)
                     cleared += 1
+        return cleared
+
+
+    def reconcile_with_serve(self, serve_app_names: list[str]) -> int:
+        """Drop pending/active/deployments whose Serve apps are not live.
+
+        Replicas still referenced by a deployment whose router app is live are
+        protected (Serve status can briefly omit replica apps during sleep/wake).
+        """
+        live = set(serve_app_names)
+        protected: set[str] = set()
+        for dep_id, dep in self.deployments.items():
+            mid = dep.get("model_id") or dep_id
+            if dep_id in live or mid in live:
+                protected.add(dep_id)
+                protected.add(mid)
+                protected.update((dep.get("replicas") or {}).keys())
+        cleared = 0
+        for gpu in self.gpus.values():
+            for rid in list(gpu["pending"]):
+                if rid not in live and rid not in protected:
+                    gpu["pending"].pop(rid)
+                    cleared += 1
+            for rid in list(gpu["active"]):
+                if rid not in live and rid not in protected:
+                    gpu["active"].pop(rid)
+                    cleared += 1
+        for dep_id in list(self.deployments):
+            dep = self.deployments[dep_id]
+            mid = dep.get("model_id") or dep_id
+            if dep_id in live or mid in live:
+                continue
+            reps = set((dep.get("replicas") or {}).keys())
+            if reps & live:
+                continue
+            self.deployments.pop(dep_id)
+            cleared += 1
         return cleared
 
 

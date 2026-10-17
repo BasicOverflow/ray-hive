@@ -114,7 +114,7 @@ spec:
         tolerationSeconds: 30
       containers:
       - name: kuberay-operator
-        image: quay.io/kuberay/operator:v1.2.2
+        image: quay.io/kuberay/operator:v1.4.2
         imagePullPolicy: Always
         resources:
           requests:

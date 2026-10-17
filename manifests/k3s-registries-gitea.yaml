@@ -9,3 +9,5 @@ mirrors:
   "10.0.0.52:3000":
     endpoint:
       - "http://10.0.0.52:3000"
+    # Gitea is HTTP-only; without this, containerd falls back to https://10.0.0.52:3000/v2 and fails.
+    disableDefaultRegistryEndpoint: true

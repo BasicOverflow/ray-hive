@@ -48,20 +48,24 @@ def print_banner():
     console.print(Text(f"  ray-hive {__version__}", style="dim"))
 
 
+def _msg(style: str, msg: str):
+    console.print(f"[{style}]{msg}[/{style}]")
+
+
 def info(msg: str):
-    console.print(f"[cyan]{msg}[/cyan]")
+    _msg("cyan", msg)
 
 
 def warn(msg: str):
-    console.print(f"[yellow]{msg}[/yellow]")
+    _msg("yellow", msg)
 
 
 def error(msg: str):
-    console.print(f"[red]{msg}[/red]")
+    _msg("red", msg)
 
 
 def success(msg: str):
-    console.print(f"[green]{msg}[/green]")
+    _msg("green", msg)
 
 
 def print_panel(title: str, renderable: Any, style: str = "cyan"):

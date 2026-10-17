@@ -6,6 +6,15 @@ metadata:
 spec:
   rayVersion: "2.56.0"
   enableInTreeAutoscaling: false
+  # Redis-backed GCS FT: new head reloads Serve/controller state from Redis.
+  # Hive's in-memory gpu_registry still needs supervisor revive after head bounce.
+  gcsFaultToleranceOptions:
+    redisAddress: "ray-gcs-redis:6379"
+    redisPassword:
+      valueFrom:
+        secretKeyRef:
+          name: ray-gcs-redis-password
+          key: password
   headServiceAnnotations:
     metallb.universe.tf/loadBalancerIPs: "10.0.1.52"
   headGroupSpec:
@@ -206,7 +215,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2-0.1.7
           # IfNotPresent: Gitea package blobs can 404 while nodes still have the image cached.
           imagePullPolicy: IfNotPresent
           securityContext:
@@ -294,7 +303,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2-0.1.7
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
@@ -381,7 +390,7 @@ spec:
           emptyDir: {}
         containers:
         - name: ray-worker
-          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
+          image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2-0.1.7
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true

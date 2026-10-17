@@ -394,7 +394,11 @@ def test_live_resilience_registry_kill(hive, scheduler):
         wait_for_available(hive.get_vram_state, pin, 4.0, max_wait_s=180.0)
         kill_gpu_registry()
         # Fresh actor starts empty / free=0 until DaemonSet reports again.
-        wait_for_available(hive.get_vram_state, pin, 4.0, max_wait_s=180.0)
+        # Lexis path: get_vram_state(wait=True) / free_gpus settle without manual seed.
+        state = hive.get_vram_state(wait=True, timeout_s=180.0)
+        assert state and pin in state
+        free = hive.free_gpus(min_free_gb=4.0)
+        assert free, "free_gpus empty after registry settle"
         mid2 = uniq("i2")
         hive.deploy_model(
             model_id=mid2, model_name=TEXT_MODEL,
@@ -408,3 +412,64 @@ def test_live_resilience_registry_kill(hive, scheduler):
     finally:
         if claim is not None:
             scheduler.release(claim)
+
+
+def test_live_lexis_name_then_embed(hive, scheduler):
+    """Lexis Retail flow: sequential name then embed on freest GPUs (no dual-race)."""
+    name_id = uniq("lex-name")
+    embed_id = uniq("lex-embed")
+    claim_name = claim_embed = None
+    try:
+        claim_name = scheduler.claim(_fp8_need(min_free_gb=4.0, count=1, name="lex-name"))
+        pin_name = claim_name.gpu_keys[0]
+        status = hive.deploy_model(
+            model_id=name_id,
+            model_name=TEXT_MODEL,
+            max_input_prompt_length=256,
+            max_output_prompt_length=64,
+            replicas=1,
+            gpu=pin_name,
+            vllm_kwargs=VLLM_TEXT,
+        )
+        assert status["status"] == "ready"
+        # Tiny name model must stay TP=1 when pinned to one freest card.
+        rep = next(iter(status["replicas"].values()))
+        keys = rep.get("gpu_keys") or [rep.get("gpu_key")]
+        assert len(keys) == 1, f"expected TP=1, got {keys}"
+
+        claim_embed = scheduler.claim(
+            GpuNeed(min_free_gb=2.0, count=1, name="lex-embed")
+        )
+        pin_embed = claim_embed.gpu_keys[0]
+        estatus = hive.deploy_model(
+            model_id=embed_id,
+            model_name=EMBED_MODEL,
+            max_input_prompt_length=128,
+            max_output_prompt_length=0,
+            replicas=1,
+            gpu=pin_embed,
+            vllm_kwargs={"runner": "pooling", "trust_remote_code": True},
+        )
+        assert estatus["status"] == "ready"
+        assert _openai_chat(name_id, "Name me.")
+    except TimeoutError as e:
+        note_vram_skip(f"lexis name+embed: {e}")
+        pytest.skip(str(e))
+    finally:
+        hive.shutdown(embed_id)
+        hive.shutdown(name_id)
+        if claim_embed is not None:
+            scheduler.release(claim_embed)
+        if claim_name is not None:
+            scheduler.release(claim_name)
+
+
+def test_live_shutdown_leaves_foreign_serve(hive):
+    """hive.shutdown() must not call serve.shutdown (Markets coexistence)."""
+    from unittest.mock import patch
+    from ray import serve
+
+    with patch.object(serve, "shutdown") as shut:
+        # May no-op if no hive apps; still must never global-shutdown Serve.
+        hive.shutdown()
+        shut.assert_not_called()

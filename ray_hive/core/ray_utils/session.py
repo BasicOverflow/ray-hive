@@ -16,8 +16,7 @@ _WORKING_DIR = os.path.dirname(os.path.dirname(os.path.abspath(ray_hive.__file__
 
 # Must match manifests/Dockerfile.ray-vllm-worker. Serve ingress pickles FastAPI
 # internals (_DefaultLifespan); client/worker/replica skew → DEPLOY_FAILED.
-SERVE_FASTAPI_PIP = ("fastapi==0.133.0", "starlette==1.0.1")
-SERVE_FASTAPI_RUNTIME_ENV = {"pip": list(SERVE_FASTAPI_PIP)}
+SERVE_FASTAPI_RUNTIME_ENV = {"pip": ["fastapi==0.133.0", "starlette==1.0.1"]}
 
 
 class StderrFilter:

@@ -1,0 +1,100 @@
+# Standalone Redis for Ray GCS fault tolerance (KubeRay supports single replica only).
+# Apply before enabling gcsFaultToleranceOptions on the RayCluster.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ray-gcs-redis-password
+  namespace: ray-system
+type: Opaque
+stringData:
+  # Homelab-only; rotate if the cluster is exposed beyond the LAN.
+  password: "ray-hive-gcs-ft-redis"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-gcs-redis-config
+  namespace: ray-system
+data:
+  redis.conf: |
+    dir /data
+    port 6379
+    bind 0.0.0.0
+    appendonly yes
+    protected-mode no
+    requirepass ray-hive-gcs-ft-redis
+    pidfile /data/redis-6379.pid
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ray-gcs-redis-data
+  namespace: ray-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-gcs-redis
+  namespace: ray-system
+  labels:
+    app: ray-gcs-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ray-gcs-redis
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ray-gcs-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.4.0
+        command: ["sh", "-c", "redis-server /usr/local/etc/redis/redis.conf"]
+        ports:
+        - containerPort: 6379
+          name: redis
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        volumeMounts:
+        - name: config
+          mountPath: /usr/local/etc/redis/redis.conf
+          subPath: redis.conf
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: config
+        configMap:
+          name: ray-gcs-redis-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: ray-gcs-redis-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-gcs-redis
+  namespace: ray-system
+  labels:
+    app: ray-gcs-redis
+spec:
+  type: ClusterIP
+  selector:
+    app: ray-gcs-redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379

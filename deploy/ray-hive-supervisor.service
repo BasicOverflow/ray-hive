@@ -1,0 +1,23 @@
+[Unit]
+Description=ray-hive supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hive
+Group=hive
+WorkingDirectory=/opt/ray-hive
+EnvironmentFile=/etc/ray-hive.env
+Environment=PYTHONPATH=/opt/ray-hive
+Environment=HIVE_SUPERVISOR_STATE=/var/lib/ray-hive/state.db
+Environment=RAY_LOG_TO_DRIVER=0
+TasksMax=256
+MemoryMax=1G
+ExecStart=/opt/ray-hive/.venv/bin/python -m ray_hive.supervisor.main
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
