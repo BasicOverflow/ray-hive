@@ -33,6 +33,15 @@ spec:
       labels:
         app: ray-prometheus
     spec:
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
       containers:
         - name: prometheus
           image: prom/prometheus:v2.55.1

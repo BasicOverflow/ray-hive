@@ -16,6 +16,19 @@ spec:
       metrics-export-port: "8080"
     template:
       spec:
+        # Unpinned on purpose: when any Proxmox host dies, k8s can reschedule
+        # the single Ray head onto a surviving ergos node. Override the default
+        # 300s NotReady/unreachable toleration so failover is ~30s, not ~5m.
+        # This is cold restart (new session), not multi-head HA.
+        tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
         containers:
         - name: ray-head
           image: rayproject/ray:2.56.0-py312-cu125
@@ -32,9 +45,11 @@ spec:
           - containerPort: 8080
             name: metrics
           resources:
+            # Keep Ray num-cpus=2 above; low k8s requests so the head still
+            # packs onto a surviving node that already hosts a pinned worker.
             requests:
-              cpu: "2"
-              memory: "4Gi"
+              cpu: "500m"
+              memory: "2Gi"
             # No limits - allow head to use more if needed
           env:
           - name: RAY_DISABLE_IMPORT_WARNING
@@ -192,7 +207,8 @@ spec:
         containers:
         - name: ray-worker
           image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
-          imagePullPolicy: Always
+          # IfNotPresent: Gitea package blobs can 404 while nodes still have the image cached.
+          imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
           resources:
@@ -201,7 +217,7 @@ spec:
               memory: "8Gi"
               nvidia.com/gpu: "3"
             limits:
-              memory: "40Gi"
+              memory: "51Gi"
               nvidia.com/gpu: "3"
           volumeMounts:
           - name: dev
@@ -279,7 +295,7 @@ spec:
         containers:
         - name: ray-worker
           image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
           resources:
@@ -288,7 +304,7 @@ spec:
               memory: "8Gi"
               nvidia.com/gpu: "2"
             limits:
-              memory: "18Gi"
+              memory: "20Gi"
               nvidia.com/gpu: "2"
           volumeMounts:
           - name: dev
@@ -366,7 +382,7 @@ spec:
         containers:
         - name: ray-worker
           image: 10.0.0.52:3000/peter/ray-vllm-worker:2.56.0-vllm028-ocr2
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
           resources:
@@ -375,7 +391,7 @@ spec:
               memory: "8Gi"
               nvidia.com/gpu: "1"
             limits:
-              memory: "32Gi"
+              memory: "36Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
           - name: dev

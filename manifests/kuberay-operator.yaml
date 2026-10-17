@@ -101,6 +101,17 @@ spec:
         app.kubernetes.io/component: operator
     spec:
       serviceAccountName: kuberay-operator
+      # Must leave a dead host quickly; without the operator, RayCluster
+      # cannot recreate the head on a surviving node.
+      tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
       containers:
       - name: kuberay-operator
         image: quay.io/kuberay/operator:v1.2.2
