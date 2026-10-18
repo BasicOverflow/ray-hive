@@ -1,0 +1,14 @@
+# Head + CPU worker image: stock Ray + ray-hive (jobs/meta system actors).
+# GPU workers use Dockerfile.ray-vllm-worker (vLLM + hive).
+#
+#   IMG=10.0.0.52:3000/peter/ray-cpu-hive:2.56.0-0.2.1
+#   docker build -f manifests/Dockerfile.ray-cpu-hive -t "$IMG" .
+#   docker push "$IMG"
+
+FROM rayproject/ray:2.56.0-py312-cu125
+
+USER root
+COPY dist/ray_hive-*.whl /tmp/
+USER ray
+RUN pip install --no-cache-dir --no-deps /tmp/ray_hive-*.whl \
+    && python -c "from importlib.metadata import version; assert version('ray-hive') == '0.2.1'; from ray_hive.cluster.registry import ClusterRegistry"

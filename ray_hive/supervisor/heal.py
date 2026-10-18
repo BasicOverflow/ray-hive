@@ -181,14 +181,16 @@ def redeploy_sticky(state: DesiredState, *, cool_down_ok: bool) -> list[str]:
 
 
 def heal_once(state: DesiredState, *, attempt_serve: bool) -> None:
+    # Jobs/meta path must succeed; vLLM actors are best-effort (optional [vllm]).
     ensure_system_actors()
     sync_meta_from_cluster(state)
     try:
         ensure_actors()
         wait_vram_settled()
         reconcile_registry()
-    except Exception:
-        logger.warning("vLLM heal path skipped", exc_info=True)
+    except Exception as exc:
+        # Ray Client often surfaces stale handles after reconnect; next loop retries.
+        logger.warning("vLLM heal path skipped (%s)", exc, exc_info=True)
     if attempt_serve:
         try:
             serve.start(

@@ -214,12 +214,16 @@ def get_cluster_registry(*, create: bool = True) -> Any:
     except ValueError:
         if not create:
             raise
+        from ray_hive.cluster.actor_env import system_actor_runtime_env
+
         return ClusterRegistry.options(
             name=REGISTRY_ACTOR,
             namespace=SYSTEM_NAMESPACE,
             lifetime="detached",
             max_restarts=-1,
             max_concurrency=1,
+            num_cpus=0.01,
+            runtime_env=system_actor_runtime_env(),
         ).remote()
 
 

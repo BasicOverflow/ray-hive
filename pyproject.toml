@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ray-hive"
-version = "0.2.0"
+version = "0.2.1"
 description = "Ray cluster jobs primitives, optional vLLM Serve, and optional Train for shared GPU/CPU clusters"
 readme = "README.md"
 requires-python = ">=3.8"
