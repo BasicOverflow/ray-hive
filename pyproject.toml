@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ray-hive"
-version = "0.1.7"
-description = "Distributed LLM serving engine for Ray clusters"
+version = "0.2.0"
+description = "Ray cluster jobs primitives, optional vLLM Serve, and optional Train for shared GPU/CPU clusters"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"},
 ]
-keywords = ["ray", "vllm", "gpu", "vram", "llm", "serving"]
+keywords = ["ray", "vllm", "gpu", "vram", "llm", "serving", "jobs", "cron"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -25,20 +25,32 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
+# Lean core: jobs + cluster + meta-supervisor. Install [vllm] / [train] for those paths.
 dependencies = [
     "python-dotenv>=1.0.0",
-    "ray[serve]==2.56.0",
-    "vllm",
+    "ray[default]==2.56.0",
     "pydantic>=2.0.0",
-    "torch>=2.0.0",
-    "transformers",
     "rich",
-    # Pin with cluster worker image — Serve ingress pickles FastAPI internals.
-    "fastapi==0.133.0",
-    "starlette==1.0.1",
 ]
 
 [project.optional-dependencies]
+jobs = []  # included in core; extras name for docs / pip install ray-hive[jobs]
+vllm = [
+    "ray[serve]==2.56.0",
+    "vllm",
+    "torch>=2.0.0",
+    "transformers",
+    "fastapi==0.133.0",
+    "starlette==1.0.1",
+]
+train = [
+    "ray[train]==2.56.0",
+    "torch>=2.0.0",
+    "transformers",
+]
+all = [
+    "ray-hive[vllm,train]",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
@@ -46,6 +58,7 @@ dev = [
     "httpx>=0.27.0",
     "black>=23.0.0",
     "flake8>=6.0.0",
+    "yfinance>=0.2.40",
 ]
 
 [tool.setuptools.packages.find]
@@ -64,6 +77,8 @@ markers = [
     "ray: needs live Ray cluster (no LLM)",
     "live: needs Ray + GPUs + model download",
     "nightly: long stress / full MM",
+    "chaos: power-cycle Ray VMs; manual/homelab only",
+    "markets_shaped: real YF/FRED slices against live cluster",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

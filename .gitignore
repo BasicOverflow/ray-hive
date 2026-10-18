@@ -63,3 +63,4 @@ htmlcov/
 # Local test files
 test/
 tmp/
+tests/.chaos_state/

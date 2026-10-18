@@ -15,6 +15,7 @@ from .core.model_specs.attention import BaseAttentionSpecs
 from .core.model_specs.estimate import load_hf_config_dict
 from .core.model_specs.planner import normalize_hf_config
 from .core.model_specs.vram_reqs import BaseVramReqs
+from .cluster.banner import print_hive_banner
 from .core.ray_utils import init_ray, shutdown_all, shutdown_model, suppress_ray_warnings
 from .core.ray_utils.display import (
     print_banner,
@@ -83,6 +84,7 @@ class RayHive:
         """
         if show_banner:
             print_banner()
+        print_hive_banner()
         warn(
             "WARNING: vLLM has model-family usage guides — check them before deploy "
             "so you pass the right HF config / vllm kwargs (quantization, rope, etc.). "

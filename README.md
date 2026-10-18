@@ -1,467 +1,225 @@
-# Ray Hive
+# ray-hive
 
-Ray Hive is a small control layer for running a heterogeneous Ray cluster on k3s and placing vLLM model replicas according to live GPU memory.
-
-The cluster remains a normal Ray cluster: CPU workers can run general distributed tasks while GPU workers host model deployments through Ray Serve.
-
-## Contents
-
-- [Architecture](#architecture)
-- [Capabilities](#capabilities)
-- [Quick start](#quick-start)
-- [Placement](#placement)
-- [Allocation policies](#allocation-policies)
-- [Custom attention](#custom-attention)
-- [Multimodal and context](#multimodal-and-context)
-- [Embeddings](#embeddings)
-- [Lifecycle](#lifecycle)
-- [OpenAI HTTP](#openai-http)
-- [General Ray CPU Tasks](#general-ray-cpu-tasks)
-
-## Architecture
+Shared-cluster toolkit for Ray: **job primitives** (IO/CPU fan-out, gates, durable queues, cron board), optional **vLLM Serve**, optional **Train** for custom PyTorch/HF. One install, extras for heavy deps.
 
 ```text
-Clients
-  └─ Ray head
-      ├─ CPU workers → general Ray tasks
-      └─ GPU workers → vLLM replicas
-           ├─ VRAM monitor DaemonSet
-           ├─ shared GPU registry
-           └─ Ray Serve model routers
+pip install "ray-hive[jobs]"          # core (already in base)
+pip install "ray-hive[vllm]"          # Serve + vLLM path
+pip install "ray-hive[train]"         # Ray Train / custom infer
+pip install "ray-hive[all]"           # vllm + train
 ```
 
-KubeRay manages the head and worker pods. Ray handles task scheduling and Serve deployments; Ray Hive adds model planning, per-GPU placement, memory reservations, and routing.
+```mermaid
+flowchart TB
+  subgraph projects [Your project supervisors]
+    M[lexis-markets]
+    R[lexis-retail]
+  end
+  subgraph meta [ray-hive meta-supervisor]
+    Board[cron board]
+    Reg[ClusterRegistry]
+  end
+  subgraph lib [ray_hive]
+    Jobs[jobs]
+    Vllm[vllm Serve]
+    Train[train]
+  end
+  M --> Jobs
+  M --> meta
+  R --> Vllm
+  Jobs --> Reg
+  Vllm --> Reg
+```
 
-## Capabilities
+On connect you get one stdout line: `ray-hive <ver> — https://github.com/BasicOverflow/ray-hive`.
 
-- **Throughput-first planning** — max practical `max_num_seqs` / batched tokens within a VRAM budget (`gpu_budget_frac` 0.95). With `max_input_prompt_length="auto"` + fixed `max_num_seqs`, grow text context (floor 256) instead. At `max_num_seqs=1`, auto may shrink below 256 so weights + speculative draft still fit. Hybrid GDN/Mamba models cap auto input at 32768 so leftover VRAM is not spent on an unbounded attention window.
-- **Heterogeneous replicas** — per-GPU plans so different cards each contribute what they can.
-- **Least-loaded routing** — relative to each replica’s planned capacity.
-- **Live VRAM scheduling** — registry + reservations; see `examples/4_test_allocation_policies.py`.
-- **GPU sharing** — co-locate when needed; intentional share via same `gpu=` pin (`examples/6_shared_gpu.py`).
-- **Flexible placement** — pin, N replicas, or `replicas=-1` (`examples/1_test_model_configs.py`).
-- **Flagship deploy reference** — Qwen3.8-27B + Nemotron 3.5 Lightning variants (`examples/15_flagship_models.py`).
-- **Same-node TP** — auto escalate or pin a GPU list (`examples/5_tensor_parallel.py`).
-- **Custom attention** — subclass using HF config fields (`examples/3_custom_attention.py`).
-- **Multimodal generate** — image / video / audio (`examples/8`–`9`, `12`–`14`).
-- **Embeddings** — `runner="pooling"` (`examples/10`–`11`).
-- **Sleep / idle** — level-1 sleep then optional self-destroy (`examples/7_sleep_idle_timeout.py`).
-- **OpenAI HTTP** — per-model routes + cluster `/v1` gateway (`examples/2_test_inference.py`).
-- **General Ray tasks** — same cluster for CPU work.
+---
 
-**Out of scope:** precomputed multimodal embeds as *input* (`enable_mm_embeds`).
+## Jobs primitives
 
-## Quick start
+### ProjectContext + ClusterRegistry
 
-Dry-run packing against live GPUs (same plan deploy would use):
+Claim Serve routes, model ids, cron ids so projects do not collide on a shared cluster.
+
+```python
+from ray_hive.cluster import ProjectContext, init_ray_for_project
+
+ctx = ProjectContext(
+    project_id="lexis-markets",
+    namespace="lexis-markets",
+    serve_route_prefix="/markets",
+)
+init_ray_for_project("ray://10.0.1.52:10001", ctx)
+```
+
+Gotcha: claims live in namespace `ray_hive_system`. Miss heartbeats long enough and the meta-supervisor GC releases them.
+
+### Envelopes (`io_remote` / `cpu_remote` / `ops_remote`)
+
+```python
+from ray_hive.jobs import io_remote, cpu_remote
+
+@io_remote()
+def fetch_chunk(urls: list[str]) -> list:
+    ...
+
+@cpu_remote(num_cpus=-1)  # -1 → AdmissionBroker suggests
+def stitch(batch: list) -> list:
+    ...
+```
+
+Workload envelopes always set `label_selector` so tasks stay off the head and off vram-monitor pods. There is no opt-out. Use `ops_remote` for head-pinned ops (Serve restart, disk prune).
+
+### BatchFanout + AdmissionBroker
+
+```python
+from ray_hive.jobs import BatchFanout, TaskShape
+
+fan = BatchFanout()
+shape = TaskShape(batch_size=32, max_ceiling=64, cpus_per_task=0.001)
+fan.run("ingest", items, lambda batch: fetch_chunk.remote(batch), shape)
+```
+
+In-flight width comes from live Ray CPU/RAM headroom, not a fixed `MAX_TASKS`. `max_ceiling` / `max_in_flight` are safety rails.
+
+### RateGate
+
+```python
+from ray_hive.jobs import get_or_create_rate_gate
+import ray
+
+gate = get_or_create_rate_gate("yf-gate", namespace="lexis-markets", min_interval=2.5)
+ray.get(gate.acquire.remote())
+# call external API
+ray.get(gate.record_success.remote())
+```
+
+### DurableJobQueue
+
+```python
+from ray_hive.jobs import DurableJobQueue
+
+q = DurableJobQueue("/var/lib/myapp/queue.db")
+q.enqueue("eod", {"day": "2024-06-01"})
+job = q.claim_next(["eod"])
+# ... work ...
+q.complete(job["id"])
+```
+
+Works while Ray is down. Stale `running` rows requeue after `stale_running_s`.
+
+### CronSchedule + cron board
+
+```python
+from ray_hive.jobs import CronSchedule, get_cron_board
+import ray
+
+CronSchedule("markets-eod", "lexis-markets", "16:05", load_class="io")
+board = get_cron_board()
+print(ray.get(board.list_entries.remote()))  # next_fire / load_class for all projects
+```
+
+Project supervisors still fire the work; the meta board is the cluster utilization calendar.
+
+### JobProgress
+
+```python
+from ray_hive.jobs import JobProgress
+
+prog = JobProgress("/var/lib/myapp/progress.db", "embed-v1")
+todo = prog.pending(all_ids)
+for i in todo:
+    ...
+    prog.mark_done(i)
+```
+
+### ScratchShardStore / ServeAppHeal / NodeBroadcast / MapShuffleReduce
+
+See `ray_hive/jobs/` — local scratch generations, Serve deploy cool-down with route claim, one ops task per node, map→shuffle→reduce helper. Request coalescing (identical in-flight HTTP→remote) stays in your app, not in hive.
+
+---
+
+## Meta-supervisor
+
+LXC/systemd entry: `python -m ray_hive.supervisor.main`.
+
+Keeps ClusterRegistry + AdmissionBroker + cron board warm, GC’s dead projects, redeploys sticky **vLLM** models when claimed. It does **not** replace Markets/Retail supervisors — those register into it and own domain queues.
+
+State file: `HIVE_SUPERVISOR_STATE` (SQLite): sticky models, projects, cron_board mirror, queues, trains, claims.
+
+---
+
+## vLLM Serve (optional `[vllm]`)
+
+Same client as before:
 
 ```python
 from ray_hive import RayHive
 
-hive = RayHive(address="ray://YOUR_RAY_HEAD_IP:10001")
-plan = hive.estimate_vram(
-    "Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length=1024,
-    max_output_prompt_length=2048,
+hive = RayHive("ray://10.0.1.52:10001")
+hive.deploy_model(
+    model_id="demo",
+    model_name="Qwen/Qwen3-0.6B",
+    max_input_prompt_length=2048,
+    max_output_prompt_length=256,
     replicas=1,
-    vllm_kwargs={
-        "trust_remote_code": True,
-        "reasoning_parser": "qwen3",
-        "default_chat_template_kwargs": {"enable_thinking": False},
-    },
+    vllm_kwargs={},
 )
 ```
 
-```text
-Deployment Plan: Qwen/Qwen3-0.6B-FP8
-  Replica                  replica-0
-  GPU(s)                   host-a:gpu0
-  tensor_parallel_size     1
-  max_input_prompt_length  1024
-  max_output_prompt_length 2048
-  max_model_len            3072
-  max_num_seqs             48
-  max_num_batched_tokens   8192
-  gpu_memory_utilization   0.850
-  Weights                  0.60 GiB
-  KV cache                 4.20 GiB
-  Activations              0.40 GiB
-  Overhead                 0.30 GiB
-  Total (per GPU)          5.50 GiB
+Details: [Placement](#placement), [Allocation policies](#allocation-policies), [Lifecycle](#lifecycle), [OpenAI HTTP](#openai-http), examples under `examples/`.
+
+```mermaid
+flowchart LR
+  Client --> DeployService
+  DeployService --> Registry[gpu_registry]
+  DeployService --> Serve[Ray Serve replicas]
+  Registry --> DaemonSet[VRAM monitor]
 ```
 
-Deploy until ready (router up + warmed):
+---
+
+## Train / custom infer (optional `[train]`)
+
+Sibling to vLLM — your `nn.Module` / HF code, VRAM claims via the same registry.
 
 ```python
-status = hive.deploy_model(
-    model_id="qwen",
-    model_name="Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length=1024,
-    max_output_prompt_length=2048,
-    replicas=1,
-    vllm_kwargs={
-        "trust_remote_code": True,
-        "reasoning_parser": "qwen3",
-        "default_chat_template_kwargs": {"enable_thinking": False},
-    },
-)
+from ray_hive.train import TrainJob, gpu_remote
+
+@gpu_remote()
+def worker_step(batch):
+    ...
+
+job = TrainJob("run-1", "athena", train_fn=my_loop, num_workers=2)
+job.run()
 ```
 
-```text
-{"model_id": "qwen", "status": "ready", "route": "/qwen", "openai_v1": "/v1", "replicas": {...}}
-```
+`CustomInferService` claims a `model_id` then calls your deploy/shutdown callables.
 
-Generate text (batch and stream helpers available):
-
-```python
-from ray_hive.inference import inference, inference_batch, inference_stream
-
-answer = inference("Explain Ray in one sentence.", model_id="qwen")
-answers = inference_batch(["Prompt one", "Prompt two"], model_id="qwen")
-for delta in inference_stream("Count to three.", model_id="qwen"):
-    print(delta, end="")
-```
-
-```text
-Ray is a distributed computing framework for scaling Python workloads.
-```
-
-Structured output:
-
-```python
-from pydantic import BaseModel
-
-class Answer(BaseModel):
-    summary: str
-    confidence: float
-
-result = inference("Summarize Ray.", model_id="qwen", structured_output=Answer)
-```
-
-Inside an asyncio loop use `a_inference` / `a_inference_batch` instead of the sync helpers.
+---
 
 ## Placement
 
-- `gpu="host:gpu0"` — one replica on one GPU.
-- `gpu=[a,b,...]` + `replicas=len(list)` — N single-GPU pins (TP=1 each).
-- `gpu=[a,b,...]` + `replicas=1` — one same-node TP group.
-- `gpu=None` — auto place (single GPU via `allocation_cls`, default `RayPerformanceAllocator`; else same-node TP).
-- `replicas=-1` — every eligible GPU / TP group.
-
-### Auto input length
-
-By default context lengths are a fixed contract and omitted `max_num_seqs` is packed to fill VRAM.
-
-`max_input_prompt_length="auto"` does the inverse for **text input only**: you must pass `max_num_seqs` in `vllm_kwargs`, output length stays fixed, and the planner grows text input from a floor of **256** until the VRAM budget is filled (capped by HF `max_position_embeddings` / `model_max_length` when present). When `max_num_seqs=1` and even 256 does not leave KV room after weights + speculative draft, auto shrinks toward 1 token. Multimodal placeholder tokens are still added on top of the chosen text length, so `max_model_len` always covers MM + output.
-
-`speculative_config` is part of the memory plan: in-checkpoint MTP reserves an extra compute-dtype `lm_head` (and `num_nextn_predict_layers` when set); a separate draft `model` adds that checkpoint’s weights and KV.
-
-```python
-hive.estimate_vram(
-    "Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length="auto",
-    max_output_prompt_length=512,
-    replicas=1,
-    vllm_kwargs={
-        "max_num_seqs": 8,
-        "trust_remote_code": True,
-        "reasoning_parser": "qwen3",
-        "default_chat_template_kwargs": {"enable_thinking": False},
-    },
-)
-```
-
-```text
-  max_input_prompt_length  8192 (auto)
-  max_output_prompt_length 512
-  max_model_len            8704
-  max_num_seqs             8
-```
-
-Passing `"auto"` without `max_num_seqs` raises `ConfigError`.
-
-Pin one GPU:
-
-```python
-hive.deploy_model(
-    model_id="qwen-pin",
-    model_name="Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length=512,
-    max_output_prompt_length=512,
-    replicas=1,
-    gpu="ergos-06-nv:gpu0",
-    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
-                 "default_chat_template_kwargs": {"enable_thinking": False}},
-)
-```
-
-All eligible GPUs:
-
-```python
-hive.deploy_model(
-    model_id="qwen-all",
-    model_name="Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length=512,
-    max_output_prompt_length=512,
-    replicas=-1,
-    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
-                 "default_chat_template_kwargs": {"enable_thinking": False}},
-)
-```
-
-Same-node TP=2 pin:
-
-```python
-hive.deploy_model(
-    model_id="qwen-tp",
-    model_name="Qwen/Qwen3-8B-FP8",
-    max_input_prompt_length=512,
-    max_output_prompt_length=512,
-    replicas=1,
-    gpu=["ergos-02-nv:gpu1", "ergos-02-nv:gpu2"],
-    vllm_kwargs={"trust_remote_code": True, "reasoning_parser": "qwen3",
-                 "default_chat_template_kwargs": {"enable_thinking": False}},
-)
-```
-
-Live registry snapshot: `hive.get_vram_state()`. Policies: [Allocation policies](#allocation-policies).
+Throughput-first planning, heterogeneous replicas, least-loaded routing, live VRAM scheduling, GPU sharing, TP, sleep/idle — see `examples/1_test_model_configs.py`, `4_test_allocation_policies.py`, `5_tensor_parallel.py`, `7_sleep_idle_timeout.py`.
 
 ## Allocation policies
 
-When `gpu=` is unset, `allocation_cls` picks GPUs (`ray_hive.core.ray_gpu_alloc`). Pins skip policy ranking but still check VRAM fit and arch taints. Default: `RayPerformanceAllocator`.
+`PerformanceAllocator` / `ConserveTdpAllocator` in `ray_hive.core.gpu_alloc.policies`. Pass `allocation_cls=` to `deploy_model`.
 
-- `RayPerformanceAllocator` — rank by compute (SM count, light bandwidth tie-break); top-N.
-- `RayConserveTdpAllocator` — prefer lower approx TDP; SM count tie-break.
-- `RayTensorParallelAllocator` — same-node packs of size `tensor_parallel_size`; auto when single-GPU fails.
+## Custom attention / multimodal / embeddings
 
-**Arch taint:** native FP8 (HF / vLLM dtype / kv / quantization mentioning fp8 / float8 / float-quantized) needs compute capability ≥ 8.9 (Ada+); Ampere dropped automatically.
-
-TP=1 policies prefer unshared GPUs first, then co-locate. Alive Ray nodes only. See `examples/4_test_allocation_policies.py` and `examples/5_tensor_parallel.py`.
-
-## Custom attention
-
-VRAM planning sizes the KV cache through an attention-specs class. By default that is `BaseAttentionSpecs` (or `MultimodalAttentionSpecs` for multimodal models). Pass a subclass via `attention_cls` on `estimate_vram` / `deploy_model`.
-
-The class sees the same HF config fields the planner already loads. Override properties or methods that use those fields when the default transformer KV math does not match the model (e.g. heads, sliding windows, extra tokens).
-
-```python
-from ray_hive.core.model_specs import BaseAttentionSpecs
-
-class MyAttention(BaseAttentionSpecs):
-    @property
-    def kv_heads(self) -> int:
-        return self.hf_params["num_key_value_heads"]  # from HF config
-
-hive.deploy_model(
-    ...,
-    attention_cls=MyAttention,
-)
-```
-
-See `examples/3_custom_attention.py` (and `examples/14_gemma4_stress.py` for multimodal).
-
-## Multimodal and context
-
-**Text-only models** — pass a string (or text chat messages). No `limit_mm_per_prompt`.
-
-**MM models** — planner uses `limit_mm_per_prompt` in `vllm_kwargs` to size worst-case image / video / audio placeholders. If omitted on an MM HF config, defaults are derived from `vision_config` / `audio_config` (typically `image: 1` and/or `audio: 1`). Set counts explicitly to enable or disable modalities.
-
-**Token budget** — `max_input_prompt_length` is the **text** side only. Effective input ≈ text + MM placeholders; `max_model_len ≈ effective_input + max_output_prompt_length` (use output `0` for pooling). If that cannot cover placeholders + output, planning raises `MmContextError` — raise `max_input_prompt_length` or lower `limit_mm_per_prompt`. With `max_input_prompt_length="auto"` (requires `max_num_seqs`), text grows from 256 (or shrinks below that at `max_num_seqs=1`) while MM placeholders stay reserved inside `max_model_len`.
-
-**Requests vs planning** — on an MM deploy you can still send text-only strings. That does **not** shrink the VRAM plan. For text-only *planning* on an MM checkpoint, zero unused modalities (`{"image": 0, "video": 0, "audio": 0}`).
-
-Enable image chat:
-
-```python
-from ray_hive.core.ray_utils import file_to_data_url
-from ray_hive.inference import inference
-
-hive.deploy_model(
-    model_id="vl",
-    model_name="Qwen/Qwen2.5-VL-3B-Instruct",
-    max_input_prompt_length=2048,   # text tokens you expect
-    max_output_prompt_length=256,
-    replicas=1,
-    vllm_kwargs={
-        "trust_remote_code": True,
-        "limit_mm_per_prompt": {"image": 1},
-    },
-)
-
-messages = [{
-    "role": "user",
-    "content": [
-        {"type": "image_url", "image_url": {"url": file_to_data_url("photo.png")}},
-        {"type": "text", "text": "Describe this image."},
-    ],
-}]
-answer = inference(messages, model_id="vl", max_tokens=64)
-# text-only request on the same deploy still works:
-inference("Say hello.", model_id="vl", max_tokens=32)
-```
-
-```text
-# estimate_vram on MM models also shows:
-  mm_tokens_per_prompt     1280
-```
-
-Content part types: `text`, `image_url`, `video_url` / `video`, `audio_url` / `input_audio`. Fixtures: `examples/media/`. Demos: `examples/8_multimodal_vision.py`, `9_multimodal_audio.py`, `12_multimodal_video.py`, `13_gemma4_multimodal.py`, `14_gemma4_stress.py`.
-
-## Embeddings
-
-Set `runner="pooling"` (legacy `task="embed"` still works). Use `max_output_prompt_length=0`. `inference` returns a vector (or list of vectors for batch).
-
-```python
-hive.deploy_model(
-    model_id="embed",
-    model_name="BAAI/bge-small-en-v1.5",
-    max_input_prompt_length=512,
-    max_output_prompt_length=0,
-    replicas=1,
-    vllm_kwargs={"runner": "pooling", "trust_remote_code": True},
-)
-vec = inference("hello", model_id="embed")
-```
-
-```text
-[-0.012, 0.034, ...]   # length = model hidden size
-```
-
-```bash
-curl http://YOUR_RAY_HEAD_IP:8000/embed/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{"model":"embed","input":["hello world"]}'
-```
-
-See `examples/10_text_embeddings.py` and `examples/11_multimodal_embeddings.py`.
+Subclass attention specs (`examples/3_custom_attention.py`). MM generate and pooling runners: `examples/8`–`14`, `10`–`11`.
 
 ## Lifecycle
 
-Sleep after quiet, then optional full destroy (`idle_timeout` must be greater than `sleep_timeout` when both are set). While sleeping, the running footprint stays reserved so other deploys cannot take the space a wake needs. That reservation is one copy of the weights plus the planned KV cache. Pass `sleep_peak_factor` in `vllm_kwargs` only if you need an extra weight-sized hold:
-
-```python
-hive.deploy_model(
-    model_id="qwen",
-    model_name="Qwen/Qwen3-0.6B-FP8",
-    max_input_prompt_length=512,
-    max_output_prompt_length=256,
-    replicas=1,
-    sleep_timeout=60,
-    idle_timeout=300,
-    vllm_kwargs={
-        "trust_remote_code": True,
-        "reasoning_parser": "qwen3",
-        "default_chat_template_kwargs": {"enable_thinking": False},
-        # "sleep_peak_factor": 1.0,  # optional extra weight-sized hold
-    },
-)
-```
-
-```python
-hive.shutdown("qwen")   # one model
-hive.shutdown()         # all *hive* models only (never serve.shutdown — Markets stays up)
-free = hive.free_gpus(min_free_gb=8.0)  # Alive + unshared, freest first
-```
-
-```python
-from ray_hive import kill_gpu_registry
-kill_gpu_registry()     # explicit rebuild only — not part of normal shutdown
-```
-
-See `examples/7_sleep_idle_timeout.py` and `examples/0_shutdown_models.py`.
-
-## Ops: GCS FT + home-media supervisor
-
-**GCS FT (Redis):** `manifests/ray-gcs-redis.yaml` + `gcsFaultToleranceOptions` on the RayCluster. After head failover, Serve controllers can revive on surviving workers. Hive’s in-memory `gpu_registry` does **not** survive GCS alone — the supervisor recreates it.
-
-```bash
-kubectl apply -f manifests/ray-gcs-redis.yaml
-# KubeRay ≥1.3 (repo pins operator v1.4.2)
-kubectl apply -f manifests/kuberay-operator.yaml
-kubectl apply -f manifests/raycluster.yaml
-```
-
-**Supervisor LXC (home-media):** CT `119` / `ray-hive-supervisor` @ `10.0.0.59` — Markets-style systemd loop (`deploy/install.sh`). Heals actors, waits for VRAM settle, reconciles ghosts, redeploys sticky models (`HIVE_SUPERVISOR_STATE`).
-
-```bash
-# as root on home-media (10.0.0.20)
-bash deploy/install.sh
-pct exec 119 -- journalctl -u ray-hive-supervisor -f
-```
+Hive-scoped shutdown (does not `serve.shutdown()` the whole cluster). Sticky pin when `HIVE_SUPERVISOR_STATE` is set. GCS FT Redis: `manifests/ray-gcs-redis.yaml`.
 
 ## OpenAI HTTP
 
-Per-model route and cluster-wide `/v1` gateway (port `8000`). Gateway starts on `deploy_model`; for an already-running cluster call `hive.ensure_openai_api()`.
+Per-model routes + `/v1` gateway — `examples/2_test_inference.py`.
 
-```bash
-curl http://YOUR_RAY_HEAD_IP:8000/qwen/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"Explain Ray briefly."}]}'
+## Ops
 
-# Open WebUI: API URL = http://YOUR_RAY_HEAD_IP:8000/v1
-curl http://YOUR_RAY_HEAD_IP:8000/v1/models
-curl http://YOUR_RAY_HEAD_IP:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"Explain Ray briefly."}]}'
-```
-
-Streaming, structured JSON, and LangChain: `examples/2_test_inference.py`.
-
-## General Ray CPU Tasks
-
-```python
-import ray
-
-ray.init(address="ray://YOUR_RAY_HEAD_IP:10001")
-
-@ray.remote
-def square(value):
-    return value * value
-
-results = ray.get([square.remote(value) for value in range(10)])
-```
-
-### Running tests
-
-```bash
-pip install -e ".[dev]"   # or: pip install -r requirements-dev.txt
-
-# Parallel unit suite (default; no Ray / no LLM — RAY_ADDRESS not required)
-pytest -n auto -m "not ray and not live"
-```
-
-**`ray` / `live` require `RAY_ADDRESS`.** Without it those tests skip. Set it in the shell before running (same value as `examples/.env`):
-
-```bash
-# Linux / macOS
-export RAY_ADDRESS=ray://YOUR_RAY_HEAD_IP:10001
-
-# PowerShell
-$env:RAY_ADDRESS = "ray://YOUR_RAY_HEAD_IP:10001"
-```
-
-Then (single process — do **not** use `pytest -n` here; live GPU claims must stay process-local):
-
-```bash
-pytest -m ray    # cluster smoke, no LLM
-pytest -m live   # Deploy A–H + auto-input + sleep-hold; needs GPUs + model download
-# Focused:
-#   pytest -m live -k "auto_input or sleep_vram_hold"
-# or both:
-pytest -m "ray or live"
-```
-
-Markers: `ray` (cluster, no LLM), `live` (small-model cycles), `nightly` (stress / resilience).
-
-### Repository
-
-- `ray_hive/` — planner, registry, deployment service, router, client API, supervisor
-- `deploy/` — home-media LXC install for the hive supervisor
-- `manifests/` — KubeRay cluster, GCS Redis FT, worker image, VRAM monitor
-- `examples/` — deploy/inference experiments (`.env` / `.env.example`)
-- `examples/requirements.txt` — example-only deps
-- `examples/media/` — multimodal fixtures
-- `tests/` — pytest unit (`unit/`), Ray smoke (`ray_smoke/`), live cycles (`live/`)
-- `basic_ray_tests/` — manual cluster / resource scripts
-
-Related: [rayify](https://github.com/BasicOverflow/rayify), a tool for converting scripts into Ray jobs.
+- Meta-supervisor CT: `deploy/` on home-media  
+- Worker image: `manifests/Dockerfile.ray-vllm-worker`  
+- Internals (admission, GC, chaos): Homelab `projects/ray-hive/`

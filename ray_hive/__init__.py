@@ -1,5 +1,5 @@
 """
-Ray Hive - Distributed LLM serving engine for Ray clusters.
+ray-hive — Ray jobs primitives, optional vLLM Serve, optional Train.
 """
 
 from .errors import (
@@ -64,7 +64,7 @@ __all__ = [
     "estimate_vram",
 ]
 
-__version__ = "0.1.6"
+__version__ = "0.2.0"
 
 _INFERENCE = (
     "inference",
