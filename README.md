@@ -2,7 +2,7 @@
 
 **ray-hive** is a shared-cluster toolkit for [Ray](https://www.ray.io/): it makes distributed Ray development simpler and more reliable by baking resilience into reusable primitives so each project ships less Ray glue and has a smoother path to production.
 
-You run one heterogeneous Ray cluster (CPU workers for jobs, GPU workers for models). Multiple apps (Markets, Retail, ad-hoc Serve deploys, Train runs) share that cluster without fighting over Serve routes, model ids, or cron windows. Hive owns the boring distributed concerns—placement envelopes, admission, durable queues, claim registry, Serve cool-down, VRAM-aware vLLM placement—so your project code stays domain-shaped.
+You run one heterogeneous Ray cluster (CPU workers for jobs, GPU workers for models). Multiple apps share that cluster — for example a **quotes-pipeline** (batch IO + Serve API), a **catalog-search** service (embeddings / retrieval), plus ad-hoc vLLM deploys and Train runs — without fighting over Serve routes, model ids, or cron windows. Hive owns the boring distributed concerns (placement envelopes, admission, durable queues, claim registry, Serve cool-down, VRAM-aware vLLM placement) so your project code stays domain-shaped.
 
 Install extras match how you use the cluster:
 
@@ -371,18 +371,18 @@ These are the building blocks for **non-LLM** Ray work (and for the CPU side of 
 ### ProjectContext + ClusterRegistry
 
 **What:** a named claim book for the whole cluster.  
-**Why:** two projects must not both own `/markets`, the same `model_id`, or the same cron id.  
+**Why:** two projects must not both own `/quotes`, the same `model_id`, or the same cron id.  
 **Where:** detached actor in namespace `ray_hive_system`.
 
 ```python
 from ray_hive.cluster import ProjectContext, init_ray_for_project
 
 ctx = ProjectContext(
-    project_id="lexis-markets",
-    namespace="lexis-markets",
-    serve_route_prefix="/markets",
+    project_id="quotes-pipeline",
+    namespace="quotes-pipeline",
+    serve_route_prefix="/quotes",
 )
-init_ray_for_project("ray://10.0.1.52:10001", ctx)
+init_ray_for_project("ray://YOUR_RAY_HEAD_IP:10001", ctx)
 ```
 
 Miss heartbeats long enough and the meta-supervisor GC marks the project dead and releases claims.
@@ -422,14 +422,18 @@ fan.run("ingest", items, lambda batch: fetch_chunk.remote(batch), shape)
 
 ### RateGate
 
-**What:** a named cluster actor that serializes / paces external API calls (yfinance, FRED, …).  
+**What:** a named cluster actor that serializes / paces external HTTP or vendor APIs.  
 **Why:** per-process sleeps do not coordinate across workers.
 
 ```python
 from ray_hive.jobs import get_or_create_rate_gate
 import ray
 
-gate = get_or_create_rate_gate("yf-gate", namespace="lexis-markets", min_interval=2.5)
+gate = get_or_create_rate_gate(
+    "vendor-http-gate",
+    namespace="quotes-pipeline",
+    min_interval=2.5,
+)
 ray.get(gate.acquire.remote())
 # call external API
 ray.get(gate.record_success.remote())
@@ -438,14 +442,14 @@ ray.get(gate.record_success.remote())
 ### DurableJobQueue
 
 **What:** SQLite-backed pending/running/done queue on the project supervisor host.  
-**Why:** Ray (and the whole k3s worker set) can be offline for hours; catch-up work must survive.
+**Why:** Ray (and the whole worker set) can be offline for hours; catch-up work must survive.
 
 ```python
 from ray_hive.jobs import DurableJobQueue
 
-q = DurableJobQueue("/var/lib/myapp/queue.db")
-q.enqueue("eod", {"day": "2024-06-01"})
-job = q.claim_next(["eod"])
+q = DurableJobQueue("/var/lib/quotes-pipeline/queue.db")
+q.enqueue("daily-bar-sync", {"day": "2024-06-01"})
+job = q.claim_next(["daily-bar-sync"])
 q.complete(job["id"])
 ```
 
@@ -460,12 +464,17 @@ Stale `running` rows requeue after `stale_running_s`.
 from ray_hive.jobs import CronSchedule, get_cron_board
 import ray
 
-CronSchedule("markets-eod", "lexis-markets", "16:05", load_class="io")
+CronSchedule(
+    "quotes-daily-bar-sync",
+    "quotes-pipeline",
+    "16:05",
+    load_class="io",
+)
 board = get_cron_board()
 print(ray.get(board.list_entries.remote()))
 ```
 
-Project supervisors still **fire** the work; the board is the calendar.
+Each project’s supervisor still **fires** the work; the board is the shared calendar.
 
 ### JobProgress
 
@@ -475,7 +484,7 @@ Project supervisors still **fire** the work; the board is the calendar.
 ```python
 from ray_hive.jobs import JobProgress
 
-prog = JobProgress("/var/lib/myapp/progress.db", "embed-v1")
+prog = JobProgress("/var/lib/catalog-search/progress.db", "embed-v1")
 todo = prog.pending(all_ids)
 for i in todo:
     ...
@@ -485,7 +494,7 @@ for i in todo:
 ### ScratchShardStore / ServeAppHeal / NodeBroadcast / MapShuffleReduce
 
 - **ScratchShardStore** — local scratch generations under a prefix; safe wipe of orphan trees.
-- **ServeAppHeal** — deploy/replace a Serve app with cool-down + route claim (so two projects do not stomp `/markets`).
+- **ServeAppHeal** — deploy/replace a Serve app with cool-down + route claim (so two projects do not stomp `/quotes`).
 - **NodeBroadcast** — one ops task per alive node (disk prune, cache flush).
 - **MapShuffleReduce** — small map→shuffle→reduce helper for CPU pipelines.
 
@@ -495,16 +504,15 @@ Request coalescing (identical in-flight HTTP→remote) stays in your app, not in
 
 ## Meta-supervisor
 
-LXC/systemd entry: `python -m ray_hive.supervisor.main` (`deploy/` on home-media).
+LXC/systemd entry: `python -m ray_hive.supervisor.main` (`deploy/`).
 
-Keeps **ClusterRegistry**, **AdmissionBroker**, and **cron board** warm, GCs dead projects, and redeploys sticky **vLLM** models when claimed. It does **not** replace Markets/Retail supervisors — those register into it and own domain queues / Serve apps.
+Keeps **ClusterRegistry**, **AdmissionBroker**, and **cron board** warm, GCs dead projects, and redeploys sticky **vLLM** models when claimed. It does **not** replace per-project supervisors (e.g. `quotes-pipeline` or `catalog-search`) — those register into it and own their domain queues / Serve apps.
 
 State file: `HIVE_SUPERVISOR_STATE` (SQLite): sticky models, projects, cron_board mirror, queues, trains, claims.
 
 ```bash
-# as root on home-media
 bash deploy/install.sh
-pct exec 119 -- journalctl -u ray-hive-supervisor -f
+# journalctl -u ray-hive-supervisor -f   # on the supervisor host
 ```
 
 Worker images must include `ray-hive` (CPU: `manifests/Dockerfile.ray-cpu-hive`; GPU: `Dockerfile.ray-vllm-worker`) so system actors created via Ray Client can import the package on the cluster.
@@ -522,7 +530,7 @@ from ray_hive.train import TrainJob, gpu_remote
 def worker_step(batch):
     ...
 
-job = TrainJob("run-1", "athena", train_fn=my_loop, num_workers=2)
+job = TrainJob("run-1", "gpu-rack-a", train_fn=my_loop, num_workers=2)
 job.run()
 ```
 
