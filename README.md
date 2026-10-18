@@ -22,7 +22,7 @@ On connect you get one stdout line: `ray-hive <ver> — https://github.com/Basic
 | **vLLM Serve** (`[vllm]`) | Live-VRAM planning, heterogeneous GPU placement, sleep/idle, OpenAI HTTP |
 | **Jobs primitives** (core) | IO/CPU envelopes, fan-out + admission, rate gates, durable queues, cron board |
 | **Train** (`[train]`) | Custom PyTorch/HF loops with the same GPU claim model |
-| **Meta-supervisor** | Cluster-wide claims, cron calendar, sticky model revive (LXC on home-media) |
+| **Meta-supervisor** | Cluster-wide claims, cron calendar, sticky model revive (LXC/systemd host) |
 
 **Design intent:** cut Ray-related code per project. Resilience (reconnect, cool-down, head/vram-monitor avoidance, durable pending work while Ray is down, collision GC) lives in hive so prod systems spend less time rediscovering the same failure modes.
 
@@ -560,7 +560,7 @@ Gitea PyPI (LAN): `http://10.0.0.52:3000/api/packages/admin/pypi/simple/` — us
 **Repository layout**
 
 - `ray_hive/` — vLLM planner/registry/deploy, jobs, cluster, train, supervisor
-- `deploy/` — home-media LXC install for the meta-supervisor
+- `deploy/` — LXC/systemd install for the meta-supervisor
 - `manifests/` — KubeRay cluster, GCS Redis FT, worker images, VRAM monitor
 - `examples/` — deploy/inference experiments
 - `tests/` — unit / Ray smoke / live / chaos
