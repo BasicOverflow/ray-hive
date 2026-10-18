@@ -1,4 +1,4 @@
-"""Timezone cron + central meta-supervisor cron board."""
+"""Timezone cron + cluster cron board (owned by the ray-hive supervisor)."""
 from __future__ import annotations
 
 import time

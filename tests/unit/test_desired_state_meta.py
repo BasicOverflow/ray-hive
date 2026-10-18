@@ -1,4 +1,4 @@
-"""Meta-supervisor DesiredState tables."""
+"""ray-hive supervisor DesiredState tables."""
 import time
 
 from ray_hive.supervisor.desired_state import (

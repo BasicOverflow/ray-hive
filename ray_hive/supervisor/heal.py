@@ -1,4 +1,4 @@
-"""Meta-supervisor heal: system actors, GC, sticky models, collision refuse."""
+"""ray-hive supervisor heal: system actors, GC, sticky models, collision refuse."""
 from __future__ import annotations
 
 import logging
@@ -181,7 +181,7 @@ def redeploy_sticky(state: DesiredState, *, cool_down_ok: bool) -> list[str]:
 
 
 def heal_once(state: DesiredState, *, attempt_serve: bool) -> None:
-    # Jobs/meta path must succeed; vLLM actors are best-effort (optional [vllm]).
+    # Jobs/system-actor path must succeed; vLLM actors are best-effort (optional [vllm]).
     ensure_system_actors()
     sync_meta_from_cluster(state)
     try:

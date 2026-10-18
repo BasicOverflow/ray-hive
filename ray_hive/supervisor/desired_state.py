@@ -1,4 +1,4 @@
-"""SQLite sticky desired-state for meta-supervisor (models, projects, crons, queues)."""
+"""SQLite sticky desired-state for the ray-hive supervisor (models, projects, crons, queues)."""
 from __future__ import annotations
 
 import json

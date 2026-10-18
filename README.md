@@ -22,7 +22,7 @@ On connect you get one stdout line: `ray-hive <ver> — https://github.com/Basic
 | **vLLM Serve** (`[vllm]`) | Live-VRAM planning, heterogeneous GPU placement, sleep/idle, OpenAI HTTP |
 | **Jobs primitives** (core) | IO/CPU envelopes, fan-out + admission, rate gates, durable queues, cron board |
 | **Train** (`[train]`) | Custom PyTorch/HF loops with the same GPU claim model |
-| **Meta-supervisor** | Cluster-wide claims, cron calendar, sticky model revive (LXC/systemd host) |
+| **ray-hive supervisor** | Cluster-wide claims, cron calendar, sticky model revive (LXC/systemd host) |
 
 **Design intent:** cut Ray-related code per project. Resilience (reconnect, cool-down, head/vram-monitor avoidance, durable pending work while Ray is down, collision GC) lives in hive so prod systems spend less time rediscovering the same failure modes.
 
@@ -50,7 +50,7 @@ On connect you get one stdout line: `ray-hive <ver> — https://github.com/Basic
   - [CronSchedule + cron board](#cronschedule--cron-board)
   - [JobProgress](#jobprogress)
   - [ScratchShardStore / ServeAppHeal / NodeBroadcast / MapShuffleReduce](#scratchshardstore--serveappheal--nodebroadcast--mapshufflereduce)
-- [Meta-supervisor](#meta-supervisor)
+- [ray-hive supervisor](#ray-hive-supervisor)
 - [Train / custom infer](#train--custom-infer-optional-train)
 - [Ops](#ops)
 - [Tests](#tests)
@@ -354,7 +354,7 @@ from ray_hive import kill_gpu_registry
 kill_gpu_registry()     # explicit rebuild only — not part of normal shutdown
 ```
 
-See `examples/7_sleep_idle_timeout.py` and `examples/0_shutdown_models.py`. Sticky pin when `HIVE_SUPERVISOR_STATE` is set (meta-supervisor). GCS FT Redis: `manifests/ray-gcs-redis.yaml`.
+See `examples/7_sleep_idle_timeout.py` and `examples/0_shutdown_models.py`. Sticky pin when `HIVE_SUPERVISOR_STATE` is set (ray-hive supervisor). GCS FT Redis: `manifests/ray-gcs-redis.yaml`.
 
 ---
 
@@ -396,7 +396,7 @@ ctx = ProjectContext(
 init_ray_for_project("ray://YOUR_RAY_HEAD_IP:10001", ctx)
 ```
 
-Miss heartbeats long enough and the meta-supervisor GC marks the project dead and releases claims.
+Miss heartbeats long enough and the ray-hive supervisor GC marks the project dead and releases claims.
 
 ### Envelopes (`io_remote` / `cpu_remote` / `ops_remote`)
 
@@ -513,9 +513,9 @@ Request coalescing (identical in-flight HTTP→remote) stays in your app, not in
 
 ---
 
-## Meta-supervisor
+## ray-hive supervisor
 
-LXC/systemd entry: `python -m ray_hive.supervisor.main` (`deploy/`).
+LXC/systemd entry: `python -m ray_hive.supervisor.main` (`deploy/`; unit `ray-hive-supervisor`).
 
 Keeps **ClusterRegistry**, **AdmissionBroker**, and **cron board** warm, GCs dead projects, and redeploys sticky **vLLM** models when claimed. It does **not** replace per-project supervisors (e.g. `quotes-pipeline` or `catalog-search`) — those register into it and own their domain queues / Serve apps.
 
@@ -571,7 +571,7 @@ Gitea PyPI (LAN): `http://10.0.0.52:3000/api/packages/admin/pypi/simple/` — us
 **Repository layout**
 
 - `ray_hive/` — vLLM planner/registry/deploy, jobs, cluster, train, supervisor
-- `deploy/` — LXC/systemd install for the meta-supervisor
+- `deploy/` — LXC/systemd install for the ray-hive supervisor
 - `manifests/` — KubeRay cluster, GCS Redis FT, worker images, VRAM monitor
 - `examples/` — deploy/inference experiments
 - `tests/` — unit / Ray smoke / live / chaos
