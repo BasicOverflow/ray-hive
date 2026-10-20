@@ -553,8 +553,12 @@ job.run()
 
 **GCS FT (Redis):** `manifests/ray-gcs-redis.yaml` + `gcsFaultToleranceOptions` on the RayCluster. After head failover, Serve controllers can revive on surviving workers. Hive’s in-memory `gpu_registry` does **not** survive GCS alone — the supervisor recreates it.
 
+Redis is pinned to dedicated Longhorn nodes (`longhorn-node=true`) with 30s NotReady eviction so the RWO PVC can reattach when a Proxmox host dies. Apply `longhorn-node-down-policy.yaml` and `ray-dead-node-janitor.yaml` with it: Longhorn must delete volume-holding pods on down nodes, and the janitor force-deletes Terminating Ray pods / stale VolumeAttachments that kubelet can no longer acknowledge.
+
 ```bash
+kubectl apply -f manifests/longhorn-node-down-policy.yaml
 kubectl apply -f manifests/ray-gcs-redis.yaml
+kubectl apply -f manifests/ray-dead-node-janitor.yaml
 kubectl apply -f manifests/kuberay-operator.yaml
 kubectl apply -f manifests/raycluster.yaml
 ```

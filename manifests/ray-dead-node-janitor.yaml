@@ -1,0 +1,160 @@
+# Force-delete ray-system pods and Redis VolumeAttachments left on unreachable
+# nodes. k8s sets deletionTimestamp after the 30s NoExecute toleration, but the
+# object stays Terminating until kubelet confirms — and kubelet is gone. KubeRay
+# will not create a replacement head while the old pod object still exists.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ray-dead-node-janitor
+  namespace: ray-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ray-dead-node-janitor
+  namespace: ray-system
+rules:
+- apiGroups: [""]
+  resources: ["pods", "persistentvolumeclaims"]
+  verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ray-dead-node-janitor
+  namespace: ray-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ray-dead-node-janitor
+subjects:
+- kind: ServiceAccount
+  name: ray-dead-node-janitor
+  namespace: ray-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ray-dead-node-janitor
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["volumeattachments"]
+  verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ray-dead-node-janitor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ray-dead-node-janitor
+subjects:
+- kind: ServiceAccount
+  name: ray-dead-node-janitor
+  namespace: ray-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-dead-node-janitor
+  namespace: ray-system
+data:
+  janitor.sh: |
+    #!/bin/sh
+    set -eu
+    while true; do
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) tick"
+      DOWN=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}')
+      kubectl -n ray-system get pods -o jsonpath='{range .items[*]}{.metadata.name}|{.spec.nodeName}|{.metadata.deletionTimestamp}|{.status.phase}{"\n"}{end}' \
+      | while IFS='|' read -r name node del phase; do
+          [ -n "${node:-}" ] || continue
+          echo "$DOWN" | grep -q "${node}=True" && continue
+          echo "$DOWN" | grep -q "${node}=" || continue
+          if [ -z "${del:-}" ] && [ "${phase:-}" = "Pending" ]; then
+            continue
+          fi
+          echo "force-delete pod ${name} node=${node} phase=${phase}"
+          kubectl -n ray-system delete pod "$name" --force --grace-period=0 --wait=false || true
+        done
+      PVS=$(kubectl -n ray-system get pvc -o jsonpath='{range .items[*]}{.spec.volumeName}{"\n"}{end}')
+      REDIS_NODE=$(kubectl -n ray-system get pods -l app=ray-gcs-redis -o jsonpath='{.items[0].spec.nodeName}')
+      kubectl get volumeattachment -o jsonpath='{range .items[*]}{.metadata.name}|{.spec.nodeName}|{.spec.source.persistentVolumeName}{"\n"}{end}' \
+      | while IFS='|' read -r va node pv; do
+          [ -n "${node:-}" ] || continue
+          echo "$PVS" | grep -qx "${pv:-}" || continue
+          stale=0
+          if echo "$DOWN" | grep -q "${node}="; then
+            if ! echo "$DOWN" | grep -q "${node}=True"; then
+              stale=1
+            fi
+          fi
+          if [ -n "${REDIS_NODE:-}" ] && [ "$node" != "$REDIS_NODE" ]; then
+            stale=1
+          fi
+          [ "$stale" = "1" ] || continue
+          echo "delete volumeattachment ${va} node=${node} pv=${pv} redisNode=${REDIS_NODE:-none}"
+          kubectl delete volumeattachment "$va" --wait=false || true
+        done
+      sleep 15
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-dead-node-janitor
+  namespace: ray-system
+  labels:
+    app: ray-dead-node-janitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ray-dead-node-janitor
+  template:
+    metadata:
+      labels:
+        app: ray-dead-node-janitor
+    spec:
+      serviceAccountName: ray-dead-node-janitor
+      terminationGracePeriodSeconds: 10
+      tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+      containers:
+      - name: janitor
+        image: alpine:3.20
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          apk add --no-cache curl >/dev/null
+          curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.30.2/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          exec /bin/sh /scripts/janitor.sh
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            memory: 64Mi
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+      volumes:
+      - name: scripts
+        configMap:
+          name: ray-dead-node-janitor
+          defaultMode: 0755

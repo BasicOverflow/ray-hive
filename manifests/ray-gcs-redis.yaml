@@ -1,5 +1,10 @@
 # Standalone Redis for Ray GCS fault tolerance (KubeRay supports single replica only).
 # Apply before enabling gcsFaultToleranceOptions on the RayCluster.
+#
+# Must run on dedicated Longhorn nodes (longhorn-node=true). Compute nodes can be
+# k3s Ready while Longhorn reports ManagerPodDown, which leaves the RWO PVC stuck
+# ContainerCreating and the Ray head crash-looping on Redis. Storage VMs exist so
+# this workload can move when any one Proxmox host is powered off.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -56,6 +61,24 @@ spec:
       labels:
         app: ray-gcs-redis
     spec:
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        longhorn-node: "true"
+      # Leave a dead host quickly so the RWO Longhorn PVC can reattach
+      # on a surviving storage node (default NotReady eviction is ~300s).
+      tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 30
+      - key: dedicated
+        operator: Equal
+        value: longhorn
+        effect: NoSchedule
       containers:
       - name: redis
         image: redis:7.4.0

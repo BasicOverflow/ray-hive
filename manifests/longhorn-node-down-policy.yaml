@@ -1,0 +1,9 @@
+# Longhorn must delete pods that hold RWO volumes on a dead node, otherwise
+# the VolumeAttachment stays ATTACHED and the replacement pod cannot bind.
+# Cluster-wide setting; Ray GCS Redis is the workload that fails without it.
+apiVersion: longhorn.io/v1beta2
+kind: Setting
+metadata:
+  name: node-down-pod-deletion-policy
+  namespace: longhorn-system
+value: delete-both-statefulset-and-deployment-pod
